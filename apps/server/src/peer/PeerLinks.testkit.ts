@@ -43,7 +43,12 @@ export const descriptorOf = (
   label,
   platform: { os: "linux", arch: "x64" },
   serverVersion: "0.0.0-test",
-  capabilities: { repositoryIdentity: true, mcpModeLimitHeader: true, ...capabilities },
+  capabilities: {
+    repositoryIdentity: true,
+    mcpModeLimitHeader: true,
+    linkFence: true,
+    ...capabilities,
+  },
 });
 
 /**
