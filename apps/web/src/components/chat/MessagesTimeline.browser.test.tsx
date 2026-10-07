@@ -1061,7 +1061,7 @@ describe("MessagesTimeline history and thread links", () => {
     const onOpenThread = vi.fn();
     await using screen = await renderTimeline([], {
       onOpenThread,
-      parentThreadLink: { threadId: ThreadId.make("thread-parent"), title: "Architecture audit" },
+      parentThreadLink: { title: "Architecture audit", open: () => {} },
     });
     expect(screen.text()).toContain("Subagent of");
     expect(screen.text()).toContain("Architecture audit");
