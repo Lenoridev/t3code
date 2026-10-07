@@ -14,6 +14,7 @@ import {
   ProjectUpdatePayload,
   ProjectId,
   OrchestratorMcpClientRequestId,
+  OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
@@ -29,6 +30,7 @@ import { Tool, Toolkit } from "effect/ai";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as SourceControlRepositoryService from "../../../sourceControl/SourceControlRepositoryService.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -48,6 +50,7 @@ const ProjectListTool = Tool.make("t3_project_list", {
   ...shared,
   description: "List projects. Pages can shift.",
   parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
     cursor: Schema.optional(NonNegativeInt),
     limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
   }),
@@ -55,6 +58,7 @@ const ProjectListTool = Tool.make("t3_project_list", {
     projects: Schema.Array(Project),
     nextCursor: Schema.NullOr(NonNegativeInt),
   }),
+  dependencies: [...shared.dependencies, PeerForwarding.PeerForwarding],
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);
@@ -104,6 +108,7 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   description:
     "Create one new top-level thread, bound to its workspace before the agent starts. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. After an error or lost reply, retry with the same `clientRequestId`. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
   parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
     projectId: Schema.optional(ProjectId),
     scratch: Schema.optional(
       Schema.Boolean.annotate({
@@ -146,6 +151,7 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
     ServerConfig.ServerConfig,
     ServerSettings.ServerSettingsService,
     DocumentText.DocumentText,
+    PeerForwarding.PeerForwarding,
   ],
 })
   .annotate(Tool.Destructive, true)
