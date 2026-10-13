@@ -1869,6 +1869,7 @@ const make = Effect.gen(function* () {
             };
           }),
           features: {
+            remoteQuestionHandling: true,
             appOwnedSubagents: true,
             asyncPolling: true,
             cancellation: true,
@@ -1886,6 +1887,12 @@ const make = Effect.gen(function* () {
           input.target === undefined
             ? undefined
             : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
+        if (input.followUpQuestions === "parent" && environmentId === undefined) {
+          return yield* failure(
+            "invalid_request",
+            "followUpQuestions:parent applies only to linked-environment tasks.",
+          );
+        }
         if (input.target !== undefined && environmentId !== undefined) {
           yield* requireCapability(callerScope);
           const scope = yield* requireThreadScope(callerScope, "delegate_task");
@@ -2545,6 +2552,12 @@ const make = Effect.gen(function* () {
             projectId: target.thread.projectId,
             threadId: input.threadId,
             ...(input.runId === undefined ? {} : { runId: input.runId }),
+            ...(input.untilPendingRequest === undefined
+              ? {}
+              : { untilPendingRequest: input.untilPendingRequest }),
+            ...(input.ignoreRequestIds === undefined
+              ? {}
+              : { ignoreRequestIds: input.ignoreRequestIds }),
             timeoutMs: Math.min(
               MAX_WAIT_TIMEOUT_MS,
               Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
@@ -2556,6 +2569,9 @@ const make = Effect.gen(function* () {
           runId: result.run?.id ?? null,
           status: result.run?.status ?? "idle",
           timedOut: result.timedOut,
+          ...(result.pendingRequests === undefined
+            ? {}
+            : { pendingRequests: result.pendingRequests }),
         } satisfies OrchestratorMcpThreadWaitResult;
       }),
     interruptThread: (scope, input) =>

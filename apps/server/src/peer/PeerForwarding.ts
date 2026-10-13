@@ -1,5 +1,7 @@
 import {
   type EnvironmentId,
+  OrchestratorMcpCapabilitiesInput,
+  OrchestratorMcpCapabilitiesResult,
   OrchestratorMcpFailure,
   type OrchestratorMcpEnvironmentLinksResult,
   OrchestratorMcpThreadInterruptInput,
@@ -46,6 +48,10 @@ export class PeerForwarding extends Context.Service<
   PeerForwarding,
   {
     /** Runs `tool` in the linked environment `environmentId` with `params`. */
+    readonly readCapabilities: (
+      scope: Scope,
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
     readonly call: <T extends Tool.Any>(
       scope: Scope,
       tool: T,
@@ -203,7 +209,12 @@ const make = Effect.gen(function* () {
           OrchestratorMcpThreadWaitInput,
           OrchestratorMcpThreadWaitResult,
           environmentId,
-          { threadId: input.threadId, ...(runId === undefined ? {} : { runId }), timeoutMs: chunk },
+          {
+            ...input,
+            threadId: input.threadId,
+            ...(runId === undefined ? {} : { runId }),
+            timeoutMs: chunk,
+          },
         );
         remaining -= chunk;
         if (!result.timedOut || remaining <= 0) return result;
@@ -232,6 +243,15 @@ const make = Effect.gen(function* () {
     );
 
   return PeerForwarding.of({
+    readCapabilities: (scope, environmentId) =>
+      forward<OrchestratorMcpCapabilitiesResult>(
+        scope,
+        "orchestrator_capabilities",
+        OrchestratorMcpCapabilitiesInput,
+        OrchestratorMcpCapabilitiesResult,
+        environmentId,
+        {},
+      ),
     call,
     route,
     readThread,

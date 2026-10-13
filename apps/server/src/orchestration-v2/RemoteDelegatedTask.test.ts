@@ -10,6 +10,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -291,3 +292,176 @@ it.layer(layerTest)("a delegated task in a linked environment", (it) => {
     }),
   );
 });
+
+it.effect(
+  "remote question notices are request-scoped and Stop suppresses queued and future notices",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const parent = yield* seedLiveParent("question-stop");
+        const childRunId = RunId.make("run:remote-question");
+        yield* orchestrator.dispatch({
+          type: "delegated_task.remote.request",
+          commandId: CommandId.make("command:question-stop:delegate"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          task: "Work there and ask for missing context",
+          driver: ProviderDriverKind.make("remote"),
+          modelSelection,
+          remoteChild: { ...remoteChild, runId: childRunId, followUpQuestions: "parent" },
+          completionWake: "always",
+        });
+        const task = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents[0]!;
+        const report = (key: string, requestId: RuntimeRequestId, runId = childRunId) =>
+          orchestrator.dispatch({
+            type: "delegated_task.remote.question",
+            commandId: CommandId.make(`remote-question:${key}`),
+            parentThreadId: parent.threadId,
+            taskId: task.id,
+            childRunId: runId,
+            requestId,
+            requestKind: "user_input",
+          });
+        const id = RuntimeRequestId.make("request:question-stop");
+        yield* report("first", id);
+        yield* report("same-request", id).pipe(Effect.result);
+        yield* report(
+          "foreign-run",
+          RuntimeRequestId.make("request:foreign"),
+          RunId.make("run:foreign"),
+        ).pipe(Effect.result);
+        const before = yield* orchestrator.getThreadProjection(parent.threadId);
+        const notices = before.messages.filter((message) =>
+          message.id.startsWith("message:remote-question:"),
+        );
+        assert.equal(notices.length, 1);
+        assert.equal(
+          before.runs.find((run) => run.userMessageId === notices[0]!.id)?.status,
+          "queued",
+        );
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("command:question-stop:stop"),
+          threadId: parent.threadId,
+        });
+        yield* report("after-stop", RuntimeRequestId.make("request:after-stop")).pipe(
+          Effect.result,
+        );
+        const after = yield* orchestrator.getThreadProjection(parent.threadId);
+        assert.equal(
+          after.runs.find((run) => run.userMessageId === notices[0]!.id)?.status,
+          "cancelled",
+        );
+        assert.equal(
+          after.messages.filter((message) => message.id.startsWith("message:remote-question:"))
+            .length,
+          1,
+        );
+      }),
+    ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "a pending remote question starts a parent continuation when its originating turn has ended",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const parent = yield* seedLiveParent("question-idle");
+        const childRunId = RunId.make("run:remote-question-idle");
+        yield* orchestrator.dispatch({
+          type: "delegated_task.remote.request",
+          commandId: CommandId.make("command:question-idle:delegate"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          task: "Work there",
+          driver: ProviderDriverKind.make("remote"),
+          modelSelection,
+          remoteChild: { ...remoteChild, runId: childRunId, followUpQuestions: "parent" },
+          completionWake: "always",
+        });
+        const before = yield* orchestrator.getThreadProjection(parent.threadId);
+        const task = before.subagents[0]!;
+        const run = before.runs.find((candidate) => candidate.id === parent.runId)!;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          commandId: CommandId.make("command:question-idle:end-parent"),
+          events: [
+            {
+              id: EventId.make("event:question-idle:end-parent"),
+              type: "run.updated",
+              threadId: parent.threadId,
+              runId: parent.runId,
+              providerInstanceId: instanceId,
+              occurredAt: now,
+              payload: { ...run, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        yield* orchestrator.dispatch({
+          type: "delegated_task.remote.question",
+          commandId: CommandId.make("remote-question:idle"),
+          parentThreadId: parent.threadId,
+          taskId: task.id,
+          childRunId,
+          requestId: RuntimeRequestId.make("request:question-idle"),
+          requestKind: "user_input",
+        });
+        const after = yield* orchestrator.getThreadProjection(parent.threadId);
+        const notice = after.messages.find(
+          (message) => message.id === "message:remote-question:idle",
+        );
+        assert.isDefined(notice);
+        assert.equal(after.subagents[0]?.result, null);
+        const continuation = after.runs.find((candidate) => candidate.userMessageId === notice!.id);
+        assert.isDefined(continuation);
+        assert.notEqual(continuation!.status, "queued");
+        assert.notEqual(continuation!.status, "cancelled");
+      }),
+    ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "the first request pins a remote task whose launch receipt did not yet identify a run",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const parent = yield* seedLiveParent("question-pin-run");
+        yield* orchestrator.dispatch({
+          type: "delegated_task.remote.request",
+          commandId: CommandId.make("command:question-pin-run:delegate"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          task: "Work there",
+          driver: ProviderDriverKind.make("remote"),
+          modelSelection,
+          remoteChild: { ...remoteChild, followUpQuestions: "parent" },
+          completionWake: "always",
+        });
+        const task = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents[0]!;
+        const childRunId = RunId.make("run:question-pin-run:child");
+        yield* orchestrator.dispatch({
+          type: "delegated_task.remote.question",
+          commandId: CommandId.make("remote-question:pin-run"),
+          parentThreadId: parent.threadId,
+          taskId: task.id,
+          childRunId,
+          requestId: RuntimeRequestId.make("request:question-pin-run"),
+          requestKind: "user_input",
+        });
+        const after = yield* orchestrator.getThreadProjection(parent.threadId);
+        assert.equal(after.subagents[0]?.remoteChild?.runId, childRunId);
+        assert.equal(
+          after.messages.filter((message) => message.id.startsWith("message:remote-question:"))
+            .length,
+          1,
+        );
+      }),
+    ).pipe(Effect.provide(layerTest)),
+);

@@ -52,6 +52,7 @@ const dispatch = Effect.fn("mcp.dispatchThreadCommand")(function* (
 const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
   threadId?: ThreadId | undefined;
   requestId: RuntimeRequestId;
+  runId?: RunId | undefined;
 }) {
   const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"]);
   const request = context.projection.runtimeRequests.find(
@@ -63,7 +64,11 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
   const item = context.projection.turnItems.find(
     (item) => item.type === "user_input_request" && item.requestId === input.requestId,
   );
-  if (request === undefined || item?.type !== "user_input_request")
+  if (
+    request === undefined ||
+    item?.type !== "user_input_request" ||
+    (input.runId !== undefined && item.runId !== input.runId)
+  )
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
       message: "The pending user-input request was not found.",

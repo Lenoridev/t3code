@@ -262,6 +262,13 @@ ends, as for any delegated task. It keeps following the task across restarts.
 If the other machine revokes the link, or the link is removed here, the task
 fails with that reason.
 
+For an autonomous remote task, pass `followUpQuestions: "parent"` to `delegate_task`.
+The parent receives a notice when the child needs input. It can read and answer a
+question with `task_question_read` and `task_question_respond`; permission approvals
+and sign-in are reported to the parent for a user handoff. Both servers must support
+this option. Omit it or use `"user"` to handle requests in the destination thread yourself.
+The option applies to the active delegated run; ordinary `t3_thread_launch` is unchanged.
+
 ## Manage or revoke access
 
 On the host, **Settings → Connections** lets authorized administrators create

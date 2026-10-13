@@ -127,7 +127,11 @@ const QueuePromoteTool = Tool.make("t3_queue_promote_to_steer", {
   parameters: Schema.Struct({ ...queueTarget, targetRunId: RunId }),
 }).annotate(Tool.Destructive, true);
 
-const requestTarget = { threadId: Schema.optional(ThreadId), requestId: RuntimeRequestId };
+const requestTarget = {
+  threadId: Schema.optional(ThreadId),
+  requestId: RuntimeRequestId,
+  runId: Schema.optional(RunId),
+};
 const question = Schema.Struct({
   id: Schema.String,
   header: Schema.String,

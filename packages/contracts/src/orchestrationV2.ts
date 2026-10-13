@@ -699,6 +699,8 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
   label: Schema.String,
   /** The run there that carries the task; absent on tasks recorded before it was kept. */
   runId: Schema.optional(RunId),
+  followUpQuestions: Schema.optional(Schema.Literals(["user", "parent"])),
+  reportedRequestIds: Schema.optional(Schema.Array(RuntimeRequestId)),
   /**
    * Nothing is left to stop there: a stop from here reached the thread there,
    * the other side refused it for good, or the thread or its link is gone. A
@@ -3180,6 +3182,15 @@ const OrchestrationV2InternalCommand = Schema.Union([
      * a run that ended by itself leaves the stop owed for what may follow it.
      */
     stoppedThere: Schema.optional(Schema.Literals(["ran-out", "stopped"])),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("delegated_task.remote.question"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    childRunId: RunId,
+    requestId: RuntimeRequestId,
+    requestKind: OrchestrationV2RuntimeRequest.fields.kind,
   }),
   /** Records that the provider rollback `requestId` failed for good. */
   Schema.Struct({

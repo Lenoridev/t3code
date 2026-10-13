@@ -12,6 +12,8 @@ import {
   type ProviderInstanceId,
   ProviderDriverKind,
   type RunId,
+  type RuntimeRequestId,
+  type ProviderUserInputAnswers,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -20,12 +22,14 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type * as Tool from "effect/ai/Tool";
 
 import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import { ProjectToolkit } from "../mcp/toolkits/project/tools.ts";
 import {
   resolveInteractionMode,
@@ -42,6 +46,7 @@ import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 
 /** How long one follow of a remote task waits on its thread there before checking again. */
+const isMcpFailure = Schema.is(OrchestratorMcpFailure);
 const FOLLOW_WAIT_MS = 10 * 60 * 1_000;
 /** A linked environment that stops answering is retried, backing off to this. */
 const FOLLOW_MAX_BACKOFF = Duration.minutes(5);
@@ -62,6 +67,24 @@ type ThreadScope = McpInvocationContext.McpThreadInvocationScope;
 export class RemoteDelegation extends Context.Service<
   RemoteDelegation,
   {
+    readonly readQuestion: (
+      scope: McpInvocationContext.McpInvocationScope,
+      input: { readonly taskId: NodeId; readonly requestId: RuntimeRequestId },
+    ) => Effect.Effect<
+      Tool.Success<typeof ThreadToolkit.tools.t3_pending_request_read>,
+      OrchestratorMcpFailure
+    >;
+    readonly respondToQuestion: (
+      scope: McpInvocationContext.McpInvocationScope,
+      input: {
+        readonly taskId: NodeId;
+        readonly requestId: RuntimeRequestId;
+        readonly answers: ProviderUserInputAnswers;
+      },
+    ) => Effect.Effect<
+      Tool.Success<typeof ThreadToolkit.tools.t3_pending_request_respond>,
+      OrchestratorMcpFailure
+    >;
     readonly delegate: (
       scope: ThreadScope,
       input: OrchestratorMcpDelegateTaskInput & {
@@ -230,6 +253,16 @@ const make = Effect.gen(function* () {
       // the forwarder scopes the launch's, and the record's names it.
       const key = input.clientRequestId ?? (yield* crypto.randomUUIDv4.pipe(Effect.orDie));
       const task = taskPrompt(input);
+      if (input.followUpQuestions === "parent") {
+        const capabilities = yield* forwarding.readCapabilities(scope, target.environmentId);
+        if (capabilities.features.remoteQuestionHandling !== true) {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message:
+              "The linked environment does not support parent-handled questions. Update it or use followUpQuestions:user.",
+          });
+        }
+      }
       const launched = yield* forwarding.call(
         scope,
         ProjectToolkit.tools.t3_thread_launch,
@@ -261,6 +294,9 @@ const make = Effect.gen(function* () {
         environmentId: target.environmentId,
         threadId: launched.threadId,
         label: link?.label ?? target.environmentId,
+        ...(input.followUpQuestions === undefined
+          ? {}
+          : { followUpQuestions: input.followUpQuestions }),
         ...(launched.runId === null ? {} : { runId: launched.runId }),
       };
       const recorded = yield* threads
@@ -552,11 +588,41 @@ const make = Effect.gen(function* () {
           threadId: remote.threadId,
           ...(remote.runId === undefined ? {} : { runId: remote.runId }),
           timeoutMs: FOLLOW_WAIT_MS,
+          ...(remote.followUpQuestions === "parent"
+            ? {
+                untilPendingRequest: true,
+                ignoreRequestIds: remote.reportedRequestIds ?? [],
+              }
+            : {}),
         })
         .pipe(Effect.raceFirst(endedHere));
       // The next look reads the result and stops it there.
       if ("endedHere" in waited) return false;
       if (waited.timedOut) return false;
+      if (
+        waited.pendingRequests !== undefined &&
+        waited.runId !== null &&
+        !isTerminal(waited.status) &&
+        remote.followUpQuestions === "parent"
+      ) {
+        for (const request of waited.pendingRequests) {
+          const requestId = request.id;
+          // Eligibility and request-id dedup commit with the notice. A rejected
+          // attempt gets a fresh receipt id so transient parent state can recover.
+          yield* threads.dispatch({
+            type: "delegated_task.remote.question",
+            commandId: CommandId.make(
+              `remote-question:${encodeURIComponent(parentThreadId)}:${encodeURIComponent(taskId)}:${encodeURIComponent(requestId)}:${yield* crypto.randomUUIDv4.pipe(Effect.orDie)}`,
+            ),
+            parentThreadId,
+            taskId,
+            childRunId: waited.runId,
+            requestId,
+            requestKind: request.kind,
+          });
+        }
+        return false;
+      }
       // A task recorded without its run waits on the thread's latest; a
       // thread there with none has nothing left to wait for.
       if (waited.runId === null) {
@@ -674,7 +740,78 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.ignoreCause({ log: true })),
     );
 
-  return RemoteDelegation.of({ delegate, cancel, start });
+  const questionTarget = (
+    scope: McpInvocationContext.McpInvocationScope,
+    taskId: NodeId,
+    requestId: RuntimeRequestId,
+  ) =>
+    Effect.gen(function* () {
+      if (scope.thread === undefined)
+        return yield* new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "Only the delegated task's parent can handle its questions.",
+        });
+      const records = yield* threads.getThreadRecords(scope.thread.threadId, ["subagents"]);
+      const task = records.subagents.find(
+        (candidate) => candidate.id === taskId && candidate.origin === "app_owned",
+      );
+      const remote = task?.remoteChild;
+      if (
+        task === undefined ||
+        task.result !== null ||
+        task.completionDelivery?.state === "disposed" ||
+        records.thread.archivedAt !== null ||
+        records.thread.deletedAt !== null ||
+        remote?.followUpQuestions !== "parent" ||
+        remote.runId === undefined ||
+        remote.threadId === undefined ||
+        !remote.reportedRequestIds?.includes(requestId)
+      ) {
+        return yield* new OrchestratorMcpFailure({
+          code: "capability_denied",
+          message: "This parent has no active delegated question with that request id.",
+        });
+      }
+      return { remote, runId: remote.runId, threadId: remote.threadId };
+    }).pipe(
+      Effect.mapError((error) =>
+        isMcpFailure(error)
+          ? error
+          : new OrchestratorMcpFailure({
+              code: "orchestration_error",
+              message: "The delegated question could not be read.",
+            }),
+      ),
+    );
+  const readQuestion: RemoteDelegation["Service"]["readQuestion"] = (scope, input) =>
+    Effect.gen(function* () {
+      const { remote, runId, threadId } = yield* questionTarget(
+        scope,
+        input.taskId,
+        input.requestId,
+      );
+      return yield* forwarding.call(
+        scope,
+        ThreadToolkit.tools.t3_pending_request_read,
+        remote.environmentId,
+        { threadId, runId, requestId: input.requestId },
+      );
+    });
+  const respondToQuestion: RemoteDelegation["Service"]["respondToQuestion"] = (scope, input) =>
+    Effect.gen(function* () {
+      const { remote, runId, threadId } = yield* questionTarget(
+        scope,
+        input.taskId,
+        input.requestId,
+      );
+      return yield* forwarding.call(
+        scope,
+        ThreadToolkit.tools.t3_pending_request_respond,
+        remote.environmentId,
+        { threadId, runId, requestId: input.requestId, answers: input.answers },
+      );
+    });
+  return RemoteDelegation.of({ delegate, cancel, start, readQuestion, respondToQuestion });
 });
 
 const isTerminal = (status: string) =>

@@ -19,12 +19,14 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
   type OrchestrationV2Run,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2TurnItem,
   ProjectId,
   RunId,
+  type RuntimeRequestId,
   type ScheduledTaskId,
   ThreadId,
   type TurnItemId,
@@ -94,6 +96,7 @@ export function existingThreadIdsForCommand(
     case "delegated_task.completion-delivery.dispose":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
+    case "delegated_task.remote.question":
       return [command.parentThreadId];
     case "thread.created.record":
       return command.parentThreadId === command.targetThreadId
@@ -142,12 +145,15 @@ export interface ThreadManagementWaitInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly timeoutMs: number;
+  readonly untilPendingRequest?: boolean;
+  readonly ignoreRequestIds?: ReadonlyArray<RuntimeRequestId>;
 }
 
 export interface ThreadManagementWaitResult {
   readonly threadId: ThreadId;
   readonly run: OrchestrationV2Run | null;
   readonly timedOut: boolean;
+  readonly pendingRequests?: ReadonlyArray<Pick<OrchestrationV2RuntimeRequest, "id" | "kind">>;
 }
 
 export interface ThreadManagementInterruptInput {
@@ -688,12 +694,23 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           cause,
         });
-      // Taken before the first read, so a run update between that read and
-      // the subscription below still replays.
+      // Capture the cursor before reading so a question arriving during setup replays.
       const afterSequence = yield* orchestrator
         .getThreadEventSequence(input.threadId)
         .pipe(Effect.mapError(loadError));
-      const target = yield* getProjectThreadRecords(input, ["runs"]);
+      const loadRecords = (runIds?: ReadonlyArray<RunId>) =>
+        input.untilPendingRequest === true
+          ? getProjectThreadRecords(
+              input,
+              ["runs", "runtimeRequests", "nodes"],
+              runIds === undefined ? undefined : { runIds },
+            )
+          : getProjectThreadRecords(
+              input,
+              ["runs"],
+              runIds === undefined ? undefined : { runIds },
+            ).pipe(Effect.map((records) => ({ ...records, runtimeRequests: [], nodes: [] })));
+      const target = yield* loadRecords();
       const selectedRun =
         input.runId === undefined
           ? latestRun(target)
@@ -704,17 +721,37 @@ const make = Effect.gen(function* () {
           runId: input.runId,
         });
       }
-      if (selectedRun === undefined) {
+      if (selectedRun === undefined)
         return { threadId: input.threadId, run: null, timedOut: false };
+      const ignored = new Set(input.ignoreRequestIds ?? []);
+      const questions = (records: typeof target) =>
+        input.untilPendingRequest === true
+          ? records.runtimeRequests
+              .filter(
+                (request) =>
+                  records.nodes.some(
+                    (node) => node.id === request.nodeId && node.runId === selectedRun.id,
+                  ) &&
+                  request.kind !== "dynamic_tool_call" &&
+                  request.status === "pending" &&
+                  !ignored.has(request.id),
+              )
+              .map((request) => ({ id: request.id, kind: request.kind }))
+          : [];
+      const result = (
+        run: OrchestrationV2Run,
+        pending: ReadonlyArray<Pick<OrchestrationV2RuntimeRequest, "id" | "kind">>,
+      ) => ({
+        threadId: input.threadId,
+        run,
+        timedOut: !isTerminalRunStatus(run.status) && pending.length === 0,
+        ...(input.untilPendingRequest === true ? { pendingRequests: pending } : {}),
+      });
+      const firstQuestions = questions(target);
+      if (isTerminalRunStatus(selectedRun.status) || firstQuestions.length > 0) {
+        return result(selectedRun, firstQuestions);
       }
-      if (isTerminalRunStatus(selectedRun.status)) {
-        return { threadId: input.threadId, run: selectedRun, timedOut: false };
-      }
-
-      // Re-read the run only when the thread records a run update or its
-      // deletion, instead of polling the projection for up to an hour. Each
-      // stream keeps one event type, so transcript events never fill its buffer.
-      const wait = Stream.merge(
+      const runEvents = Stream.merge(
         orchestrator.streamStoredEventsFrom({
           threadId: input.threadId,
           afterSequence,
@@ -725,47 +762,41 @@ const make = Effect.gen(function* () {
           afterSequence,
           eventType: "thread.deleted",
         }),
-      ).pipe(
+      );
+      const events =
+        input.untilPendingRequest === true
+          ? Stream.merge(
+              runEvents,
+              orchestrator.streamStoredEventsFrom({
+                threadId: input.threadId,
+                afterSequence,
+                eventType: "runtime-request.updated",
+              }),
+            )
+          : runEvents;
+      const load = Effect.gen(function* () {
+        const current = yield* loadRecords([selectedRun.id]);
+        const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
+        if (run === undefined)
+          return yield* new ThreadManagementRunNotFoundError({
+            threadId: input.threadId,
+            runId: selectedRun.id,
+          });
+        return result(run, questions(current));
+      });
+      const wait = events.pipe(
         Stream.mapError(loadError),
         Stream.filter(
           (stored) =>
             stored.event.type !== "run.updated" || stored.event.payload.id === selectedRun.id,
         ),
-        Stream.mapEffect(() =>
-          getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] }).pipe(
-            Effect.flatMap((current) => {
-              const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-              return run === undefined
-                ? Effect.fail(
-                    new ThreadManagementRunNotFoundError({
-                      threadId: input.threadId,
-                      runId: selectedRun.id,
-                    }),
-                  )
-                : Effect.succeed(run);
-            }),
-          ),
-        ),
-        Stream.filter((run) => isTerminalRunStatus(run.status)),
+        Stream.mapEffect(() => load),
+        Stream.filter((snapshot) => !snapshot.timedOut),
         Stream.runHead,
         Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
       );
       const waited = Option.flatten(yield* wait);
-      if (Option.isSome(waited)) {
-        return { threadId: input.threadId, run: waited.value, timedOut: false };
-      }
-      const current = yield* getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] });
-      const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-      if (run === undefined) {
-        return yield* new ThreadManagementRunNotFoundError({
-          threadId: input.threadId,
-          runId: selectedRun.id,
-        });
-      }
-      // The run may have reached a terminal status while the timeout was
-      // winning the race; the final projection read decides what actually
-      // happened, so only a still-active run counts as timed out.
-      return { threadId: input.threadId, run, timedOut: !isTerminalRunStatus(run.status) };
+      return Option.isSome(waited) ? waited.value : yield* load;
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(

@@ -4,6 +4,7 @@ import type * as Tool from "effect/ai/Tool";
 
 import { OrchestratorToolkit } from "./tools.ts";
 
+import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -30,6 +31,18 @@ const routed = <T extends (typeof tools)[keyof typeof tools], A, E, R>(
   });
 
 const handlers = {
+  task_question_read: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      return yield* (yield* RemoteDelegation.RemoteDelegation).readQuestion(scope, input);
+    }),
+  ),
+  task_question_respond: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      return yield* (yield* RemoteDelegation.RemoteDelegation).respondToQuestion(scope, input);
+    }),
+  ),
   orchestrator_capabilities: McpToolAccess.reads((input) =>
     routed(
       tools.orchestrator_capabilities,
