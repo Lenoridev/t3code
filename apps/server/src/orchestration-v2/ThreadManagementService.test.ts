@@ -17,6 +17,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -1085,4 +1086,128 @@ it.effect.each([
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
   }),
+);
+
+it.effect(
+  "waitForThread returns pending questions from the selected run without waiting for completion",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:question-wait");
+      const threadId = ThreadId.make("thread:question-wait");
+      const runId = RunId.make("run:question-wait");
+      const requestId = RuntimeRequestId.make("request:question-wait");
+      const records = {
+        thread: { id: threadId, projectId, deletedAt: null },
+        runs: [{ id: runId, status: "running" }],
+        nodes: [{ id: "node:selected", runId }],
+        runtimeRequests: [
+          { id: requestId, nodeId: "node:selected", kind: "user_input", status: "pending" },
+        ],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provide(
+              Layer.mock(Orchestrator.OrchestratorV2)({
+                getThreadEventSequence: () => Effect.succeed(0),
+                getThreadRecords: () => Effect.succeed(records),
+                streamStoredEventsFrom: () => Stream.never,
+              }),
+            ),
+          ),
+        ),
+      );
+      const fiber = yield* service
+        .waitForThread({ projectId, threadId, runId, timeoutMs: 1, untilPendingRequest: true })
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust(Duration.millis(1));
+      expect(yield* Fiber.join(fiber)).toMatchObject({
+        timedOut: false,
+        run: { status: "running" },
+        pendingRequests: [{ id: requestId, kind: "user_input" }],
+      });
+    }),
+);
+
+it.effect(
+  "question waits wake on runtime requests and exclude answered, internal-tool, other-run and already-reported requests",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:question-event");
+      const threadId = ThreadId.make("thread:question-event");
+      const runId = RunId.make("run:question-event");
+      const subscribed = yield* Deferred.make<void>();
+      const reread = yield* Deferred.make<void>();
+      const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      const ignored = RuntimeRequestId.make("request:ignored");
+      const newId = RuntimeRequestId.make("request:new");
+      let requests = [
+        { id: ignored, nodeId: "node:own", kind: "user_input", status: "pending" },
+        { id: "request:answered", nodeId: "node:own", kind: "user_input", status: "resolved" },
+        {
+          id: "request:approval",
+          nodeId: "node:own",
+          kind: "dynamic_tool_call",
+          status: "pending",
+        },
+        { id: "request:other", nodeId: "node:other", kind: "user_input", status: "pending" },
+      ];
+      let reads = 0;
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provide(
+              Layer.mock(Orchestrator.OrchestratorV2)({
+                getThreadEventSequence: () => Effect.succeed(10),
+                streamStoredEventsFrom: (input) =>
+                  input?.eventType === "runtime-request.updated"
+                    ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                        Stream.drain,
+                        Stream.concat(Stream.fromQueue(events)),
+                      )
+                    : Stream.never,
+                getThreadRecords: () =>
+                  Effect.gen(function* () {
+                    if (++reads > 1) yield* Deferred.succeed(reread, undefined);
+                    return {
+                      thread: { id: threadId, projectId, deletedAt: null },
+                      runs: [{ id: runId, status: "running" }],
+                      nodes: [
+                        { id: "node:own", runId },
+                        { id: "node:other", runId: "run:other" },
+                      ],
+                      runtimeRequests: requests,
+                    } as unknown as OrchestrationV2ThreadProjection;
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+      const fiber = yield* service
+        .waitForThread({
+          projectId,
+          threadId,
+          runId,
+          timeoutMs: 60000,
+          untilPendingRequest: true,
+          ignoreRequestIds: [ignored],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(subscribed);
+      requests = [
+        ...requests,
+        { id: newId, nodeId: "node:own", kind: "user_input", status: "pending" },
+      ];
+      yield* Queue.offer(events, {
+        sequence: 11,
+        event: { type: "runtime-request.updated", threadId },
+      } as unknown as OrchestrationV2StoredEvent);
+      yield* Deferred.await(reread);
+      expect(yield* Fiber.join(fiber)).toMatchObject({
+        timedOut: false,
+        run: { status: "running" },
+        pendingRequests: [{ id: newId, kind: "user_input" }],
+      });
+    }),
 );

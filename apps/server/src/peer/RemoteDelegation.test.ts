@@ -14,6 +14,8 @@ import {
   type Project,
   type RepositoryIdentity,
   RunId,
+  RuntimeRequestId,
+  type ProviderUserInputAnswers,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -43,6 +45,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
@@ -80,7 +83,17 @@ type LaunchedWith = Pick<
 >;
 
 /** The thread the box launches for the task, which the test finishes. */
+interface BoxQuestion {
+  readonly id: RuntimeRequestId;
+  readonly runId: RunId;
+  readonly kind: "user_input" | "command" | "auth_refresh";
+  readonly status: "pending" | "resolved";
+}
 interface BoxThread {
+  readonly questions: SubscriptionRef.SubscriptionRef<ReadonlyArray<BoxQuestion>>;
+  readonly answers: Ref.Ref<ProviderUserInputAnswers | null>;
+  readonly waitStarted: Deferred.Deferred<void>;
+
   readonly launched: Ref.Ref<ThreadId | null>;
   /** The link session that launched it, as the box stamps it. */
   readonly linkOrigin: Ref.Ref<{ readonly sessionId: string; readonly label: string } | null>;
@@ -114,6 +127,9 @@ interface BoxThread {
 
 const makeBoxThread = Effect.gen(function* () {
   return {
+    questions: yield* SubscriptionRef.make<ReadonlyArray<BoxQuestion>>([]),
+    answers: yield* Ref.make<ProviderUserInputAnswers | null>(null),
+    waitStarted: yield* Deferred.make<void>(),
     launched: yield* Ref.make<ThreadId | null>(null),
     linkOrigin: yield* Ref.make<{ readonly sessionId: string; readonly label: string } | null>(
       null,
@@ -206,9 +222,40 @@ const boxToolkitLayer = (thread: BoxThread) => {
       const shell = yield* shellOf(threadId);
       const status = yield* Ref.get(thread.status);
       const runless = yield* Ref.get(thread.runless);
+      const requests = yield* SubscriptionRef.get(thread.questions);
       return shell === null
         ? (null as never)
-        : { ...idleThreadProjection(shell), runs: runless ? [] : [runOf(status)] };
+        : {
+            ...idleThreadProjection(shell),
+            runs: runless ? [] : [runOf(status)],
+            runtimeRequests: requests.map((question) => ({
+              id: question.id,
+              nodeId: NodeId.make(`node:${question.runId}`),
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: question.kind,
+              status: question.status,
+              responseCapability: { type: "message" as const },
+              createdAt: DateTime.makeUnsafe(0),
+              resolvedAt: null,
+            })),
+            turnItems: requests
+              .filter((question) => question.kind === "user_input")
+              .map((question) => ({
+                id: TurnItemId.make(`item:${question.id}`),
+                type: "user_input_request" as const,
+                requestId: question.id,
+                runId: question.runId,
+                questions: [
+                  {
+                    id: "branch",
+                    header: "Branch",
+                    question: "Which branch should I use?",
+                    options: [{ label: "main", description: "The base branch" }],
+                  },
+                ],
+              })) as never,
+          };
     });
   // One record per command id, as its receipt replays a repeat.
   const recordStop = (commandId: string, kind: "interrupt" | "thread.stop" | "delegated-tasks") =>
@@ -238,7 +285,28 @@ const boxToolkitLayer = (thread: BoxThread) => {
             threadId: input.threadId,
           });
         }
+        yield* Deferred.succeed(thread.waitStarted, undefined);
+        const pending =
+          input.untilPendingRequest === true
+            ? SubscriptionRef.changes(thread.questions).pipe(
+                Stream.map((requests) =>
+                  requests
+                    .filter(
+                      (request) =>
+                        request.runId === (input.runId ?? runId) &&
+                        request.status === "pending" &&
+                        !input.ignoreRequestIds?.includes(request.id),
+                    )
+                    .map((request) => ({ id: request.id, kind: request.kind })),
+                ),
+                Stream.filter((ids) => ids.length > 0),
+                Stream.runHead,
+                Effect.map((ids) => ({ questions: Option.getOrElse(ids, () => []) })),
+              )
+            : Effect.never;
         const done = yield* Deferred.await(thread.finished).pipe(
+          Effect.as({ questions: [] as ReadonlyArray<Pick<BoxQuestion, "id" | "kind">> }),
+          Effect.raceFirst(pending),
           Effect.timeoutOption(input.timeoutMs),
         );
         // Unpinned, a wait reports the latest run: a later one once there is one.
@@ -250,6 +318,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
             status: later ? "completed" : yield* Ref.get(thread.status),
           } as OrchestrationV2Run,
           timedOut: Option.isNone(done),
+          pendingRequests: Option.isSome(done) ? done.value.questions : [],
         };
       }),
     getTimelinePage: (threadId, options) =>
@@ -310,11 +379,23 @@ const boxToolkitLayer = (thread: BoxThread) => {
         Effect.as({ type: "interrupt_requested", run: runOf("running") } as never),
       ),
     dispatch: (command) =>
-      command.type === "thread.stop"
-        ? recordStop(command.commandId, "thread.stop").pipe(
-            Effect.as({ sequence: 0, storedEvents: [] } as never),
-          )
-        : Effect.die(`The box does not expect ${command.type}`),
+      command.type === "runtime-request.respond"
+        ? Effect.gen(function* () {
+            yield* Ref.set(thread.answers, command.answers ?? null);
+            yield* SubscriptionRef.update(thread.questions, (requests) =>
+              requests.map((request) =>
+                request.id === command.requestId
+                  ? { ...request, status: "resolved" as const }
+                  : request,
+              ),
+            );
+            return { sequence: 1, storedEvents: [] } as never;
+          })
+        : command.type === "thread.stop"
+          ? recordStop(command.commandId, "thread.stop").pipe(
+              Effect.as({ sequence: 0, storedEvents: [] } as never),
+            )
+          : Effect.die(`The box does not expect ${command.type}`),
     stopDelegatedTasks: (input) => recordStop(input.commandId, "delegated-tasks"),
   });
   const layerBoxLaunches = Layer.mock(ThreadLaunch.ThreadLaunchService)({
@@ -358,8 +439,9 @@ const boxToolkitLayer = (thread: BoxThread) => {
         ),
       ),
   });
-  return Layer.merge(
+  return Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit,
+    McpHttpServer.layerThreadToolkit,
     McpHttpServer.layerProjectRegistration,
   ).pipe(
     Layer.provide(NodeCrypto.layer),
@@ -377,9 +459,16 @@ const boxToolkitLayer = (thread: BoxThread) => {
         Layer.provide(NodeServices.layer),
       ),
     ),
-    Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
-    Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+    Layer.provide(
+      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    ),
+    Layer.provide(
+      Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+        list: () => Effect.succeed([]),
+      }),
+    ),
     Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+    Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
     Layer.provide(
       Layer.mock(ProjectService.ProjectService)({
         // More than a page, so finding the project with this repository pages.
@@ -483,8 +572,14 @@ const makeLaptop = (
       Layer.provide(Layer.succeedContext(linking)),
       Layer.provide(NodeCrypto.layer),
       Layer.provideMerge(layerThreads),
-      Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
-      Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+      Layer.provide(
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+      ),
+      Layer.provide(
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+      ),
       Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
       Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
       Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
@@ -631,9 +726,13 @@ const seedParent = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>) =>
     });
   });
 
-const delegateToBox = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>) =>
+const delegateToBox = (
+  laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>,
+  followUpQuestions?: "parent" | "user",
+) =>
   laptopEnv
     .call("delegate_task", {
+      ...(followUpQuestions === undefined ? {} : { followUpQuestions }),
       task: "Run the full suite on the box.",
       target: {
         environmentId: box.environmentId,
@@ -1256,6 +1355,296 @@ it.effect("a local task runs in this thread's project", () =>
       });
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).toContain("invalid_request");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+const questionId = RuntimeRequestId.make("request:box-question");
+const askBox = (
+  thread: BoxThread,
+  id = questionId,
+  runId = boxRunId,
+  kind: BoxQuestion["kind"] = "user_input",
+) =>
+  SubscriptionRef.update(thread.questions, (requests) => [
+    ...requests,
+    { id, runId, kind, status: "pending" as const },
+  ]);
+const questionNotice = (a: Effect.Success<ReturnType<typeof makeLaptop>>, taskId: NodeId) =>
+  a.orchestrator
+    .streamStoredEventsFrom({
+      threadId: parentThreadId,
+      afterSequence: 0,
+      eventType: "message.updated",
+    })
+    .pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "message.updated" &&
+          stored.event.payload.id.startsWith("message:remote-question:") &&
+          stored.event.payload.notification?.source.kind === "delegated_task" &&
+          stored.event.payload.notification.source.taskIds.includes(taskId),
+      ),
+      Stream.runHead,
+    );
+
+it.effect(
+  "parent-handled remote questions are readable and answerable without completing the task",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* askBox(thread);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const delegated = yield* delegateToBox(a, "parent");
+        const notice = yield* questionNotice(a, delegated.taskId);
+        expect(Option.isSome(notice)).toBe(true);
+        const parent = yield* a.orchestrator.getThreadProjection(parentThreadId);
+        expect(parent.subagents[0]).toMatchObject({
+          status: "running",
+          result: null,
+          remoteChild: { followUpQuestions: "parent", reportedRequestIds: [questionId] },
+        });
+        expect(
+          parent.messages.filter((message) => message.id.startsWith("message:remote-question:")),
+        ).toHaveLength(1);
+        const target = { taskId: delegated.taskId, requestId: questionId };
+        const read = yield* a.call("task_question_read", target);
+        expect(read.isError, JSON.stringify(read.content)).toBe(false);
+        expect(read.structuredContent).toMatchObject({
+          requestId: questionId,
+          questions: [{ id: "branch", question: "Which branch should I use?" }],
+        });
+        const answered = yield* a.call("task_question_respond", {
+          ...target,
+          answers: { branch: ["main"] },
+        });
+        expect(answered.isError, JSON.stringify(answered.content)).toBe(false);
+        expect(yield* Ref.get(thread.answers)).toEqual({ branch: ["main"] });
+        // A human or another answer winning the race is rejected rather than applied twice.
+        expect(
+          (yield* a.call("task_question_respond", { ...target, answers: { branch: ["other"] } }))
+            .isError,
+        ).toBe(true);
+        expect(yield* Ref.get(thread.answers)).toEqual({ branch: ["main"] });
+        yield* Ref.set(thread.reply, "Answered and finished.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
+          status: "completed",
+          result: "Answered and finished.",
+        });
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "user-handled remote questions stay on the destination and cannot be answered by the parent tools",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* askBox(thread);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const a = yield* makeLaptop(yield* SqlitePersistence.layerMemory.pipe(Layer.build), offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const delegated = yield* delegateToBox(a);
+        yield* Deferred.await(thread.waitStarted);
+        const parent = yield* a.orchestrator.getThreadProjection(parentThreadId);
+        expect(
+          parent.messages.filter((message) => message.id.startsWith("message:remote-question:")),
+        ).toHaveLength(0);
+        expect(
+          (yield* a.call("task_question_read", { taskId: delegated.taskId, requestId: questionId }))
+            .isError,
+        ).toBe(true);
+        expect(
+          (yield* a.call("task_question_respond", {
+            taskId: delegated.taskId,
+            requestId: questionId,
+            answers: { branch: ["main"] },
+          })).isError,
+        ).toBe(true);
+        expect(yield* Ref.get(thread.answers)).toBeNull();
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "cancelling a remote task cancels its queued question notice and prevents later answers",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* askBox(thread);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const a = yield* makeLaptop(yield* SqlitePersistence.layerMemory.pipe(Layer.build), offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const delegated = yield* delegateToBox(a, "parent");
+        const notice = yield* questionNotice(a, delegated.taskId);
+        expect(Option.isSome(notice)).toBe(true);
+        yield* a.call("task_cancel", { taskId: delegated.taskId });
+        const parent = yield* a.orchestrator.getThreadProjection(parentThreadId);
+        if (Option.isSome(notice) && notice.value.event.type === "message.updated") {
+          const noticeId = notice.value.event.payload.id;
+          expect(parent.runs.find((run) => run.userMessageId === noticeId)?.status).toBe(
+            "cancelled",
+          );
+        }
+        expect(
+          (yield* a.call("task_question_respond", {
+            taskId: delegated.taskId,
+            requestId: questionId,
+            answers: { branch: ["main"] },
+          })).isError,
+        ).toBe(true);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each([
+  { kind: "command" as const, label: "approval" },
+  { kind: "auth_refresh" as const, label: "sign in" },
+])(
+  "remote $label notices ask the user and never grant approval authority to question tools",
+  ({ kind, label }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* askBox(thread, questionId, boxRunId, kind);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const a = yield* makeLaptop(yield* SqlitePersistence.layerMemory.pipe(Layer.build), offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const delegated = yield* delegateToBox(a, "parent");
+        const notice = yield* questionNotice(a, delegated.taskId);
+        expect(Option.isSome(notice)).toBe(true);
+        if (Option.isSome(notice) && notice.value.event.type === "message.updated") {
+          expect(notice.value.event.payload.text).toContain(
+            "Only the user may approve permissions",
+          );
+          expect(notice.value.event.payload.notification?.summary).toContain(label);
+        }
+        expect(
+          (yield* a.call("task_question_read", { taskId: delegated.taskId, requestId: questionId }))
+            .isError,
+        ).toBe(true);
+        expect(
+          (yield* a.call("task_question_respond", {
+            taskId: delegated.taskId,
+            requestId: questionId,
+            answers: { branch: ["main"] },
+          })).isError,
+        ).toBe(true);
+        expect(yield* Ref.get(thread.answers)).toBeNull();
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "remote question reports survive source restart without duplicate notices and a later question is reported",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* askBox(thread);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const kept = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
+        const taskId = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const a = yield* makeLaptop(database, offers, kept);
+            yield* linkTo(a.links, b, "full-access");
+            yield* seedParent(a);
+            const task = yield* delegateToBox(a, "parent");
+            yield* questionNotice(a, task.taskId);
+            return task.taskId;
+          }),
+        );
+        const restarted = yield* makeLaptop(database, offers, kept);
+        yield* restarted.remote.start();
+        const secondId = RuntimeRequestId.make("request:second-question");
+        yield* askBox(thread, secondId);
+        const second = yield* restarted.orchestrator
+          .streamStoredEventsFrom({
+            threadId: parentThreadId,
+            afterSequence: 0,
+            eventType: "subagent.updated",
+          })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "subagent.updated" &&
+                stored.event.payload.remoteChild?.reportedRequestIds?.includes(secondId) === true,
+            ),
+            Stream.runHead,
+          );
+        expect(Option.isSome(second)).toBe(true);
+        const parent = yield* restarted.orchestrator.getThreadProjection(parentThreadId);
+        expect(
+          parent.messages.filter((message) => message.id.startsWith("message:remote-question:")),
+        ).toHaveLength(2);
+        expect(
+          (yield* restarted.call("task_question_read", { taskId, requestId: secondId })).isError,
+        ).toBe(false);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("question answers require the owning parent and a current destination grant", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      yield* askBox(thread);
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const a = yield* makeLaptop(yield* SqlitePersistence.layerMemory.pipe(Layer.build), offers);
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      const delegated = yield* delegateToBox(a, "parent");
+      yield* questionNotice(a, delegated.taskId);
+      const target = { taskId: delegated.taskId, requestId: questionId };
+      expect(
+        (yield* a.call("task_question_read", { ...target, requestId: "request:unreported" }))
+          .isError,
+      ).toBe(true);
+      const anotherParent = {
+        ...parentScope,
+        thread: { ...parentScope.thread!, threadId: ThreadId.make("thread:unrelated") },
+      };
+      expect((yield* a.remote.readQuestion(anotherParent, target).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      const [session] = yield* b.linkedSessions;
+      yield* b.auth.revokeSession(session!.sessionId);
+      expect(
+        (yield* a.call("task_question_respond", { ...target, answers: { branch: ["main"] } }))
+          .isError,
+      ).toBe(true);
+      expect(yield* Ref.get(thread.answers)).toBeNull();
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

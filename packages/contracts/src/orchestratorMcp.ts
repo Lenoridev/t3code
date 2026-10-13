@@ -13,6 +13,7 @@ import {
   PositiveInt,
   ProjectId,
   RunId,
+  RuntimeRequestId,
   ScheduledTaskId,
   SecretRef,
   ThreadId,
@@ -29,6 +30,7 @@ import { ThreadLinkedPullRequest } from "./threadPullRequest.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
   OrchestrationV2Actor,
+  OrchestrationV2RuntimeRequest,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
@@ -169,6 +171,12 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
   typeof OrchestratorMcpTerminalDelegatedTaskStatus.Type;
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
+  followUpQuestions: Schema.optional(
+    Schema.Literals(["user", "parent"]).annotate({
+      description:
+        "Remote tasks only. Defaults to user: answer questions in the destination thread. Parent opts into server-owned question notices and task_question_read/task_question_respond. Permission approvals and sign-in still need the user.",
+    }),
+  ),
   task: OrchestratorMcpPrompt.annotate({
     description: "Self-contained task for one delegated child agent/subagent.",
   }),
@@ -479,6 +487,8 @@ export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Number),
+  untilPendingRequest: Schema.optional(Schema.Boolean),
+  ignoreRequestIds: Schema.optional(Schema.Array(RuntimeRequestId)),
 });
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
 
@@ -487,6 +497,11 @@ export const OrchestratorMcpThreadWaitResult = Schema.Struct({
   runId: Schema.NullOr(RunId),
   status: OrchestratorMcpThreadStatus,
   timedOut: Schema.Boolean,
+  pendingRequests: Schema.optional(
+    Schema.Array(
+      Schema.Struct({ id: RuntimeRequestId, kind: OrchestrationV2RuntimeRequest.fields.kind }),
+    ),
+  ),
 });
 export type OrchestratorMcpThreadWaitResult = typeof OrchestratorMcpThreadWaitResult.Type;
 
@@ -567,6 +582,7 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   providers: Schema.Array(OrchestratorMcpProviderCapability),
   features: Schema.Struct({
+    remoteQuestionHandling: Schema.optional(Schema.Boolean),
     appOwnedSubagents: Schema.Boolean,
     asyncPolling: Schema.Boolean,
     cancellation: Schema.Boolean,

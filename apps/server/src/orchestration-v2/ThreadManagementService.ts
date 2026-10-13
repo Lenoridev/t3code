@@ -21,6 +21,7 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
   type OrchestrationV2Run,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadTranscript,
@@ -31,6 +32,7 @@ import {
   ProviderInstanceId,
   resolveProjectProviderInstanceEnabled,
   RunId,
+  type RuntimeRequestId,
   type ScheduledTaskId,
   ThreadId,
   type TurnItemId,
@@ -109,6 +111,7 @@ export function existingThreadIdsForCommand(
     case "delegated_task.completion-delivery.dispose":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
+    case "delegated_task.remote.question":
       return [command.parentThreadId];
     case "thread.created.record":
       return command.parentThreadId === command.targetThreadId
@@ -156,12 +159,15 @@ export interface ThreadManagementWaitInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly timeoutMs: number;
+  readonly untilPendingRequest?: boolean;
+  readonly ignoreRequestIds?: ReadonlyArray<RuntimeRequestId>;
 }
 
 export interface ThreadManagementWaitResult {
   readonly threadId: ThreadId;
   readonly run: OrchestrationV2Run | null;
   readonly timedOut: boolean;
+  readonly pendingRequests?: ReadonlyArray<Pick<OrchestrationV2RuntimeRequest, "id" | "kind">>;
 }
 
 export interface ThreadManagementInterruptInput {
@@ -845,12 +851,23 @@ const make = Effect.gen(function* () {
           threadId: input.threadId,
           cause,
         });
-      // Taken before the first read, so a run update between that read and
-      // the subscription below still replays.
+      // Capture the cursor before reading so a question arriving during setup replays.
       const afterSequence = yield* orchestrator
         .getThreadEventSequence(input.threadId)
         .pipe(Effect.mapError(loadError));
-      const target = yield* getProjectThreadRecords(input, ["runs"]);
+      const loadRecords = (runIds?: ReadonlyArray<RunId>) =>
+        input.untilPendingRequest === true
+          ? getProjectThreadRecords(
+              input,
+              ["runs", "runtimeRequests", "nodes"],
+              runIds === undefined ? undefined : { runIds },
+            )
+          : getProjectThreadRecords(
+              input,
+              ["runs"],
+              runIds === undefined ? undefined : { runIds },
+            ).pipe(Effect.map((records) => ({ ...records, runtimeRequests: [], nodes: [] })));
+      const target = yield* loadRecords();
       const selectedRun =
         input.runId === undefined
           ? latestRun(target)
@@ -861,76 +878,76 @@ const make = Effect.gen(function* () {
           runId: input.runId,
         });
       }
-      if (selectedRun === undefined) {
+      if (selectedRun === undefined)
         return { threadId: input.threadId, run: null, timedOut: false };
-      }
-      // A restart cuts a run and continues it as a new run. Follow that chain,
-      // so a cut run is not the answer while its continuation is pending.
-      const outcome = (runs: ReadonlyArray<OrchestrationV2Run>) =>
+      const ignored = new Set(input.ignoreRequestIds ?? []);
+      const outcome = (records: typeof target) =>
         Effect.gen(function* () {
-          const current = runs.find((candidate) => candidate.id === selectedRun.id);
+          const current = records.runs.find((candidate) => candidate.id === selectedRun.id);
           if (current === undefined) {
             return yield* new ThreadManagementRunNotFoundError({
               threadId: input.threadId,
               runId: selectedRun.id,
             });
           }
-          const run = latestRestartContinuation(runs, current);
-          const pending =
+          // Opt-in request handling stays pinned to the delegated run, as do its
+          // source-side request ownership checks.
+          const run = input.untilPendingRequest === true
+            ? current
+            : latestRestartContinuation(records.runs, current);
+          const pending = input.untilPendingRequest !== true &&
             isTerminalRunStatus(run.status) &&
             (yield* orchestrator.restartContinuationPending(run));
-          return { run, pending, settled: isTerminalRunStatus(run.status) && !pending };
+          const requests = input.untilPendingRequest === true
+            ? records.runtimeRequests.filter((request) =>
+                records.nodes.some((node) => node.id === request.nodeId && node.runId === run.id) &&
+                request.kind !== "dynamic_tool_call" && request.status === "pending")
+                .map((request) => ({ id: request.id, kind: request.kind }))
+            : [];
+          const unreported = requests.filter((request) => !ignored.has(request.id));
+          const timedOut = unreported.length === 0 &&
+            (!isTerminalRunStatus(run.status) || pending || requests.length > 0);
+          return {
+            run, pending, settled: !timedOut,
+            result: {
+              threadId: input.threadId, run, timedOut,
+              ...(input.untilPendingRequest === true ? { pendingRequests: unreported } : {}),
+            },
+          };
         });
-      const initial = yield* outcome(target.runs);
-      if (initial.settled) {
-        return { threadId: input.threadId, run: initial.run, timedOut: false };
-      }
-
-      // A declined continuation records no event, so its effect settling wakes
-      // the wait too.
+      const initial = yield* outcome(target);
+      if (initial.settled) return initial.result;
+      const runEvents = Stream.merge(
+        orchestrator.streamStoredEventsFrom({
+          threadId: input.threadId, afterSequence, eventType: "run.updated",
+        }),
+        orchestrator.streamStoredEventsFrom({
+          threadId: input.threadId, afterSequence, eventType: "thread.deleted",
+        }),
+      );
+      const events = input.untilPendingRequest === true
+        ? Stream.merge(runEvents, orchestrator.streamStoredEventsFrom({
+            threadId: input.threadId, afterSequence, eventType: "runtime-request.updated",
+          }))
+        : runEvents;
       const wait = Stream.merge(
-        Stream.merge(
-          orchestrator.streamStoredEventsFrom({
-            threadId: input.threadId,
-            afterSequence,
-            eventType: "run.updated",
-          }),
-          orchestrator.streamStoredEventsFrom({
-            threadId: input.threadId,
-            afterSequence,
-            eventType: "thread.deleted",
-          }),
-        ).pipe(
+        events.pipe(
           Stream.mapError(loadError),
-          Stream.filter(
-            (stored) =>
-              stored.event.type !== "run.updated" ||
-              stored.event.payload.id === selectedRun.id ||
-              stored.event.payload.restartContinuationOfRunId !== undefined,
-          ),
+          Stream.filter((stored) => stored.event.type !== "run.updated" ||
+            stored.event.payload.id === selectedRun.id ||
+            stored.event.payload.restartContinuationOfRunId !== undefined),
         ),
         initial.pending
           ? Stream.fromEffect(orchestrator.awaitRestartContinuation(initial.run))
           : Stream.empty,
       ).pipe(
-        Stream.mapEffect(() =>
-          getProjectThreadRecords(input, ["runs"]).pipe(
-            Effect.flatMap((current) => outcome(current.runs)),
-          ),
-        ),
-        Stream.filter((current) => current.settled),
+        Stream.mapEffect(() => loadRecords().pipe(Effect.flatMap(outcome))),
+        Stream.filter((snapshot) => snapshot.settled),
         Stream.runHead,
         Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
       );
       const waited = Option.flatten(yield* wait);
-      if (Option.isSome(waited)) {
-        return { threadId: input.threadId, run: waited.value.run, timedOut: false };
-      }
-      // The run may have reached a terminal status while the timeout was
-      // winning the race; the final projection read decides what actually
-      // happened, so only a still-active run counts as timed out.
-      const final = yield* outcome((yield* getProjectThreadRecords(input, ["runs"])).runs);
-      return { threadId: input.threadId, run: final.run, timedOut: !final.settled };
+      return Option.isSome(waited) ? waited.value.result : (yield* outcome(yield* loadRecords())).result;
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(
