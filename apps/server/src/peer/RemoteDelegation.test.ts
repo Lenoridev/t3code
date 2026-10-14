@@ -91,6 +91,7 @@ interface BoxThread {
   readonly questions: SubscriptionRef.SubscriptionRef<ReadonlyArray<BoxQuestion>>;
   readonly answers: Ref.Ref<ProviderUserInputAnswers | null>;
   readonly waitStarted: Deferred.Deferred<void>;
+  readonly waitingOnReportedQuestion: Deferred.Deferred<void>;
 
   readonly launched: Ref.Ref<ThreadId | null>;
   /** The link session that launched it, as the box stamps it. */
@@ -128,6 +129,7 @@ const makeBoxThread = Effect.gen(function* () {
     questions: yield* SubscriptionRef.make<ReadonlyArray<BoxQuestion>>([]),
     answers: yield* Ref.make<ProviderUserInputAnswers | null>(null),
     waitStarted: yield* Deferred.make<void>(),
+    waitingOnReportedQuestion: yield* Deferred.make<void>(),
     launched: yield* Ref.make<ThreadId | null>(null),
     linkOrigin: yield* Ref.make<{ readonly sessionId: string; readonly label: string } | null>(
       null,
@@ -284,6 +286,9 @@ const boxToolkitLayer = (thread: BoxThread) => {
           });
         }
         yield* Deferred.succeed(thread.waitStarted, undefined);
+        if (input.ignoreRequestIds?.length) {
+          yield* Deferred.succeed(thread.waitingOnReportedQuestion, undefined);
+        }
         const pending =
           input.untilPendingRequest === true
             ? SubscriptionRef.changes(thread.questions).pipe(
@@ -302,7 +307,23 @@ const boxToolkitLayer = (thread: BoxThread) => {
                 Effect.map((ids) => ({ questions: Option.getOrElse(ids, () => []) })),
               )
             : Effect.never;
-        const done = yield* Deferred.await(thread.finished).pipe(
+        const finished = Deferred.await(thread.finished).pipe(
+          Effect.andThen(
+            input.untilPendingRequest === true
+              ? SubscriptionRef.changes(thread.questions).pipe(
+                  Stream.filter(
+                    (requests) =>
+                      !requests.some(
+                        (request) =>
+                          request.runId === (input.runId ?? runId) && request.status === "pending",
+                      ),
+                  ),
+                  Stream.runHead,
+                )
+              : Effect.void,
+          ),
+        );
+        const done = yield* finished.pipe(
           Effect.as({ questions: [] as ReadonlyArray<Pick<BoxQuestion, "id" | "kind">> }),
           Effect.raceFirst(pending),
           Effect.timeoutOption(input.timeoutMs),
@@ -1380,13 +1401,14 @@ const questionNotice = (a: Effect.Success<ReturnType<typeof makeLaptop>>, taskId
       Stream.runHead,
     );
 
-it.effect(
-  "parent-handled remote questions are readable and answerable without completing the task",
-  () =>
+it.effect.each(["running", "completed"] as const)(
+  "parent-handled remote questions remain answerable when the child run is %s",
+  (status) =>
     Effect.scoped(
       Effect.gen(function* () {
         const thread = yield* makeBoxThread;
         yield* askBox(thread);
+        yield* Ref.set(thread.status, status);
         const b = yield* serveBox(thread);
         const offers = yield* SubscriptionRef.make<
           ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
@@ -1396,7 +1418,9 @@ it.effect(
         yield* linkTo(a.links, b, "full-access");
         yield* seedParent(a);
         const delegated = yield* delegateToBox(a, "parent");
-        const notice = yield* questionNotice(a, delegated.taskId);
+        const notice = yield* questionNotice(a, delegated.taskId).pipe(
+          Effect.raceFirst(taskResult(a, delegated.taskId).pipe(Effect.as(Option.none()))),
+        );
         expect(Option.isSome(notice)).toBe(true);
         const parent = yield* a.orchestrator.getThreadProjection(parentThreadId);
         expect(parent.subagents[0]).toMatchObject({
@@ -1407,6 +1431,12 @@ it.effect(
         expect(
           parent.messages.filter((message) => message.id.startsWith("message:remote-question:")),
         ).toHaveLength(1);
+        yield* Deferred.await(thread.waitingOnReportedQuestion);
+        const taskStatus = yield* a.call("task_status", { taskId: delegated.taskId });
+        expect(taskStatus.structuredContent).toMatchObject({
+          status: "running",
+          workState: "working",
+        });
         const target = { taskId: delegated.taskId, requestId: questionId };
         const read = yield* a.call("task_question_read", target);
         expect(read.isError, JSON.stringify(read.content)).toBe(false);

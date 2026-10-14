@@ -733,24 +733,27 @@ const make = Effect.gen(function* () {
                     (node) => node.id === request.nodeId && node.runId === selectedRun.id,
                   ) &&
                   request.kind !== "dynamic_tool_call" &&
-                  request.status === "pending" &&
-                  !ignored.has(request.id),
+                  request.status === "pending",
               )
               .map((request) => ({ id: request.id, kind: request.kind }))
           : [];
       const result = (
         run: OrchestrationV2Run,
         pending: ReadonlyArray<Pick<OrchestrationV2RuntimeRequest, "id" | "kind">>,
-      ) => ({
-        threadId: input.threadId,
-        run,
-        timedOut: !isTerminalRunStatus(run.status) && pending.length === 0,
-        ...(input.untilPendingRequest === true ? { pendingRequests: pending } : {}),
-      });
-      const firstQuestions = questions(target);
-      if (isTerminalRunStatus(selectedRun.status) || firstQuestions.length > 0) {
-        return result(selectedRun, firstQuestions);
-      }
+      ) => {
+        const unreported = pending.filter((request) => !ignored.has(request.id));
+        return {
+          threadId: input.threadId,
+          run,
+          // A terminal turn can still have a live question. Reporting it suppresses
+          // duplicate notices, but the opt-in wait must hold until it resolves.
+          timedOut:
+            unreported.length === 0 && (!isTerminalRunStatus(run.status) || pending.length > 0),
+          ...(input.untilPendingRequest === true ? { pendingRequests: unreported } : {}),
+        };
+      };
+      const first = result(selectedRun, questions(target));
+      if (!first.timedOut) return first;
       const runEvents = Stream.merge(
         orchestrator.streamStoredEventsFrom({
           threadId: input.threadId,

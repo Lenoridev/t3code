@@ -644,3 +644,109 @@ it.effect(
       });
     }),
 );
+
+it.effect.each(["completed", "failed", "interrupted", "cancelled", "rolled_back"] as const)(
+  "question waits hold a %s run until its reported request resolves",
+  (status) =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project:terminal-question");
+      const threadId = ThreadId.make("thread:terminal-question");
+      const runId = RunId.make("run:terminal-question");
+      const requestId = RuntimeRequestId.make("request:terminal-question");
+      let subscribed = yield* Deferred.make<void>();
+      const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      let pending = true;
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(
+          ThreadManagementService.layer.pipe(
+            Layer.provide(
+              Layer.mock(Orchestrator.OrchestratorV2)({
+                getThreadEventSequence: () => Effect.succeed(10),
+                streamStoredEventsFrom: (input) =>
+                  input?.eventType === "runtime-request.updated"
+                    ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                        Stream.drain,
+                        Stream.concat(Stream.fromQueue(events)),
+                      )
+                    : Stream.never,
+                getThreadRecords: () =>
+                  Effect.sync(
+                    () =>
+                      ({
+                        thread: { id: threadId, projectId, deletedAt: null },
+                        runs: [{ id: runId, status }],
+                        nodes: [{ id: "node:own", runId }],
+                        runtimeRequests: [
+                          {
+                            id: requestId,
+                            nodeId: "node:own",
+                            kind: "user_input",
+                            status: pending ? "pending" : "resolved",
+                          },
+                          {
+                            id: "request:other",
+                            nodeId: "node:other",
+                            kind: "user_input",
+                            status: "pending",
+                          },
+                          {
+                            id: "request:internal",
+                            nodeId: "node:own",
+                            kind: "dynamic_tool_call",
+                            status: "pending",
+                          },
+                        ],
+                      }) as unknown as OrchestrationV2ThreadProjection,
+                  ),
+              }),
+            ),
+          ),
+        ),
+      );
+      const input = { projectId, threadId, runId, timeoutMs: 60000 };
+      // Default waits remain terminal-only even with a pending question.
+      expect(yield* service.waitForThread(input)).toMatchObject({
+        timedOut: false,
+        run: { status },
+      });
+      expect(yield* service.waitForThread({ ...input, untilPendingRequest: true })).toMatchObject({
+        timedOut: false,
+        run: { status },
+        pendingRequests: [{ id: requestId, kind: "user_input" }],
+      });
+      const fiber = yield* service
+        .waitForThread({
+          ...input,
+          untilPendingRequest: true,
+          ignoreRequestIds: [requestId],
+        })
+        .pipe(Effect.forkChild);
+      // Reporting a request suppresses duplicate notices, never the outstanding wait.
+      yield* TestClock.adjust(Duration.millis(input.timeoutMs));
+      expect(yield* Fiber.join(fiber)).toMatchObject({
+        timedOut: true,
+        run: { status },
+        pendingRequests: [],
+      });
+      subscribed = yield* Deferred.make<void>();
+      const resumed = yield* service
+        .waitForThread({
+          ...input,
+          untilPendingRequest: true,
+          ignoreRequestIds: [requestId],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(subscribed);
+      // The request resolution event wakes the selected-run wait without another run update.
+      pending = false;
+      yield* Queue.offer(events, {
+        sequence: 11,
+        event: { type: "runtime-request.updated", threadId },
+      } as unknown as OrchestrationV2StoredEvent);
+      expect(yield* Fiber.join(resumed)).toMatchObject({
+        timedOut: false,
+        run: { status },
+        pendingRequests: [],
+      });
+    }),
+);

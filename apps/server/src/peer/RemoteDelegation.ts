@@ -601,8 +601,8 @@ const make = Effect.gen(function* () {
       if (waited.timedOut) return false;
       if (
         waited.pendingRequests !== undefined &&
+        waited.pendingRequests.length > 0 &&
         waited.runId !== null &&
-        !isTerminal(waited.status) &&
         remote.followUpQuestions === "parent"
       ) {
         for (const request of waited.pendingRequests) {
