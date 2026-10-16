@@ -742,8 +742,14 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
    * task's run that ended there by itself also sets it, unless the task here
    * was cancelled or stopped, which still owes a stop for whatever runs on the
    * thread there now. Its follower keeps sending that stop, across restarts.
+   * `false` is a stop owed by a Stop here on a task that already had its result.
    */
   stoppedThere: Schema.optional(Schema.Boolean),
+  /**
+   * Stops asked for here once the task had its result. The count names the
+   * one owed, so each reaches the thread there once however often it is sent.
+   */
+  stopCount: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationV2RemoteTaskChild = typeof OrchestrationV2RemoteTaskChild.Type;
 
@@ -3127,6 +3133,19 @@ const OrchestrationV2InternalCommand = Schema.Union([
     stoppedThere: Schema.optional(Schema.Literals(["ran-out", "stopped"])),
     /** Preserve launch uncertainty even when cancellation already supplied the task result. */
     launchError: Schema.optional(Schema.String),
+  }),
+  /**
+   * Owes a stop to the thread there of a remote task that already has its
+   * result, as Stop on a parent stops a finished child here: whatever runs on
+   * that thread now is stopped. The task keeps its status, result and
+   * completion delivery; its follower sends the stop and reports it with
+   * `delegated_task.remote.complete`.
+   */
+  Schema.Struct({
+    type: Schema.Literal("delegated_task.remote.stop"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
   }),
   Schema.Struct({
     type: Schema.Literal("checkpoint.rollback.fail"),

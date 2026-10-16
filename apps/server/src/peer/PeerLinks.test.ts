@@ -215,6 +215,21 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");
 
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      // A link made with a peer that later answers without the fence, as
+      // one made before the fence or a peer moved back to such a version.
+      yield* Ref.set(b.descriptor, descriptorOf("environment-box", "Box", { linkFence: false }));
+      yield* Ref.set(b.bearers, []);
+      const unfenced = yield* probe(a).pipe(Effect.flip);
+      expect(unfenced.code).toBe("capability_denied");
+      expect(unfenced.message).toContain("cannot keep a linked agent's limits");
+      expect(yield* Ref.get(b.bearers)).toEqual([]);
+      yield* Ref.set(b.descriptor, box);
+
       yield* TestClock.adjust(Duration.days(31));
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);
       yield* Ref.set(b.bearers, []);

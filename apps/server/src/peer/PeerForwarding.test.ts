@@ -246,7 +246,10 @@ const makeLaptop = Effect.gen(function* () {
   );
   const here = yield* Layer.build(layerHere);
   const server = Context.get(here, McpServer.McpServer);
-  const scopeOf = (caller: string): McpInvocationContext.McpInvocationScope => ({
+  const scopeOf = (
+    caller: string,
+    capabilities: ReadonlySet<McpInvocationContext.McpCapability> = new Set(["orchestration"]),
+  ): McpInvocationContext.McpInvocationScope => ({
     environmentId: laptop.environmentId,
     requestNamespace: `provider-session:${caller}`,
     thread: {
@@ -255,14 +258,22 @@ const makeLaptop = Effect.gen(function* () {
       providerInstanceId: ProviderInstanceId.make("codex"),
     },
     client: undefined,
-    capabilities: new Set(["orchestration"]),
+    capabilities,
     issuedAt: 1,
   });
-  const call = (caller: string, name: string, args: Record<string, unknown>) =>
+  const call = (
+    caller: string,
+    name: string,
+    args: Record<string, unknown>,
+    capabilities?: ReadonlySet<McpInvocationContext.McpCapability>,
+  ) =>
     server
       .callTool({ name, arguments: args })
       .pipe(
-        Effect.provideService(McpInvocationContext.McpInvocationContext, scopeOf(caller)),
+        Effect.provideService(
+          McpInvocationContext.McpInvocationContext,
+          scopeOf(caller, capabilities),
+        ),
         Effect.provideService(McpSchema.McpServerClient, mcpClient),
       );
   return { links: Context.get(linking, PeerLinks.PeerLinks), call };
@@ -464,6 +475,35 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
         threadId: boxThread,
       });
       expect(failureOf(unknown)).toMatchObject({ code: "invalid_request" });
+      expect(yield* Ref.get(b.bearers)).toEqual([]);
+
+      // The box sees only the link's credential, so one that may not control
+      // threads here may not reach them there either.
+      const previewOnly = new Set<McpInvocationContext.McpCapability>(["preview"]);
+      for (const [name, args] of [
+        ["t3_environment_links", {}],
+        ["t3_project_list", { environmentId: box.environmentId }],
+        ["t3_thread_list", { environmentId: box.environmentId, projectId: boxProject }],
+        ["t3_thread_read", { environmentId: box.environmentId, threadId: boxThread }],
+        ["t3_thread_wait", { environmentId: box.environmentId, threadId: boxThread }],
+        [
+          "t3_thread_send",
+          { environmentId: box.environmentId, threadId: boxThread, message: "Carry on there." },
+        ],
+        [
+          "t3_thread_launch",
+          {
+            environmentId: box.environmentId,
+            projectId: boxProject,
+            title: "Start there",
+            modelSelection: { instanceId: "codex", model: "gpt-5" },
+            message: "Start there.",
+          },
+        ],
+      ] as const) {
+        const refused = yield* a.call("thread:laptop-full", name, args, previewOnly);
+        expect(failureOf(refused), name).toMatchObject({ code: "capability_denied" });
+      }
       expect(yield* Ref.get(b.bearers)).toEqual([]);
 
       // Work a desk's link started here never uses this laptop's links: the
