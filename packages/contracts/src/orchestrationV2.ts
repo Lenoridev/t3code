@@ -3133,6 +3133,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     stoppedThere: Schema.optional(Schema.Literals(["ran-out", "stopped"])),
     /** Preserve launch uncertainty even when cancellation already supplied the task result. */
     launchError: Schema.optional(Schema.String),
+    /** The stop generation this report acknowledges; absent for the original unnumbered stop. */
+    stopCount: Schema.optional(NonNegativeInt),
   }),
   /**
    * Owes a stop to the thread there of a remote task that already has its
