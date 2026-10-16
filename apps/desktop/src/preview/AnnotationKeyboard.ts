@@ -12,7 +12,12 @@ export function handleAnnotationKeyEvent(
   event: AnnotationKeyboardEvent &
     Pick<
       KeyboardEvent,
-      "type" | "target" | "preventDefault" | "stopImmediatePropagation" | "stopPropagation"
+      | "type"
+      | "target"
+      | "isTrusted"
+      | "preventDefault"
+      | "stopImmediatePropagation"
+      | "stopPropagation"
     >,
   input: {
     overlayTarget: EventTarget;
@@ -22,7 +27,8 @@ export function handleAnnotationKeyEvent(
 ): "cancel" | "select" | "marquee" | "draw" | "erase" | PreviewAnnotationSubmission | null {
   const inOverlay = event.target === input.overlayTarget;
   if (inOverlay) event.stopImmediatePropagation();
-  if (event.type !== "keydown") return null;
+  // Page scripts can target the visible shadow host without accessing the editor.
+  if (event.type !== "keydown" || !event.isTrusted) return null;
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopPropagation();

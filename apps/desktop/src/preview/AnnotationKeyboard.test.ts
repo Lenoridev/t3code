@@ -37,12 +37,18 @@ describe("resolveAnnotationSubmission", () => {
 });
 
 const dispatchKey = (
-  input: { inOverlay?: boolean; commentFocused?: boolean; canSend?: boolean } = {},
+  input: {
+    inOverlay?: boolean;
+    commentFocused?: boolean;
+    canSend?: boolean;
+    isTrusted?: boolean;
+  } = {},
   overrides: Partial<Parameters<typeof resolveAnnotationSubmission>[0]> = {},
   type = "keydown",
 ) => {
   const window = new EventTarget();
   const event = Object.assign(new Event(type, { cancelable: true }), keyboardEvent(overrides));
+  Object.defineProperty(event, "isTrusted", { value: input.isTrusted ?? true });
   const actions: Array<ReturnType<typeof handleAnnotationKeyEvent>> = [];
   let pageEvents = 0;
   window.addEventListener(type, () => {
@@ -100,6 +106,18 @@ describe("annotation keyboard isolation", () => {
       pageEvents: 0,
       defaultPrevented: true,
     });
+  });
+
+  it("ignores page-generated submission and cancellation events on the overlay host", () => {
+    expect(dispatchKey({ isTrusted: false })).toEqual({
+      action: null,
+      pageEvents: 0,
+      defaultPrevented: false,
+    });
+    expect(dispatchKey({ isTrusted: false }, { ctrlKey: true }).action).toBeNull();
+    expect(dispatchKey({ isTrusted: false }, { metaKey: true }).action).toBeNull();
+    expect(dispatchKey({ isTrusted: false }, { key: "Escape" }).action).toBeNull();
+    expect(dispatchKey({ isTrusted: false, inOverlay: false }, { key: "r" }).action).toBeNull();
   });
 
   it("leaves page keyboard input and tool selection outside the overlay available", () => {
