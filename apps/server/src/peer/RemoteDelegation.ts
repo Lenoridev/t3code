@@ -612,7 +612,7 @@ const make = Effect.gen(function* () {
           yield* threads.dispatch({
             type: "delegated_task.remote.question",
             commandId: CommandId.make(
-              `remote-question:${encodeURIComponent(parentThreadId)}:${encodeURIComponent(taskId)}:${encodeURIComponent(requestId)}:${yield* crypto.randomUUIDv4.pipe(Effect.orDie)}`,
+              `remote-question:${encodeURIComponent(parentThreadId)}:${encodeURIComponent(taskId)}:${encodeURIComponent(requestId)}:${yield* crypto.randomUUIDv4().pipe(Effect.orDie)}`,
             ),
             parentThreadId,
             taskId,

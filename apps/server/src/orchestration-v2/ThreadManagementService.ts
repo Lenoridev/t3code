@@ -21,6 +21,7 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
   type OrchestrationV2Run,
+  type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadTranscript,
@@ -891,25 +892,39 @@ const make = Effect.gen(function* () {
           }
           // Opt-in request handling stays pinned to the delegated run, as do its
           // source-side request ownership checks.
-          const run = input.untilPendingRequest === true
-            ? current
-            : latestRestartContinuation(records.runs, current);
-          const pending = input.untilPendingRequest !== true &&
+          const run =
+            input.untilPendingRequest === true
+              ? current
+              : latestRestartContinuation(records.runs, current);
+          const pending =
+            input.untilPendingRequest !== true &&
             isTerminalRunStatus(run.status) &&
             (yield* orchestrator.restartContinuationPending(run));
-          const requests = input.untilPendingRequest === true
-            ? records.runtimeRequests.filter((request) =>
-                records.nodes.some((node) => node.id === request.nodeId && node.runId === run.id) &&
-                request.kind !== "dynamic_tool_call" && request.status === "pending")
-                .map((request) => ({ id: request.id, kind: request.kind }))
-            : [];
+          const requests =
+            input.untilPendingRequest === true
+              ? records.runtimeRequests
+                  .filter(
+                    (request) =>
+                      records.nodes.some(
+                        (node) => node.id === request.nodeId && node.runId === run.id,
+                      ) &&
+                      request.kind !== "dynamic_tool_call" &&
+                      request.status === "pending",
+                  )
+                  .map((request) => ({ id: request.id, kind: request.kind }))
+              : [];
           const unreported = requests.filter((request) => !ignored.has(request.id));
-          const timedOut = unreported.length === 0 &&
+          const timedOut =
+            unreported.length === 0 &&
             (!isTerminalRunStatus(run.status) || pending || requests.length > 0);
           return {
-            run, pending, settled: !timedOut,
+            run,
+            pending,
+            settled: !timedOut,
             result: {
-              threadId: input.threadId, run, timedOut,
+              threadId: input.threadId,
+              run,
+              timedOut,
               ...(input.untilPendingRequest === true ? { pendingRequests: unreported } : {}),
             },
           };
@@ -918,35 +933,52 @@ const make = Effect.gen(function* () {
       if (initial.settled) return initial.result;
       const runEvents = Stream.merge(
         orchestrator.streamStoredEventsFrom({
-          threadId: input.threadId, afterSequence, eventType: "run.updated",
+          threadId: input.threadId,
+          afterSequence,
+          eventType: "run.updated",
         }),
         orchestrator.streamStoredEventsFrom({
-          threadId: input.threadId, afterSequence, eventType: "thread.deleted",
+          threadId: input.threadId,
+          afterSequence,
+          eventType: "thread.deleted",
         }),
       );
-      const events = input.untilPendingRequest === true
-        ? Stream.merge(runEvents, orchestrator.streamStoredEventsFrom({
-            threadId: input.threadId, afterSequence, eventType: "runtime-request.updated",
-          }))
-        : runEvents;
+      const events =
+        input.untilPendingRequest === true
+          ? Stream.merge(
+              runEvents,
+              orchestrator.streamStoredEventsFrom({
+                threadId: input.threadId,
+                afterSequence,
+                eventType: "runtime-request.updated",
+              }),
+            )
+          : runEvents;
+      const load = loadRecords(
+        input.untilPendingRequest === true ? [selectedRun.id] : undefined,
+      ).pipe(Effect.flatMap(outcome));
+      // A declined continuation records no event; its effect settling also wakes the wait.
       const wait = Stream.merge(
         events.pipe(
           Stream.mapError(loadError),
-          Stream.filter((stored) => stored.event.type !== "run.updated" ||
-            stored.event.payload.id === selectedRun.id ||
-            stored.event.payload.restartContinuationOfRunId !== undefined),
+          Stream.filter(
+            (stored) =>
+              stored.event.type !== "run.updated" ||
+              stored.event.payload.id === selectedRun.id ||
+              stored.event.payload.restartContinuationOfRunId !== undefined,
+          ),
         ),
         initial.pending
           ? Stream.fromEffect(orchestrator.awaitRestartContinuation(initial.run))
           : Stream.empty,
       ).pipe(
-        Stream.mapEffect(() => loadRecords().pipe(Effect.flatMap(outcome))),
+        Stream.mapEffect(() => load),
         Stream.filter((snapshot) => snapshot.settled),
         Stream.runHead,
         Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
       );
       const waited = Option.flatten(yield* wait);
-      return Option.isSome(waited) ? waited.value.result : (yield* outcome(yield* loadRecords())).result;
+      return Option.isSome(waited) ? waited.value.result : (yield* load).result;
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(

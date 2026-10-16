@@ -1107,8 +1107,12 @@ it.effect(
       const service = yield* ThreadManagementService.ThreadManagementService.pipe(
         Effect.provide(
           ThreadManagementService.layer.pipe(
+            Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(layerReceiptsTest),
             Layer.provide(
               Layer.mock(Orchestrator.OrchestratorV2)({
+                restartContinuationPending: () => Effect.succeed(false),
                 getThreadEventSequence: () => Effect.succeed(0),
                 getThreadRecords: () => Effect.succeed(records),
                 streamStoredEventsFrom: () => Stream.never,
@@ -1156,8 +1160,12 @@ it.effect(
       const service = yield* ThreadManagementService.ThreadManagementService.pipe(
         Effect.provide(
           ThreadManagementService.layer.pipe(
+            Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(layerReceiptsTest),
             Layer.provide(
               Layer.mock(Orchestrator.OrchestratorV2)({
+                restartContinuationPending: () => Effect.succeed(false),
                 getThreadEventSequence: () => Effect.succeed(10),
                 streamStoredEventsFrom: (input) =>
                   input?.eventType === "runtime-request.updated"
@@ -1226,8 +1234,12 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled", "rolled_back"
       const service = yield* ThreadManagementService.ThreadManagementService.pipe(
         Effect.provide(
           ThreadManagementService.layer.pipe(
+            Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(layerReceiptsTest),
             Layer.provide(
               Layer.mock(Orchestrator.OrchestratorV2)({
+                restartContinuationPending: () => Effect.succeed(false),
                 getThreadEventSequence: () => Effect.succeed(10),
                 streamStoredEventsFrom: (input) =>
                   input?.eventType === "runtime-request.updated"
@@ -1271,7 +1283,7 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled", "rolled_back"
         ),
       );
       const input = { projectId, threadId, runId, timeoutMs: 60000 };
-      // Default waits remain terminal-only even with a pending question.
+      // Default waits ignore pending questions.
       expect(yield* service.waitForThread(input)).toMatchObject({
         timedOut: false,
         run: { status },

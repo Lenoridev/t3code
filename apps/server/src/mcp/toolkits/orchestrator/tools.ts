@@ -36,7 +36,6 @@ import {
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
 } from "@t3tools/contracts";
-import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
