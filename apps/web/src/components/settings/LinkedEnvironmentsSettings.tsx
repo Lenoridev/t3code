@@ -193,6 +193,8 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        // A link that finishes after a close would still be made, and would close a reopened form.
+        if (!next && busy) return;
         setOpen(next);
         if (!next) reset();
       }}

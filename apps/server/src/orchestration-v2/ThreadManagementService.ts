@@ -37,6 +37,7 @@ import {
   ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
+import { delegatedTaskProgress } from "@t3tools/provider-core/server/subagentProjection";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -111,6 +112,7 @@ export function existingThreadIdsForCommand(
     case "delegated_task.completion-delivery.dispose":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
+    case "delegated_task.remote.stop":
     case "delegated_task.remote.question":
       return [command.parentThreadId];
     case "thread.created.record":
@@ -159,6 +161,12 @@ export interface ThreadManagementWaitInput {
   readonly threadId: ThreadId;
   readonly runId?: RunId;
   readonly timeoutMs: number;
+  /**
+   * Also wait until the thread's own delegated work settles: an ended run
+   * still owes the thread's answer while a child, a background task or a
+   * completion delivery will wake it again, as a delegated task's result does.
+   */
+  readonly untilDelegatedWorkSettled?: boolean;
   readonly untilPendingRequest?: boolean;
   readonly ignoreRequestIds?: ReadonlyArray<RuntimeRequestId>;
 }
@@ -167,6 +175,8 @@ export interface ThreadManagementWaitResult {
   readonly threadId: ThreadId;
   readonly run: OrchestrationV2Run | null;
   readonly timedOut: boolean;
+  /** With `untilDelegatedWorkSettled`, once settled: the run with the thread's final answer. */
+  readonly resultRun?: OrchestrationV2Run;
   readonly pendingRequests?: ReadonlyArray<Pick<OrchestrationV2RuntimeRequest, "id" | "kind">>;
 }
 
@@ -929,40 +939,67 @@ const make = Effect.gen(function* () {
             },
           };
         });
-      const initial = yield* outcome(target);
-      if (initial.settled) return initial.result;
-      const runEvents = Stream.merge(
-        orchestrator.streamStoredEventsFrom({
-          threadId: input.threadId,
-          afterSequence,
-          eventType: "run.updated",
-        }),
-        orchestrator.streamStoredEventsFrom({
-          threadId: input.threadId,
-          afterSequence,
-          eventType: "thread.deleted",
-        }),
-      );
-      const events =
-        input.untilPendingRequest === true
-          ? Stream.merge(
-              runEvents,
-              orchestrator.streamStoredEventsFrom({
-                threadId: input.threadId,
-                afterSequence,
-                eventType: "runtime-request.updated",
-              }),
-            )
-          : runEvents;
-      const load = loadRecords(
-        input.untilPendingRequest === true ? [selectedRun.id] : undefined,
-      ).pipe(Effect.flatMap(outcome));
-      // A declined continuation records no event; its effect settling also wakes the wait.
+      // Pending-request ownership is scoped to the selected run, so that option takes priority.
+      const untilDelegatedWorkSettled =
+        input.untilDelegatedWorkSettled === true && input.untilPendingRequest !== true;
+      const delegatedWorkResult = Effect.gen(function* () {
+        const records = yield* getProjectThreadRecords(
+          input,
+          ["runs", "messages", "subagents", "providerThreads"],
+          { messageRoles: ["user"] },
+        );
+        const progress = delegatedTaskProgress(records);
+        if (progress.state !== "result_available") return undefined;
+        const pending = yield* orchestrator
+          .delegatedTaskResultPending(input.threadId)
+          .pipe(Effect.mapError(loadError));
+        return pending ? undefined : progress.resultRun;
+      });
+      const evaluate = (records: typeof target) =>
+        Effect.gen(function* () {
+          const current = yield* outcome(records);
+          if (!current.settled || !untilDelegatedWorkSettled) {
+            return { ...current, resultRun: undefined };
+          }
+          const resultRun = yield* delegatedWorkResult;
+          return { ...current, settled: resultRun !== undefined, resultRun };
+        });
+      const settledResult = (current: Effect.Success<ReturnType<typeof evaluate>>) => ({
+        ...current.result,
+        timedOut: !current.settled,
+        ...(current.resultRun === undefined ? {} : { resultRun: current.resultRun }),
+      });
+      const initial = yield* evaluate(target);
+      if (initial.settled) return settledResult(initial);
+
+      // A declined continuation records no event, so its effect settling wakes
+      // the wait too.
       const wait = Stream.merge(
-        events.pipe(
+        Stream.mergeAll(
+          (
+            [
+              "run.updated",
+              "thread.deleted",
+              // What delegated work reads besides runs: tasks and their
+              // deliveries, and a provider thread's background tasks.
+              ...(input.untilPendingRequest === true ? (["runtime-request.updated"] as const) : []),
+              ...(untilDelegatedWorkSettled
+                ? (["subagent.updated", "provider-thread.updated"] as const)
+                : []),
+            ] as const
+          ).map((eventType) =>
+            orchestrator.streamStoredEventsFrom({
+              threadId: input.threadId,
+              afterSequence,
+              eventType,
+            }),
+          ),
+          { concurrency: "unbounded" },
+        ).pipe(
           Stream.mapError(loadError),
           Stream.filter(
             (stored) =>
+              untilDelegatedWorkSettled ||
               stored.event.type !== "run.updated" ||
               stored.event.payload.id === selectedRun.id ||
               stored.event.payload.restartContinuationOfRunId !== undefined,
@@ -972,13 +1009,26 @@ const make = Effect.gen(function* () {
           ? Stream.fromEffect(orchestrator.awaitRestartContinuation(initial.run))
           : Stream.empty,
       ).pipe(
-        Stream.mapEffect(() => load),
-        Stream.filter((snapshot) => snapshot.settled),
+        Stream.mapEffect(() =>
+          loadRecords(input.untilPendingRequest === true ? [selectedRun.id] : undefined).pipe(
+            Effect.flatMap(evaluate),
+          ),
+        ),
+        Stream.filter((current) => current.settled),
+
         Stream.runHead,
         Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
       );
       const waited = Option.flatten(yield* wait);
-      return Option.isSome(waited) ? waited.value.result : (yield* load).result;
+      if (Option.isSome(waited)) return settledResult(waited.value);
+      // The run may have reached a terminal status while the timeout was
+      // winning the race; the final projection read decides what actually
+      // happened, so only a still-active run counts as timed out.
+      return settledResult(
+        yield* evaluate(
+          yield* loadRecords(input.untilPendingRequest === true ? [selectedRun.id] : undefined),
+        ),
+      );
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(
@@ -1154,18 +1204,29 @@ const make = Effect.gen(function* () {
         if (task.origin !== "app_owned") continue;
         if (task.childThreadId === null) {
           // A task in a linked environment ends here; its follower then stops it there.
-          if (task.remoteChild === undefined || task.result !== null) continue;
-          yield* dispatch({
-            type: "delegated_task.remote.complete",
-            commandId: CommandId.make(`${input.commandId}:stop:${task.id}`),
-            parentThreadId: input.threadId,
-            taskId: task.id,
-            status: "interrupted",
-            result:
-              input.reason === undefined
-                ? "Stopped with its parent."
-                : `Stopped with its parent: ${input.reason}`,
-          }).pipe(
+          // One with its result keeps it, but its thread there may run follow-up work.
+          if (task.remoteChild === undefined) continue;
+          const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
+          yield* dispatch(
+            task.result === null
+              ? {
+                  type: "delegated_task.remote.complete",
+                  commandId,
+                  parentThreadId: input.threadId,
+                  taskId: task.id,
+                  status: "interrupted",
+                  result:
+                    input.reason === undefined
+                      ? "Stopped with its parent."
+                      : `Stopped with its parent: ${input.reason}`,
+                }
+              : {
+                  type: "delegated_task.remote.stop",
+                  commandId,
+                  parentThreadId: input.threadId,
+                  taskId: task.id,
+                },
+          ).pipe(
             Effect.catch((error) =>
               Effect.logWarning("Unable to stop a delegated task", {
                 parentThreadId: input.threadId,

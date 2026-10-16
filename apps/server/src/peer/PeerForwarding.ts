@@ -22,7 +22,7 @@ import type * as Tool from "effect/ai/Tool";
 
 import { assertNotLinked } from "../mcp/linkOrigin.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
-import { loadCaller, unavailable } from "../mcp/threadAccess.ts";
+import { readCaller, unavailable } from "../mcp/threadAccess.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 import * as PeerMcpClient from "./PeerMcpClient.ts";
@@ -105,12 +105,13 @@ const make = Effect.gen(function* () {
 
   /**
    * The caller's own limits here, which travel with every call it forwards.
-   * Work a link started here never uses this environment's own links: the
-   * peer would see this environment's session, not the link the work came
-   * from, so its fence could not hold.
+   * The peer sees only the link's credential, so a credential that may not
+   * control threads here is refused here. Work a link started here never uses
+   * this environment's own links: the peer would see this environment's
+   * session, not the link the work came from, so its fence could not hold.
    */
   const callerLimits = (scope: Scope) =>
-    loadCaller().pipe(
+    readCaller().pipe(
       Effect.tap((caller) => assertNotLinked(caller, "use this environment's links")),
       Effect.map((caller) => caller.limits),
       Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
@@ -224,12 +225,15 @@ const make = Effect.gen(function* () {
     });
 
   const listLinks: PeerForwarding["Service"]["links"] = (scope) =>
-    links.list.pipe(
-      Effect.mapError(
-        (error) =>
-          new OrchestratorMcpFailure({ code: "orchestration_error", message: error.message }),
-      ),
-      Effect.map((listed) => ({
+    Effect.gen(function* () {
+      yield* callerLimits(scope);
+      const listed = yield* links.list.pipe(
+        Effect.mapError(
+          (error) =>
+            new OrchestratorMcpFailure({ code: "orchestration_error", message: error.message }),
+        ),
+      );
+      return {
         environmentId: scope.environmentId,
         links: listed.map((link) => ({
           environmentId: link.environmentId,
@@ -239,8 +243,8 @@ const make = Effect.gen(function* () {
           expiresAt: DateTime.formatIso(link.expiresAt),
           lastError: link.lastError,
         })),
-      })),
-    );
+      };
+    });
 
   return PeerForwarding.of({
     readCapabilities: (scope, environmentId) =>
