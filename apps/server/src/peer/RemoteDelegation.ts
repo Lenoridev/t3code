@@ -195,6 +195,15 @@ const make = Effect.gen(function* () {
       }
       const parentNodeId = parentRun.rootNodeId;
       const { target } = input;
+      // A worktree there would branch from a commit this checkout has and the
+      // other may not, so a remote task runs in that project's checkout.
+      if (input.isolation === "worktree") {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message:
+            'A task in a linked environment runs in that project\'s checkout; isolation "worktree" is not supported there. Omit isolation, or use t3_thread_launch with environmentId and a worktree workspaceStrategy.',
+        });
+      }
       // The provider and model inherit as they do for a task here. Another
       // provider there has no model to inherit, so the caller names one.
       const inherited = parent.thread.modelSelection;
@@ -295,11 +304,18 @@ const make = Effect.gen(function* () {
           completionWake: input.mode === "wait" ? "settled_only" : "always",
         })
         .pipe(
+          // The cause goes to the log; the caller learns only that recording failed.
+          Effect.tapError((cause) =>
+            Effect.logWarning("remote-delegation.record-failed", {
+              parentThreadId: scope.thread.threadId,
+              cause,
+            }),
+          ),
           Effect.mapError(
-            (error) =>
+            () =>
               new OrchestratorMcpFailure({
                 code: "orchestration_error",
-                message: `Unable to record the delegated task: ${error.message}`,
+                message: "Unable to record the delegated task.",
               }),
           ),
         );
@@ -402,6 +418,7 @@ const make = Effect.gen(function* () {
             terminalStatus(task.status),
             task.result,
             "stopped",
+            task.remoteChild.stopCount,
           );
           return;
         }
@@ -435,6 +452,7 @@ const make = Effect.gen(function* () {
               terminalStatus(task.status),
               task.result,
               "stopped",
+              task.remoteChild?.stopCount,
             );
           return;
         }
@@ -478,7 +496,7 @@ const make = Effect.gen(function* () {
                   "failed",
                   message,
                   "stopped",
-                  undefined,
+                  remote.stopCount,
                   message,
                 ).pipe(Effect.andThen(Effect.fail(error)));
               }
@@ -897,11 +915,14 @@ const make = Effect.gen(function* () {
         unstopped === undefined ? "stopped" : undefined,
         remote.stopCount,
       ).pipe(
+        Effect.tapError((cause) =>
+          Effect.logWarning("remote-delegation.cancel-record-failed", { taskId: task.id, cause }),
+        ),
         Effect.mapError(
-          (error) =>
+          () =>
             new OrchestratorMcpFailure({
               code: "orchestration_error",
-              message: `Unable to record the cancellation: ${error.message}`,
+              message: "Unable to record the cancellation.",
             }),
         ),
       );

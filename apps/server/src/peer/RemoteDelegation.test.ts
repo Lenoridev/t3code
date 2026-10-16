@@ -886,6 +886,31 @@ it.effect("a task named only by environment inherits the parent's model, within 
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("refuses worktree isolation for a task there before launching anything", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "auto");
+      yield* seedParent(a);
+
+      const result = yield* a.call("delegate_task", {
+        task: "Run the suite on the box.",
+        target: { environmentId: box.environmentId },
+        isolation: "worktree",
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("isolation");
+      expect(yield* Ref.get(thread.launched)).toBeNull();
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("follows an open task again after the laptop restarts", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1046,9 +1071,14 @@ const stoppedTask = (a: Effect.Success<ReturnType<typeof makeLaptop>>, taskId: N
       Stream.runHead,
     );
 
-it.effect.each([false, true])(
-  "recovers a never-sent intent after restart (cancelled=%s)",
-  (cancelled) =>
+it.effect.each([
+  { cancelled: false, stops: 0 },
+  { cancelled: true, stops: 0 },
+  { cancelled: true, stops: 1 },
+  { cancelled: true, stops: 2 },
+])(
+  "recovers a never-sent intent after restart (cancelled=$cancelled, stops=$stops)",
+  ({ cancelled, stops }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const thread = yield* makeBoxThread;
@@ -1074,6 +1104,14 @@ it.effect.each([false, true])(
                 status: "cancelled",
                 result: "Cancelled before send.",
               });
+              for (let generation = 1; generation <= stops; generation += 1) {
+                yield* before.orchestrator.dispatch({
+                  type: "delegated_task.remote.stop",
+                  commandId: CommandId.make(`command:stop-before-send:${generation}`),
+                  parentThreadId,
+                  taskId: id,
+                });
+              }
             }
             return id;
           }),
