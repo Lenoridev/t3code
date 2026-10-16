@@ -520,6 +520,12 @@ export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Finite),
+  untilDelegatedWorkSettled: Schema.optional(
+    Schema.Boolean.annotate({
+      description:
+        "Also wait until the thread's own delegated tasks, background tasks and their completion deliveries settle, as a delegated task's result does. resultRun then names the run with the thread's final answer.",
+    }),
+  ),
 });
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
 
@@ -529,6 +535,8 @@ export const OrchestratorMcpThreadWaitResult = Schema.Struct({
   status: OrchestratorMcpThreadStatus,
   timedOut: Schema.Boolean,
   next: Schema.optional(OrchestratorMcpRunningTaskNext),
+  /** With untilDelegatedWorkSettled, once settled: the run whose reply is the thread's result. */
+  resultRun: Schema.optional(Schema.Struct({ runId: RunId, status: OrchestrationV2RunStatus })),
 });
 export type OrchestratorMcpThreadWaitResult = typeof OrchestratorMcpThreadWaitResult.Type;
 
