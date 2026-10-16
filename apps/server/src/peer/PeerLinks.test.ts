@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool, Toolkit } from "effect/ai";
 
@@ -71,6 +72,7 @@ const makeA = (descriptor: ExecutionEnvironmentDescriptor) =>
     Effect.map((context) => ({
       links: Context.get(context, PeerLinks.PeerLinks),
       peer: Context.get(context, PeerMcpClient.PeerMcpClient),
+      sql: Context.get(context, SqlClient.SqlClient),
     })),
   );
 
@@ -229,6 +231,20 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       expect(unfenced.message).toContain("cannot keep a linked agent's limits");
       expect(yield* Ref.get(b.bearers)).toEqual([]);
       yield* Ref.set(b.descriptor, box);
+
+      // A link stored before links were marked: its session there is not a
+      // link's, so the peer would not fence its work even though it can.
+      yield* a.sql`UPDATE peer_environment_links SET fenced = 0`;
+      const legacy = yield* probe(a).pipe(Effect.flip);
+      expect(legacy.code).toBe("capability_denied");
+      expect(legacy.message).toContain("Link it again");
+      expect(yield* Ref.get(b.bearers)).toEqual([]);
+      yield* a.links.link({
+        url: b.url,
+        pairingCode: (yield* b.auth.issuePairingCredential()).credential,
+        access: "auto",
+      });
+      yield* probe(a);
 
       yield* TestClock.adjust(Duration.days(31));
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);

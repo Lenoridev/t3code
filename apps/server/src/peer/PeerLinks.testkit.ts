@@ -150,9 +150,8 @@ export type ServedPeer = Effect.Success<ReturnType<typeof servePeer>>;
 export const layerLinkingEnvironment = (descriptor: ExecutionEnvironmentDescriptor) =>
   PeerMcpClient.layer.pipe(
     Layer.provideMerge(PeerLinks.layer),
-    Layer.provide(
-      Layer.mergeAll(Sqlite.layerMemory, ServerSecretStore.layer, FetchHttpClient.layer),
-    ),
+    Layer.provideMerge(Sqlite.layerMemory),
+    Layer.provide(Layer.mergeAll(ServerSecretStore.layer, FetchHttpClient.layer)),
     // Services that act for this environment, such as delegation, name it too.
     Layer.provideMerge(
       Layer.succeed(ServerEnvironment.ServerEnvironment, {
