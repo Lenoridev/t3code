@@ -837,12 +837,17 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
   /** The run there that carries the task; absent on tasks recorded before it was kept. */
   runId: Schema.optional(RunId),
   /**
-   * Nothing is left to stop there: a stop reached it, was refused for good, or the
-   * thread or link is gone. A run ending there by itself sets it too, unless the task
-   * here was cancelled or stopped and still owes a stop, which its follower keeps
-   * sending across restarts.
+   * Nothing is left to stop there: a stop reached it, was refused for good, or the thread
+   * or link is gone. A run ending there by itself sets it too, unless the task here was
+   * cancelled or stopped and still owes a stop, which its follower keeps sending across
+   * restarts. `false`: a Stop here owes one to a task that already had its result.
    */
   stoppedThere: Schema.optional(Schema.Boolean),
+  /**
+   * Stops asked for here once the task had its result. The count names the
+   * one owed, so each reaches the thread there once however often it is sent.
+   */
+  stopCount: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationV2RemoteTaskChild = typeof OrchestrationV2RemoteTaskChild.Type;
 
@@ -3366,6 +3371,19 @@ const OrchestrationV2InternalCommand = Schema.Union([
      * a run that ended by itself leaves the stop owed for what may follow it.
      */
     stoppedThere: Schema.optional(Schema.Literals(["ran-out", "stopped"])),
+  }),
+  /**
+   * Owes a stop to the thread there of a remote task that already has its
+   * result, as Stop on a parent stops a finished child here: whatever runs on
+   * that thread now is stopped. The task keeps its status, result and
+   * completion delivery; its follower sends the stop and reports it with
+   * `delegated_task.remote.complete`.
+   */
+  Schema.Struct({
+    type: Schema.Literal("delegated_task.remote.stop"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
   }),
   Schema.Struct({
     type: Schema.Literal("checkpoint.rollback.fail"),
