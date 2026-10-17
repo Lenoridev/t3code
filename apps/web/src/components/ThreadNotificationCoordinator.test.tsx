@@ -1,4 +1,6 @@
 import type { ClientSettings } from "@t3tools/contracts/settings";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { threadKey } from "@t3tools/client-runtime/state/entities";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { act } from "react";
@@ -20,6 +22,8 @@ const state = vi.hoisted(() => ({
   turnError: false,
   limited: false,
   subagent: false,
+  linkedTask: false,
+  shownUnderParent: false,
   background: [] as Array<{ taskId: string; kind: "command" | "monitor" }>,
   delegatedChild: null as "running" | "approval" | null,
   add: vi.fn(
@@ -54,6 +58,9 @@ function mockThreadShell() {
       relationshipToParent: state.subagent ? "subagent" : null,
     },
     forkedFrom: null,
+    delegatedFrom: state.linkedTask
+      ? { environmentId: "env-2", threadId: "remote-parent", title: "Parent on another machine" }
+      : undefined,
     createdBy: "user",
     creationSource: "web",
     latestRunId: "run-1",
@@ -111,10 +118,13 @@ function mockThreads() {
 }
 
 vi.mock("@effect/atom-react", () => ({
-  useAtomValue: () => ({
-    status: state.live ? "live" : "disconnected",
-    snapshot: Option.some({ threads: mockThreads() }),
-  }),
+  useAtomValue: (atom: unknown) =>
+    atom === "subagent-requests"
+      ? new Map(state.delegatedChild === "approval" ? [["thread-1", "approval"]] : [])
+      : {
+          status: state.live ? "live" : "disconnected",
+          snapshot: Option.some({ threads: mockThreads() }),
+        },
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => state.navigate,
@@ -133,6 +143,22 @@ vi.mock("../state/environments", () => ({
 }));
 vi.mock("../state/shell", () => ({
   environmentShell: { stateValueAtom: vi.fn() },
+}));
+vi.mock("../state/threads", () => ({
+  environmentThreadShells: { pendingSubagentRequestsAtom: () => "subagent-requests" },
+}));
+vi.mock("../state/entities", () => ({
+  useDelegatedUnderParent: () =>
+    new Set(
+      state.shownUnderParent
+        ? [
+            threadKey({
+              environmentId: EnvironmentId.make("env-1"),
+              threadId: ThreadId.make("thread-1"),
+            }),
+          ]
+        : [],
+    ),
 }));
 vi.mock("../threadNotifications", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../threadNotifications")>()),
@@ -176,6 +202,8 @@ beforeEach(() => {
     turnError: false,
     limited: false,
     subagent: false,
+    linkedTask: false,
+    shownUnderParent: false,
     background: [],
     delegatedChild: null,
   });
@@ -200,6 +228,31 @@ afterEach(async () => {
 });
 
 describe("thread notifications", () => {
+  it("keeps a linked task silent while it is shown under its remote parent", async () => {
+    state.linkedTask = true;
+    state.shownUnderParent = true;
+    state.mode = "notifications-and-sound";
+    await render();
+    await complete();
+    state.input = true;
+    await render();
+    expect(state.sound).not.toHaveBeenCalled();
+    expect(state.add).not.toHaveBeenCalled();
+    expect(state.notification).not.toHaveBeenCalled();
+  });
+
+  it("notifies a linked task that cannot be shown under its remote parent", async () => {
+    state.linkedTask = true;
+    state.mode = "notifications-and-sound";
+    await render();
+    state.approval = true;
+    await render();
+    expect(state.add).toHaveBeenCalledTimes(1);
+    expect(state.add).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Approval needed", description: "Fix the login form" }),
+    );
+  });
+
   it.each([true, false])("keeps subagents silent with focus=%s", async (focused) => {
     state.subagent = true;
     state.focused = focused;
