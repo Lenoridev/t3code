@@ -211,6 +211,39 @@ describe("DesktopServerExposure", () => {
     ),
   );
 
+  it.effect("advertises the Wi-Fi or Ethernet address ahead of bridges and tunnels", () =>
+    withHarness(
+      {
+        bridge0: [{ address: "192.168.2.1", family: "IPv4", internal: false }],
+        utun4: [{ address: "10.8.0.2", family: "IPv4", internal: false }],
+        en0: [{ address: "192.168.1.20", family: "IPv4", internal: false }],
+      },
+      Effect.gen(function* () {
+        const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
+        yield* serverExposure.configureFromSettings({ port: 4173 });
+
+        const change = yield* serverExposure.setMode("network-accessible");
+        assert.equal(change.state.advertisedHost, "192.168.1.20");
+      }),
+    ),
+  );
+
+  it.effect("keeps a host bridge's LAN address ahead of later adapters", () =>
+    withHarness(
+      {
+        vmbr0: [{ address: "192.168.1.30", family: "IPv4", internal: false }],
+        enx00e04c680001: [{ address: "192.168.42.10", family: "IPv4", internal: false }],
+      },
+      Effect.gen(function* () {
+        const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
+        yield* serverExposure.configureFromSettings({ port: 4173 });
+
+        const change = yield* serverExposure.setMode("network-accessible");
+        assert.equal(change.state.advertisedHost, "192.168.1.30");
+      }),
+    ),
+  );
+
   it.effect("persists tailscale serve preferences atomically and reports no-op updates", () =>
     withHarness(
       emptyNetworkInterfaces,
@@ -317,7 +350,6 @@ describe("DesktopServerExposure", () => {
           const settings = yield* DesktopAppSettings.DesktopAppSettings;
           return DesktopAppSettings.DesktopAppSettings.of({
             ...settings,
-            // Hold the mode write the way a slow disk would.
             setServerExposureMode: (mode) =>
               Deferred.succeed(modeWriteStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseModeWrite)),
@@ -405,11 +437,8 @@ describe("DesktopServerExposure", () => {
       Effect.gen(function* () {
         const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
         yield* serverExposure.configureFromSettings({ port: 4173 });
-        // mode stays at default "local-only", tailscaleServeEnabled stays false.
 
         const endpoints = yield* serverExposure.getAdvertisedEndpoints;
-        // Only the loopback endpoint; no tailscale spawn means the dieOnSpawnLayer
-        // would have crashed the test if the gate was missing.
         assert.deepEqual(
           endpoints.map((endpoint) => endpoint.httpBaseUrl),
           ["http://127.0.0.1:4173/"],

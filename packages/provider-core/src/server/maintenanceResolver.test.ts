@@ -30,6 +30,7 @@ import {
   resolveLatestProviderVersion,
   resolvePackageManagedProviderMaintenance,
   resolveProviderMaintenanceCapabilitiesEffect,
+  type PackageManagedProviderMaintenanceDefinition,
   type ProviderMaintenanceCapabilities,
 } from "./maintenanceResolver.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
@@ -85,7 +86,6 @@ function writeExecutable(path: string) {
   NodeFS.chmodSync(path, 0o755);
 }
 
-/** Symlink `<tempDir>/bin/<name>` into a package entry point, like npm/pnpm do. */
 function linkIntoPackage(tempDir: string, name: string, packageSegments: ReadonlyArray<string>) {
   const target = NodePath.join(tempDir, ...packageSegments, "bin", `${name}.js`);
   writeExecutable(target);
@@ -284,7 +284,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         "@openai/codex",
       ),
     ).toBe("/usr/local");
-    // A copy nested inside another package is not a global install.
     expect(
       npmGlobalPrefixFromCommandPath(
         "/usr/local/lib/node_modules/other/node_modules/@openai/codex/bin/codex.js",
@@ -297,7 +296,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         "@openai/codex",
       ),
     ).toBe("/");
-    // Neither is a project-local dependency.
     expect(
       npmGlobalPrefixFromCommandPath(
         "/work/app/node_modules/@openai/codex/bin/codex.js",
@@ -342,6 +340,134 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
     }),
   );
 
+  const claudeUpdate = {
+    provider: driver("claudeAgent"),
+    npmPackageName: "@anthropic-ai/claude-code",
+    nativeUpdate: {
+      args: ["update"],
+      isCommandPath: isNativeTestCommandPath("/.local/bin/claude"),
+    },
+  };
+  const otherProviderUpdate = {
+    provider: driver("nativePackageTool"),
+    npmPackageName: "@example/native-package-tool",
+    nativeUpdate: {
+      args: ["update"],
+      isCommandPath: isNativeTestCommandPath("/.local/bin/native-package-tool"),
+    },
+  };
+  const resolveInstall = (input: {
+    readonly definition: PackageManagedProviderMaintenanceDefinition;
+    readonly resolved: string;
+    readonly real: string;
+    readonly platform?: NodeJS.Platform;
+  }) =>
+    resolvePackageManagedProviderMaintenance(input.definition, {
+      binaryPath: "claude",
+      resolvedCommandPath: input.resolved,
+      realCommandPath: input.real,
+      env: {},
+      platform: input.platform ?? "win32",
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, input.platform ?? "win32"),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+    );
+  const userWinGetLink = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WinGet\\Links\\claude.exe";
+  const userWinGetPackage =
+    "C:\\Users\\me\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe\\claude.exe";
+  const machineWinGetLink = "C:\\Program Files\\WinGet\\Links\\claude.exe";
+  const machineWinGetPackage =
+    "C:\\Program Files\\WinGet\\Packages\\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe\\claude.exe";
+  const nativeClaude = "C:\\Users\\me\\.local\\bin\\claude.exe";
+
+  it.effect.each([
+    { name: "a user-scope link", resolved: userWinGetLink, real: userWinGetPackage },
+    { name: "a user-scope package", resolved: userWinGetPackage, real: userWinGetPackage },
+    { name: "a machine-scope package", resolved: machineWinGetPackage, real: machineWinGetPackage },
+    { name: "a machine-scope link alone", resolved: machineWinGetLink, real: machineWinGetLink },
+    {
+      name: "a mixed-case link",
+      resolved: "c:\\USERS\\me\\appdata\\local\\MICROSOFT\\winget\\links\\Claude.EXE",
+      real: userWinGetPackage.toUpperCase(),
+    },
+    { name: "a native-looking alias", resolved: nativeClaude, real: userWinGetPackage },
+  ] as const)("keeps a WinGet Claude install manual-only through $name", (fixture) =>
+    Effect.gen(function* () {
+      const capabilities = yield* resolveInstall({ definition: claudeUpdate, ...fixture });
+
+      expect(capabilities.update).toBeNull();
+    }),
+  );
+
+  it.effect("hides update actions for a WinGet Claude install", () =>
+    Effect.gen(function* () {
+      const capabilities = yield* resolveInstall({
+        definition: claudeUpdate,
+        resolved: userWinGetLink,
+        real: userWinGetPackage,
+      });
+
+      expect(
+        createProviderVersionAdvisory({
+          driver: driver("claudeAgent"),
+          currentVersion: "2.1.0",
+          latestVersion: "2.2.0",
+          maintenanceCapabilities: capabilities,
+        }),
+      ).toMatchObject({ canUpdate: false, canInstallVersion: false, updateCommand: null });
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "a native install",
+      definition: claudeUpdate,
+      resolved: nativeClaude,
+      real: nativeClaude,
+    },
+    {
+      name: "a WinGet-shaped path off Windows",
+      definition: claudeUpdate,
+      resolved: "/home/me/winget/links/claude.exe",
+      real: "/home/me/winget/links/claude.exe",
+      platform: "linux",
+    },
+    {
+      name: "a WinGet-named folder outside the WinGet roots",
+      definition: claudeUpdate,
+      resolved: "C:\\Work\\WinGet\\Links\\claude.exe",
+      real: "C:\\Work\\WinGet\\Links\\claude.exe",
+    },
+    {
+      name: "a WinGet-named folder inside another directory",
+      definition: claudeUpdate,
+      resolved: "C:\\Work\\Microsoft\\WinGet\\Links\\claude.exe",
+      real: "C:\\Work\\Microsoft\\WinGet\\Links\\claude.exe",
+    },
+    {
+      name: "another provider in WinGet",
+      definition: otherProviderUpdate,
+      resolved: userWinGetLink,
+      real: userWinGetPackage,
+    },
+    {
+      name: "another WinGet package",
+      definition: claudeUpdate,
+      resolved: userWinGetPackage.replace("ClaudeCode_", "ClaudeCodeOther_"),
+      real: userWinGetPackage.replace("ClaudeCode_", "ClaudeCodeOther_"),
+    },
+  ] as const)("keeps the native updater for $name", (fixture) =>
+    Effect.gen(function* () {
+      const capabilities = yield* resolveInstall(fixture);
+
+      expect(capabilities.update).toMatchObject({
+        executable: fixture.resolved,
+        args: ["update"],
+        lockKey: `${fixture.definition.provider}-native`,
+      });
+    }),
+  );
+
   it.effect("proves Windows npm ownership from the package manifest beside the shim", () =>
     Effect.gen(function* () {
       const tempDir = yield* makeTempDir("t3-npm-windows-capabilities");
@@ -369,7 +495,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         args: ["install", "-g", "--prefix", tempDir, expect.any(String), expect.any(String)],
       });
 
-      // The same layout on POSIX is a project checkout, not a global install.
       const script = NodePath.join(tempDir, "package-tool");
       writeExecutable(script);
       const posix = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
@@ -471,8 +596,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
     }),
   );
 
-  // Regression for #9850: an explicit native path outside PATH, with spaces,
-  // must be what actually gets spawned.
   it.effect.skipIf(windowsHost)("runs an explicit native updater outside PATH", () =>
     Effect.gen(function* () {
       const tempDir = yield* makeTempDir("t3-native-update");
@@ -604,8 +727,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
     });
     // A plain /usr/local/bin binary is not evidence of Homebrew (#8832).
     expect(homebrewOwnershipFromCommandPath("/usr/local/bin/codex")).toBeNull();
-    // A keg elsewhere reports its prefix so the resolver can reject it against
-    // `brew --prefix`.
     expect(homebrewOwnershipFromCommandPath("/srv/Cellar/claude/1.0.0/bin/claude")).toMatchObject({
       prefix: "/srv",
     });
@@ -786,7 +907,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           lockKey: "packageTool-native",
         });
 
-        // A mise install is pinned in mise's config, so it stays manual.
         const misePath = NodePath.join(tempDir, "mise", "installs", "package-tool", "1.0.0", "bin");
         writeExecutable(NodePath.join(misePath, "package-tool"));
         const mise = yield* resolveProviderMaintenanceCapabilitiesEffect(selfUpdating, {
@@ -910,12 +1030,8 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         }),
       );
 
-      // An advisory read starts a resolution that is still running when the
-      // user clicks Update; the fresh read must not wait on or reuse it.
       const advisory = yield* Effect.forkChild(resolve(), { startImmediately: true });
       const fresh = yield* Effect.forkChild(resolve({ fresh: true }), { startImmediately: true });
-      // The fresh read runs its own resolution, so it finishes while the stale
-      // one is still waiting.
       expect(resolutions).toBe(2);
       expect(fresh.pollUnsafe()).toBeDefined();
       yield* Deferred.succeed(releaseStale, undefined);
@@ -940,8 +1056,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       const first = yield* Effect.forkChild(resolve(), { startImmediately: true });
       yield* Fiber.interrupt(first);
 
-      // The next read resolves again, and a reader that joined it keeps it
-      // running when the reader that started it goes away.
       const owner = yield* Effect.forkChild(resolve(), { startImmediately: true });
       const waiter = yield* Effect.forkChild(resolve(), { startImmediately: true });
       yield* Fiber.interrupt(owner);

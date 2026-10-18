@@ -118,7 +118,6 @@ describe("Cursor skills", () => {
           yield* fileSystem.writeFileString(path.join(directory, "SKILL.md"), "---\n---\n");
         });
         const userRoot = path.join(userHome, ".claude", "skills");
-        // The root is depth 0, so `deep-skill` sits at the depth limit and `below` past it.
         const atLimit = path.join(
           userRoot,
           "deep",
@@ -160,6 +159,51 @@ describe("Cursor skills", () => {
         ];
         expect(yield* discoverCursorSkills(workspace, { HOME: userHome })).toEqual(expected);
         expect(yield* probeCursorSkills(workspace, { HOME: userHome })).toEqual(expected);
+      }),
+    ));
+
+  it("discovers skills across roots without scanning installed node_modules", async () =>
+    await runNode(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const userHome = yield* fileSystem
+          .makeTempDirectoryScoped({
+            directory: NodeOS.tmpdir(),
+            prefix: "cursor-skills-home-",
+          })
+          .pipe(Effect.flatMap((directory) => fileSystem.realPath(directory)));
+        const root = path.join(userHome, ".agents", "skills");
+        const dependencies = path.join(root, "review", "tests", "node_modules");
+        yield* fileSystem.makeDirectory(dependencies, { recursive: true });
+        yield* Effect.forEach(
+          Array.from({ length: 10_001 }, (_, index) => path.join(dependencies, `entry-${index}`)),
+          (file) => fileSystem.writeFileString(file, ""),
+          { concurrency: 64, discard: true },
+        );
+        const skillDirectories = [
+          path.join(root, "review"),
+          path.join(root, "sibling"),
+          path.join(userHome, ".claude", "skills", "later"),
+        ];
+        for (const directory of skillDirectories) {
+          yield* fileSystem.makeDirectory(directory, { recursive: true });
+          yield* fileSystem.writeFileString(path.join(directory, "SKILL.md"), "---\n---\n");
+        }
+
+        const result = yield* probeCursorSkills(undefined, { HOME: userHome }).pipe(Effect.result);
+        expect(result._tag).toBe("Success");
+        if (result._tag !== "Success") return;
+        expect(result.success).toEqual(
+          skillDirectories
+            .map((directory) => ({
+              name: path.basename(directory),
+              path: path.join(directory, "SKILL.md"),
+              scope: "user",
+              enabled: true,
+            }))
+            .sort((left, right) => left.name.localeCompare(right.name)),
+        );
       }),
     ));
 
@@ -214,9 +258,6 @@ describe("Cursor skills", () => {
             yield* fileSystem.writeFileString(path.join(directory, "SKILL.md"), contents);
           });
 
-          // A skill package managed in a config repo and installed by symlink.
-          // Its own SKILL.md must be discovered under the link name, but nothing
-          // below the target may be walked.
           yield* writeSkill(path.join(library, "shared-review"), "---\ndescription: shared\n---\n");
           yield* writeSkill(path.join(library, "shared-review", "hidden"), "---\n---\n");
           const root = path.join(workspace, ".cursor", "skills");
