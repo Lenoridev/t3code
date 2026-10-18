@@ -37,6 +37,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -2468,6 +2469,19 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
     );
     assert.equal((yield* claimedFiles).length, 1);
 
+    const duplicate = yield* ThreadMessageIntake.launchThread({
+      ...input,
+      commandId: CommandId.make("intake-duplicate-create"),
+      initialMessage: { ...input.initialMessage, messageId: MessageId.make("intake-duplicate") },
+    }).pipe(Effect.result);
+    assert.ok(Result.isFailure(duplicate));
+    assert.ok(duplicate.failure._tag === "ThreadLaunchError");
+    assert.equal(duplicate.failure.operation, "create-thread");
+    assert.propertyVal(duplicate.failure.cause, "_tag", "OrchestratorThreadAlreadyExistsError");
+    assert.equal((yield* claimedFiles).length, 1);
+    assert.deepEqual(yield* fs.readFile(storedPath), new Uint8Array([1, 2, 3, 4]));
+    assert.deepEqual(yield* fs.readFile(pendingPath), new Uint8Array([1, 2, 3, 4]));
+
     const missingProject = yield* ThreadMessageIntake.launchThread({
       ...input,
       commandId: CommandId.make("intake-no-project"),
@@ -2615,6 +2629,55 @@ it.effect("cancels tracked setup before provider work is released", () =>
       assert.equal(projection.runs[0]?.status, "failed");
       assert.isNull(projection.thread.worktreePath);
       assert.isEmpty(yield* outbox.listByCommandId(CommandId.make(`${input.commandId}:release`)));
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("stops an in-flight branch rename when tracked setup is cancelled", () =>
+  Effect.gen(function* () {
+    const setupEntered = yield* Deferred.make<void>();
+    const branchNameStarted = yield* Deferred.make<void>();
+    const allowBranchName = yield* Deferred.make<void>();
+    const branchNameInterrupted = yield* Deferred.make<void>();
+    const renameAttempted = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      renameBranch: (input) =>
+        Deferred.succeed(renameAttempted, undefined).pipe(Effect.as({ branch: input.newBranch })),
+      runSetup: () => Deferred.succeed(setupEntered, undefined).pipe(Effect.andThen(Effect.never)),
+      generateBranchName: () =>
+        Deferred.succeed(branchNameStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(allowBranchName)),
+          Effect.as({ branch: "generated-branch" }),
+          Effect.onInterrupt(() => Deferred.succeed(branchNameInterrupted, undefined)),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "launch:cancel-renaming",
+          thread: "thread:cancel-renaming",
+          message: "Start",
+          workspace: { type: "worktree", baseRef: "main" },
+        }),
+      );
+      yield* Deferred.await(setupEntered);
+      yield* Deferred.await(branchNameStarted);
+      assert.isTrue(yield* tracker.cancel(launched.threadId));
+      // Let a rename that survived the cancel finish, then check it never ran.
+      yield* Deferred.succeed(allowBranchName, undefined);
+      yield* Effect.raceFirst(
+        Deferred.await(branchNameInterrupted),
+        Deferred.await(renameAttempted),
+      );
+      assert.isTrue(
+        yield* Deferred.isDone(branchNameInterrupted),
+        "the cancelled setup's branch rename kept running",
+      );
+      assert.equal(harness.renameBranch.mock.calls.length, 0);
+      assert.isNull((yield* threads.getThreadProjection(launched.threadId)).thread.worktreePath);
     }).pipe(Effect.provide(harness.layer));
   }),
 );
