@@ -71,17 +71,12 @@ export function useSidebarRowSubscriptionLease(isActive: boolean): {
 } {
   const [row, setRow] = React.useState<HTMLElement | null>(null);
   const [isNearViewport, setIsNearViewport] = React.useState(isActive);
+  // The active row stays leased after it deactivates until the observer reports.
+  if (isActive && !isNearViewport) setIsNearViewport(true);
+  const canObserve = typeof IntersectionObserver !== "undefined";
 
   React.useEffect(() => {
-    if (isActive) {
-      setIsNearViewport(true);
-      return;
-    }
-    if (row === null) return;
-    if (typeof IntersectionObserver === "undefined") {
-      setIsNearViewport(true);
-      return;
-    }
+    if (isActive || row === null || !canObserve) return;
 
     const scrollRoot = row.closest<HTMLElement>('[data-slot="scroll-area-viewport"]');
     const observer = new IntersectionObserver(
@@ -93,21 +88,24 @@ export function useSidebarRowSubscriptionLease(isActive: boolean): {
     );
     observer.observe(row);
     return () => observer.disconnect();
-  }, [isActive, row]);
+  }, [canObserve, isActive, row]);
 
   return {
-    leaseLiveStatus: isActive || isNearViewport,
+    leaseLiveStatus: isActive || isNearViewport || !canObserve,
     rowRef: setRow,
   };
 }
 
 export function useRetainedValue<T>(key: string | null, value: T | null): T | null {
-  const retained = React.useRef<{ readonly key: string; readonly value: T } | null>(null);
-  if (key !== null && value !== null) {
-    retained.current = { key, value };
+  const [retained, setRetained] = React.useState<{
+    readonly key: string;
+    readonly value: T;
+  } | null>(null);
+  if (key !== null && value !== null && (retained?.key !== key || retained.value !== value)) {
+    setRetained({ key, value });
   }
   if (value !== null) return value;
-  return key !== null && retained.current?.key === key ? retained.current.value : null;
+  return key !== null && retained?.key === key ? retained.value : null;
 }
 
 // Sidebar.motion handles ordinary section changes. Sortable transforms own
@@ -117,7 +115,8 @@ export const animateSidebarLayoutChanges: AnimateLayoutChanges = (args) =>
 
 // Snoozed rows can leave the shelf, but dropping into it is not supported
 // because snoozing requires a wake time. The Working shelf (beta) follows live
-// status, so it is neither a drag source nor a destination.
+// status, so its rows only drag out as chat context, never between sidebar
+// sections.
 
 export type SidebarSection = "pinned" | "active" | "working" | "snoozed" | "settled";
 
@@ -292,6 +291,7 @@ export function planSidebarThreadDrop(input: {
     activeKeysById,
     activeReorderableKeys,
   } = input;
+  if (activeSection === "working") return { kind: "none" };
   if (input.supportsSettlement === false && (target.section === "settled" || activeSettled)) {
     return { kind: "none" };
   }
@@ -688,9 +688,9 @@ export function useThreadJumpHintVisibility(): {
     };
   }, []);
 
-  const updateThreadJumpHintsVisibility = React.useCallback((shouldShow: boolean) => {
+  const updateThreadJumpHintsVisibility = (shouldShow: boolean) => {
     controllerRef.current?.sync(shouldShow);
-  }, []);
+  };
 
   return {
     showThreadJumpHints,
