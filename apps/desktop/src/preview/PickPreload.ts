@@ -15,7 +15,7 @@ import type {
 } from "@t3tools/contracts";
 
 import { createAnnotationIdSource } from "./AnnotationIds.ts";
-import { handleAnnotationKeyEvent } from "./AnnotationKeyboard.ts";
+import { handleAnnotationKeyEvent, type AnnotationTool } from "./AnnotationKeyboard.ts";
 import { previewAnnotationStyles } from "./AnnotationStyles.generated.ts";
 import { installRecordingCursor } from "./RecordingCursor.ts";
 import { DEFAULT_RECORDING_INPUT_OPTIONS } from "./RecordingInput.ts";
@@ -116,8 +116,6 @@ ipcRenderer.on(RECORDING_POINTER_CHANNEL, (_event, point: unknown) => {
       "phase" in point && point.phase === "click" ? "click" : "move",
     );
 });
-
-type AnnotationTool = "select" | "marquee" | "draw" | "erase";
 
 interface SelectedElement {
   id: string;

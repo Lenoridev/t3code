@@ -1,5 +1,7 @@
 import type { PreviewAnnotationSubmission } from "@t3tools/contracts";
 
+export type AnnotationTool = "select" | "marquee" | "draw" | "erase";
+
 interface AnnotationKeyboardEvent {
   readonly key: string;
   readonly metaKey: boolean;
@@ -8,26 +10,38 @@ interface AnnotationKeyboardEvent {
   readonly isComposing: boolean;
 }
 
+interface AnnotationKeyEvent extends AnnotationKeyboardEvent {
+  readonly type: string;
+  readonly target: EventTarget | null;
+  readonly isTrusted: boolean;
+  preventDefault(): void;
+  stopPropagation(): void;
+  stopImmediatePropagation(): void;
+}
+
+export type AnnotationKeyAction = "cancel" | AnnotationTool | PreviewAnnotationSubmission;
+
+const TOOL_SHORTCUTS: Readonly<Record<string, AnnotationTool>> = {
+  v: "select",
+  r: "marquee",
+  d: "draw",
+  e: "erase",
+};
+
+// Runs from the preload's window capture listeners, ahead of any listener the
+// inspected page installs. Overlay events are hidden from the page but never
+// cancelled, so the editor still receives Space, caret keys and composition.
 export function handleAnnotationKeyEvent(
-  event: AnnotationKeyboardEvent &
-    Pick<
-      KeyboardEvent,
-      | "type"
-      | "target"
-      | "isTrusted"
-      | "preventDefault"
-      | "stopImmediatePropagation"
-      | "stopPropagation"
-    >,
+  event: AnnotationKeyEvent,
   input: {
     overlayTarget: EventTarget;
     commentFocused: boolean;
     canSend: boolean;
   },
-): "cancel" | "select" | "marquee" | "draw" | "erase" | PreviewAnnotationSubmission | null {
+): AnnotationKeyAction | null {
   const inOverlay = event.target === input.overlayTarget;
   if (inOverlay) event.stopImmediatePropagation();
-  // Page scripts can target the visible shadow host without accessing the editor.
+  // The page can dispatch synthetic key events on the visible shadow host.
   if (event.type !== "keydown" || !event.isTrusted) return null;
   if (event.key === "Escape") {
     event.preventDefault();
@@ -41,18 +55,7 @@ export function handleAnnotationKeyEvent(
     if (submission) event.preventDefault();
     return submission;
   }
-  switch (event.key) {
-    case "v":
-      return "select";
-    case "r":
-      return "marquee";
-    case "d":
-      return "draw";
-    case "e":
-      return "erase";
-    default:
-      return null;
-  }
+  return TOOL_SHORTCUTS[event.key] ?? null;
 }
 
 export function resolveAnnotationSubmission(
