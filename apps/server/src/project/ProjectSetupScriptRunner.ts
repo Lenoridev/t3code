@@ -1,4 +1,4 @@
-import { ProjectId, type ProjectScript, ThreadId } from "@t3tools/contracts";
+import { linkOriginIsFenced, ProjectId, type ProjectScript, ThreadId } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   projectScriptRuntimeEnv,
@@ -48,8 +48,8 @@ export interface ProjectSetupScriptOutputLine {
 }
 
 /**
- * A thread a linked environment started does not run this project's setup
- * script: the script is the user's own code, and the link only grants T3's
+ * A thread a link below full access started does not run this project's setup
+ * script: the script is the user's own code, and such a link only grants T3's
  * tools (see `mcp/linkOrigin.ts`).
  */
 export interface ProjectSetupScriptRunnerResultSkippedForLink {
@@ -368,7 +368,8 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    if (thread?.linkOrigin !== undefined) return { status: "skipped-for-link" } as const;
+    if (thread?.linkOrigin !== undefined && linkOriginIsFenced(thread.linkOrigin))
+      return { status: "skipped-for-link" } as const;
     const suppliedProject = input.project;
     const projectById =
       suppliedProject ??
