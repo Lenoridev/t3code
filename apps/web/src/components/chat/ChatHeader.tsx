@@ -42,7 +42,6 @@ interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   activeThreadTitle: string;
-  /** The linked environment that started this thread, shown beside the title. */
   activeThreadLinkOrigin?: string | null | undefined;
   isServerThread: boolean;
   activeProject: EnvironmentProject | null;
@@ -406,8 +405,7 @@ export const ChatHeader = memo(function ChatHeader({
                 From {activeThreadLinkOrigin}
               </TooltipTrigger>
               <TooltipPopup side="top">
-                Started by an agent on {activeThreadLinkOrigin} through a linked environment. It can
-                change only threads that link started here.
+                Started by an agent on {activeThreadLinkOrigin} through a linked environment.
               </TooltipPopup>
             </Tooltip>
           ) : null}
