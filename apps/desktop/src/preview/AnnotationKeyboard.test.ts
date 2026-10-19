@@ -36,6 +36,8 @@ describe("resolveAnnotationSubmission", () => {
   });
 });
 
+// The annotation listener is registered first, as the preload's is, so a later
+// page listener stands in for the inspected page's capture-phase shortcuts.
 const dispatchKey = (
   input: {
     inOverlay?: boolean;
@@ -49,78 +51,69 @@ const dispatchKey = (
   const window = new EventTarget();
   const event = Object.assign(new Event(type, { cancelable: true }), keyboardEvent(overrides));
   Object.defineProperty(event, "isTrusted", { value: input.isTrusted ?? true });
-  const actions: Array<ReturnType<typeof handleAnnotationKeyEvent>> = [];
+  let action: ReturnType<typeof handleAnnotationKeyEvent> | undefined;
   let pageEvents = 0;
   window.addEventListener(type, () => {
-    actions.push(
-      handleAnnotationKeyEvent(event, {
-        overlayTarget: input.inOverlay === false ? new EventTarget() : window,
-        commentFocused: input.commentFocused ?? true,
-        canSend: input.canSend ?? true,
-      }),
-    );
+    action = handleAnnotationKeyEvent(event, {
+      overlayTarget: input.inOverlay === false ? new EventTarget() : window,
+      commentFocused: input.commentFocused ?? true,
+      canSend: input.canSend ?? true,
+    });
   });
   window.addEventListener(type, (pageEvent) => {
     pageEvents += 1;
     pageEvent.preventDefault();
   });
   window.dispatchEvent(event);
-  return { action: actions[0], pageEvents, defaultPrevented: event.defaultPrevented };
+  return { action, pageEvents, defaultPrevented: event.defaultPrevented };
 };
 
-describe("annotation keyboard isolation", () => {
-  it.each(["keydown", "keyup", "keypress"])(
-    "keeps overlay %s events from page shortcuts without cancelling text input",
-    (type) => {
-      expect(dispatchKey({}, { key: " " }, type)).toEqual({
+describe("handleAnnotationKeyEvent", () => {
+  it("hides overlay typing from page shortcuts without cancelling the edit", () => {
+    const edits = [
+      ["keydown", " "],
+      ["keypress", " "],
+      ["keyup", " "],
+      ["keydown", "ArrowLeft"],
+      ["keydown", "d"],
+    ] as const;
+    for (const [type, key] of edits) {
+      expect(dispatchKey({}, { key }, type)).toEqual({
         action: null,
         pageEvents: 0,
         defaultPrevented: false,
       });
-    },
-  );
-
-  it("keeps caret movement and tool letters available to editor inputs", () => {
-    expect(dispatchKey({}, { key: "ArrowLeft" })).toEqual({
-      action: null,
-      pageEvents: 0,
-      defaultPrevented: false,
-    });
-    expect(dispatchKey({ commentFocused: false }, { key: "r" }).action).toBeNull();
-    expect(dispatchKey({}, { key: "d" }).action).toBeNull();
+    }
   });
 
-  it("submits only from the comment and preserves multiline and composition editing", () => {
-    expect(dispatchKey().action).toBe("attach");
-    expect(dispatchKey().defaultPrevented).toBe(true);
+  it("submits from the focused comment and leaves multiline and IME input editable", () => {
+    expect(dispatchKey()).toMatchObject({ action: "attach", defaultPrevented: true });
     expect(dispatchKey({}, { ctrlKey: true }).action).toBe("send");
-    expect(dispatchKey({ canSend: false }, { metaKey: true }).defaultPrevented).toBe(false);
+    expect(dispatchKey({ canSend: false }, { metaKey: true })).toMatchObject({
+      action: null,
+      defaultPrevented: false,
+    });
     expect(dispatchKey({ commentFocused: false }).defaultPrevented).toBe(false);
     expect(dispatchKey({}, { shiftKey: true }).defaultPrevented).toBe(false);
     expect(dispatchKey({}, { isComposing: true }).defaultPrevented).toBe(false);
   });
 
-  it("handles Escape inside the overlay before the page can consume it", () => {
+  it("ignores submission and cancellation events dispatched by the page", () => {
+    for (const overrides of [{}, { ctrlKey: true }, { key: "Escape" }]) {
+      expect(dispatchKey({ isTrusted: false }, overrides)).toEqual({
+        action: null,
+        pageEvents: 0,
+        defaultPrevented: false,
+      });
+    }
+  });
+
+  it("keeps Escape and tool shortcuts while the page keeps its own keys", () => {
     expect(dispatchKey({}, { key: "Escape" })).toEqual({
       action: "cancel",
       pageEvents: 0,
       defaultPrevented: true,
     });
-  });
-
-  it("ignores page-generated submission and cancellation events on the overlay host", () => {
-    expect(dispatchKey({ isTrusted: false })).toEqual({
-      action: null,
-      pageEvents: 0,
-      defaultPrevented: false,
-    });
-    expect(dispatchKey({ isTrusted: false }, { ctrlKey: true }).action).toBeNull();
-    expect(dispatchKey({ isTrusted: false }, { metaKey: true }).action).toBeNull();
-    expect(dispatchKey({ isTrusted: false }, { key: "Escape" }).action).toBeNull();
-    expect(dispatchKey({ isTrusted: false, inOverlay: false }, { key: "r" }).action).toBeNull();
-  });
-
-  it("leaves page keyboard input and tool selection outside the overlay available", () => {
     expect(dispatchKey({ inOverlay: false }, { key: " " }).pageEvents).toBe(1);
     expect(dispatchKey({ inOverlay: false }, { key: "r" }).action).toBe("marquee");
     expect(dispatchKey({ inOverlay: false }, { key: "Escape" }).action).toBe("cancel");
