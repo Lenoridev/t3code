@@ -4,6 +4,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   EnvironmentId,
   type OrchestrationV2Run,
+  type OrchestrationV2ThreadShell,
   type SourceControlCloneRepositoryInput,
   ProjectId,
   ProviderInstanceId,
@@ -79,7 +80,7 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
   const users = { ...liveThreadShell(usersThread, { runtimeMode: "auto" }), projectId: boxProject };
   const run = (status: OrchestrationV2Run["status"]) =>
     ({ id: boxRun, status }) as unknown as OrchestrationV2Run;
-  const shellOf = (threadId: ThreadId) =>
+  const shellOf = (threadId: ThreadId): Effect.Effect<OrchestrationV2ThreadShell | null> =>
     threadId === boxThread ? linked : Effect.succeed(threadId === usersThread ? users : null);
   const projectionOf = (threadId: ThreadId) =>
     shellOf(threadId).pipe(
