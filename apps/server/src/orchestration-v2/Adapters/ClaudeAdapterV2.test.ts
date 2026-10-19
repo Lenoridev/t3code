@@ -8509,12 +8509,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           );
 
         yield* userTurn("attempt-failed-start-1", 1);
-        yield* Queue.offer(harness.sdkMessages, wakeTaskStarted);
-        yield* Queue.offer(harness.sdkMessages, turnOneResult);
-        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
-        yield* Queue.offer(harness.sdkMessages, wakeNotification);
-        let notificationYields = 0;
-        yield* awaitUntil(() => notificationYields++ >= 50, "notification to be recorded");
+        yield* harness.offerAndWait(wakeTaskStarted);
+        yield* harness.offerAndWait(turnOneResult);
+        yield* Queue.take(harness.terminalReceipts);
+        yield* harness.offerAndWait(wakeNotification);
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
 
         const missing = ChatImageAttachment.make({
@@ -8524,20 +8522,22 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           mimeType: "image/png",
           sizeBytes: 4,
         });
-        const failed = yield* Effect.exit(userTurn("attempt-failed-start-2", 2, [missing]));
-        assert.isTrue(Exit.isFailure(failed));
+        const failed = yield* userTurn("attempt-failed-start-2", 2, [missing]).pipe(Effect.flip);
+        assert.equal(
+          makeProviderFailure({ cause: failed }).message,
+          "The provider could not start this turn: an attachment could not be read. Retry the turn; if it keeps failing, check the provider setup and server logs.",
+        );
 
         yield* userTurn("attempt-failed-start-3", 2);
-        yield* Queue.offer(
-          harness.sdkMessages,
+        yield* harness.offerAndWait(
           makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000911", result: "Answered." }),
         );
-        yield* awaitUntil(() => harness.terminalEvents().length === 2, "second turn terminal");
+        yield* Queue.take(harness.terminalReceipts);
 
-        yield* Queue.offer(harness.sdkMessages, wakeAssistant);
-        yield* awaitUntil(() => harness.continuationRequests.length === 1, "command wake");
+        yield* harness.offerAndWait(wakeAssistant);
+        const continuation = yield* Queue.take(harness.continuationReceipts);
         assert.equal(
-          harness.continuationRequests[0]?.notification?.summary,
+          continuation.notification?.summary,
           `Command "${WAKE_TASK_DESCRIPTION}" finished`,
         );
       }).pipe(
@@ -16005,6 +16005,138 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           status: "active",
           checks: 0,
         });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
+    it.effect(
+      "defers goal completion until an ambient subagent finishes and Claude checks again",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const condition = "the review finds no bugs";
+          const taskId = "task-goal-review";
+          const toolUseId = "toolu-goal-review";
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("goal-background-attempt"),
+              text: `/goal ${condition}`,
+              attachments: [],
+            }),
+          );
+          for (const frame of [
+            syntheticFrame("goal-background-set", `Goal set: ${condition}`),
+            claudeSdkFrame({
+              ...makeSubagentTaskStartedFrame({ taskId, toolUseId, uuid: "goal-review-start" }),
+              ambient: true,
+              skip_transcript: true,
+            }),
+            makeAssistantTextFrame({
+              uuid: "goal-background-wait",
+              text: "Waiting for the review.",
+            }),
+            makeResultFrame({ uuid: "goal-background-result", result: "Waiting for the review." }),
+          ]) {
+            yield* Queue.offer(harness.sdkMessages, frame);
+          }
+          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "completed");
+          assert.deepEqual(goalStatuses(harness.events).at(-1), {
+            objective: condition,
+            status: "active",
+            checks: 0,
+          });
+
+          yield* harness.offerAndWait(
+            makeSubagentNotificationFrame({
+              taskId,
+              toolUseId,
+              summary: "No bugs found.",
+              uuid: "goal-review-done",
+            }),
+          );
+          yield* harness.offerAndWait(wakeTurnInit);
+          yield* Queue.take(harness.continuationReceipts);
+          assert.equal(goalStatuses(harness.events).at(-1)?.status, "active");
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("goal-background-wake"),
+              text: "Background task completed.",
+              attachments: [],
+              providerTurnOrdinal: 2,
+              messageCreatedBy: "agent",
+              messageCreationSource: "provider",
+            }),
+          );
+          yield* harness.offerAndWait(
+            makeAssistantTextFrame({ uuid: "goal-background-wake-work", text: "No bugs found." }),
+          );
+          yield* harness.offerAndWait(
+            makeResultFrame({
+              uuid: "goal-background-wake-result",
+              result: "No bugs found.",
+              origin: { kind: "task-notification" },
+            }),
+          );
+          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "completed");
+          assert.deepEqual(goalStatuses(harness.events).at(-1), {
+            objective: condition,
+            status: "complete",
+            checks: 0,
+          });
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+
+    it.effect.each([
+      { taskType: "mcp_task", status: "complete" },
+      { taskType: undefined, status: "active" },
+    ] as const)("leaves the goal $status with a running $taskType task", ({ taskType, status }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the docs build";
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("goal-task-type-attempt"),
+            text: `/goal ${condition}`,
+            attachments: [],
+          }),
+        );
+        for (const frame of [
+          syntheticFrame("goal-task-type-set", `Goal set: ${condition}`),
+          claudeSdkFrame({
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-goal-docs",
+            description: "Watch the docs",
+            ...(taskType === undefined ? {} : { task_type: taskType }),
+            uuid: "goal-task-type-start",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          makeAssistantTextFrame({ uuid: "goal-task-type-work", text: "The docs build." }),
+          makeResultFrame({ uuid: "goal-task-type-result", result: "The docs build." }),
+        ]) {
+          yield* Queue.offer(harness.sdkMessages, frame);
+        }
+        assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "completed");
+        assert.equal(goalStatuses(harness.events).at(-1)?.status, status);
       }).pipe(
         Effect.scoped,
         Effect.provide(
