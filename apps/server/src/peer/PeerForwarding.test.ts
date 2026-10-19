@@ -21,6 +21,7 @@ import { McpSchema, McpServer } from "effect/ai";
 import * as ServerConfig from "../config.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SourceControlRepositoryService from "../sourceControl/SourceControlRepositoryService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -175,12 +176,14 @@ const boxProjects = (seen: Ref.Ref<Seen>) =>
 const serveBox = (seen: Ref.Ref<Seen>) =>
   servePeer(
     box,
-    Layer.merge(
+    Layer.mergeAll(
       McpHttpServer.layerOrchestratorToolkit,
       McpHttpServer.layerProjectRegistration,
+      McpHttpServer.layerThreadToolkit,
     ).pipe(
       Layer.provide(NodeCrypto.layer),
       Layer.provide(boxThreads(seen)),
+      Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
       Layer.provide(boxLaunches(seen)),
       Layer.provide(
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
@@ -221,11 +224,13 @@ const mcpClient = McpSchema.McpServerClient.of({
  */
 const makeLaptop = Effect.gen(function* () {
   const linking = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
-  const layerHere = Layer.merge(
+  const layerHere = Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit,
     McpHttpServer.layerProjectRegistration,
+    McpHttpServer.layerThreadToolkit,
   ).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
     Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
     Layer.provide(
       Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
@@ -252,6 +257,10 @@ const makeLaptop = Effect.gen(function* () {
                 : { runtimeMode: "full-access" },
             ),
           ),
+        getProjectThreadRecords: ({ threadId }) =>
+          Effect.succeed({
+            thread: liveThreadShell(threadId, { runtimeMode: "full-access" }),
+          } as never),
       }),
     ),
     Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
@@ -521,6 +530,39 @@ it.effect("brings a repository to a linked environment, only through full access
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("runs any tool that takes a linked environment there", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const seen = yield* Ref.make<Seen>(nothingSeen);
+      const b = yield* serveBox(seen);
+      const a = yield* makeLaptop;
+      yield* linkTo(a.links, b, "auto");
+
+      const there = yield* a.call("thread:laptop-full", "t3_thread_configuration", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+      });
+      expect(there.structuredContent).toMatchObject({ threadId: boxThread, runtimeMode: "auto" });
+      const archived = yield* a.call("thread:laptop-full", "t3_thread_organize", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+        action: "archive",
+      });
+      expect(archived.isError).toBe(false);
+      expect((yield* Ref.get(seen)).stops).toEqual([`thread.archive ${boxThread}`]);
+
+      // This environment's own id keeps the call here.
+      const own = yield* a.call("thread:laptop-full", "t3_thread_configuration", {
+        environmentId: laptop.environmentId,
+      });
+      expect(own.structuredContent).toMatchObject({
+        threadId: "thread:laptop-full",
+        runtimeMode: "full-access",
+      });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect("refuses what a linked environment cannot take before anything leaves", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -549,6 +591,10 @@ it.effect("refuses what a linked environment cannot take before anything leaves"
         [
           "t3_thread_send",
           { environmentId: box.environmentId, threadId: boxThread, message: "Carry on there." },
+        ],
+        [
+          "t3_thread_organize",
+          { environmentId: box.environmentId, threadId: boxThread, action: "archive" },
         ],
         [
           "t3_thread_launch",
