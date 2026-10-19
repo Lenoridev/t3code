@@ -127,22 +127,30 @@ describe("searchSettings", () => {
     expect(available.map((item) => item.id).filter((id) => gatedIds.has(id))).toEqual([]);
   });
 
-  it("offers Linked environments only when a connected environment shows its links", () => {
+  it("finds linked environments on a remote host without local maintenance access", () => {
     const availability = {
       hasCloudPublicConfig: false,
       hasEnvironment: true,
       hasProviderSettingsEnvironment: true,
       hasMacProviderSettingsEnvironment: false,
-      canManageLocalBackend: true,
+      canManageLocalBackend: false,
+      localEnvironmentDisabled: true,
       isWslSettingsRowVisible: false,
       hasThreadAutoSettlement: false,
     };
-    const itemIds = (hasPeerLinkHost: boolean) =>
-      filterAvailableSettingsSearchItems({ ...availability, hasPeerLinkHost }).map(
-        (item) => item.id,
+    const results = (hasPeerLinkHost: boolean) =>
+      searchSettings(
+        "linked environments",
+        filterAvailableSettingsSearchItems({ ...availability, hasPeerLinkHost }),
       );
-    expect(itemIds(false)).not.toContain("linked-environments");
-    expect(itemIds(true)).toContain("linked-environments");
+    expect(results(false).map((item) => item.id)).not.toContain("linked-environments");
+    expect(results(true)).toContainEqual(
+      expect.objectContaining({
+        id: "linked-environments",
+        to: "/settings/connections",
+        targetId: "linked-environments",
+      }),
+    );
   });
 
   it("finds keybinding commands by label, command id, and default key", () => {
