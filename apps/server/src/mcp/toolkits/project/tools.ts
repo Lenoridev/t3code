@@ -30,7 +30,6 @@ import { Tool, Toolkit } from "effect/ai";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
-import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as SourceControlRepositoryService from "../../../sourceControl/SourceControlRepositoryService.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -58,14 +57,16 @@ const ProjectListTool = Tool.make("t3_project_list", {
     projects: Schema.Array(Project),
     nextCursor: Schema.NullOr(NonNegativeInt),
   }),
-  dependencies: [...shared.dependencies, PeerForwarding.PeerForwarding],
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);
 const ProjectReadTool = Tool.make("t3_project_read", {
   ...shared,
   description: "Read one project: workspace and saved scripts.",
-  parameters: Schema.Struct({ projectId: ProjectId }),
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: ProjectId,
+  }),
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);
@@ -79,26 +80,30 @@ const ProjectCreateTool = Tool.make("t3_project_create", {
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
   success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
-  dependencies: [
-    ...shared.dependencies,
-    ManagedProjectFolders.ManagedProjectFolders,
-    PeerForwarding.PeerForwarding,
-  ],
+  dependencies: [...shared.dependencies, ManagedProjectFolders.ManagedProjectFolders],
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
   ...shared,
   description: "Update one project's settings. Omitted fields are unchanged.",
-  parameters: Schema.Struct({ projectId: ProjectId, ...ProjectUpdatePayload.fields }),
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: ProjectId,
+    ...ProjectUpdatePayload.fields,
+  }),
 }).annotate(Tool.Destructive, true);
 const ProjectDeleteTool = Tool.make("t3_project_delete", {
   ...shared,
   description: "Delete one project. Nonempty needs `force: true`. Folder on disk stays.",
-  parameters: Schema.Struct({ projectId: ProjectId, force: Schema.optionalKey(Schema.Boolean) }),
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: ProjectId,
+    force: Schema.optionalKey(Schema.Boolean),
+  }),
 }).annotate(Tool.Destructive, true);
 const ProjectCloneTool = Tool.make("t3_project_clone", {
   ...shared,
   description:
-    "Clone a repository (`destinationPath` new or empty). Register after with `t3_project_create`; on a linked machine, pass the same `environmentId` to both.",
+    "Clone a repository (`destinationPath` new or empty). Register after with `t3_project_create`, with the same `environmentId`.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     ...SourceControlCloneRepositoryInput.fields,
@@ -107,7 +112,6 @@ const ProjectCloneTool = Tool.make("t3_project_clone", {
   dependencies: [
     ...shared.dependencies,
     SourceControlRepositoryService.SourceControlRepositoryService,
-    PeerForwarding.PeerForwarding,
   ],
 })
   .annotate(Tool.Destructive, true)
@@ -160,7 +164,6 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
     ServerConfig.ServerConfig,
     ServerSettings.ServerSettingsService,
     DocumentText.DocumentText,
-    PeerForwarding.PeerForwarding,
   ],
 })
   .annotate(Tool.Destructive, true)

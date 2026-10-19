@@ -1,6 +1,5 @@
 import {
   CommandId,
-  type EnvironmentId,
   MessageId,
   ThreadId,
   OrchestratorMcpFailure,
@@ -17,7 +16,6 @@ import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
-import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -75,32 +73,12 @@ const access = Effect.gen(function* () {
   yield* readCaller();
   return yield* Project.ProjectService;
 });
-
-/** The linked environment a call names, or nothing for this one. */
-const remoteTarget = (input: { readonly environmentId?: EnvironmentId | undefined }) =>
-  McpInvocationContext.McpInvocationContext.pipe(
-    Effect.map((scope) => ({
-      scope,
-      target: PeerForwarding.remoteTarget(scope, input.environmentId),
-    })),
-  );
 export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   t3_thread_launch: McpToolAccess.startsThreads(
     (input) => input,
     (input, { runtimeMode, interactionMode }) =>
       Effect.gen(function* () {
-        const { scope, target } = yield* remoteTarget(input);
-        if (target !== undefined) {
-          // The call carries the caller's modes, so omitted modes inherit
-          // them there too, capped by the link's access.
-          const forwarding = yield* PeerForwarding.PeerForwarding;
-          return yield* forwarding.call(
-            scope,
-            ProjectToolkit.tools.t3_thread_launch,
-            target,
-            input,
-          );
-        }
+        const scope = yield* McpInvocationContext.McpInvocationContext;
         const context = yield* readCaller();
         const { caller } = context;
         // A retry with the same key replays the first launch: the ids derive
@@ -269,11 +247,6 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   ),
   t3_project_list: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
-      const { scope, target } = yield* remoteTarget(input);
-      if (target !== undefined) {
-        const forwarding = yield* PeerForwarding.PeerForwarding;
-        return yield* forwarding.call(scope, ProjectToolkit.tools.t3_project_list, target, input);
-      }
       const projects = yield* access;
       const snapshot = yield* projects.snapshot.pipe(Effect.mapError(unavailable));
       const rows = snapshot.projects.filter((project) => project.deletedAt === null);
@@ -294,19 +267,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       return result.value;
     }),
   ),
-  t3_project_create: McpToolAccess.writesEnvironment((params) =>
+  t3_project_create: McpToolAccess.writesEnvironment(({ workspaceRoot, ...input }) =>
     Effect.gen(function* () {
-      const { scope, target } = yield* remoteTarget(params);
-      if (target !== undefined) {
-        const forwarding = yield* PeerForwarding.PeerForwarding;
-        return yield* forwarding.call(
-          scope,
-          ProjectToolkit.tools.t3_project_create,
-          target,
-          params,
-        );
-      }
-      const { environmentId: _here, workspaceRoot, ...input } = params;
       const projects = yield* Project.ProjectService;
       if (workspaceRoot === undefined) {
         // Only updates record model defaults; reject defaults that creation would silently drop.
@@ -364,14 +326,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         .pipe(Effect.mapError(projectFailure));
     }),
   ),
-  t3_project_clone: McpToolAccess.writesEnvironment((params) =>
+  t3_project_clone: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
-      const { scope, target } = yield* remoteTarget(params);
-      if (target !== undefined) {
-        const forwarding = yield* PeerForwarding.PeerForwarding;
-        return yield* forwarding.call(scope, ProjectToolkit.tools.t3_project_clone, target, params);
-      }
-      const { environmentId: _here, ...input } = params;
       const repositories = yield* Repositories.SourceControlRepositoryService;
       return yield* repositories.cloneRepository(input).pipe(
         Effect.mapError(
