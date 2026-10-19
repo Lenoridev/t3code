@@ -279,7 +279,6 @@ function ConnectAgentHeading({
   );
 }
 
-/** One choice in a picker of what an outside agent, or a linked environment, may do. */
 export function AccessOption({
   access,
   selected,

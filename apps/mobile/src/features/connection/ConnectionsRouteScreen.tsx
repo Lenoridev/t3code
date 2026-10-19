@@ -70,13 +70,15 @@ export function ConnectionsRouteScreen() {
           onSetEnabled={onSetEnvironmentEnabled}
           onUpdate={onUpdateEnvironment}
         />
-        {connectedEnvironments.map((environment) => (
-          <LinkedEnvironmentsSection
-            key={environment.environmentId}
-            environmentId={environment.environmentId}
-            environmentLabel={environment.environmentLabel}
-          />
-        ))}
+        {connectedEnvironments
+          .filter((environment) => environment.connectionState === "connected")
+          .map((environment) => (
+            <LinkedEnvironmentsSection
+              key={environment.environmentId}
+              environmentId={environment.environmentId}
+              environmentLabel={environment.environmentLabel}
+            />
+          ))}
         <PullRequestRoutingSettings />
       </ScrollView>
     </View>

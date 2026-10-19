@@ -7,7 +7,6 @@ import { useEnvironmentsWithScope } from "./session";
 
 export const peerLinkEnvironment = createPeerLinkEnvironmentAtoms(connectionAtomRuntime);
 
-/** Connected environments whose links this session may see, in catalog order. */
 export function usePeerLinkHosts() {
   const { environments } = useEnvironments();
   const supported = environments.filter(
