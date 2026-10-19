@@ -299,7 +299,7 @@ const OrchestratorMcpProjectTarget = Schema.optional(
 export const OrchestratorMcpEnvironmentTarget = Schema.optional(
   EnvironmentId.annotate({
     description:
-      "A linked environment to do this in; t3_environment_links lists them. Omit for this environment. Ids (projects, threads, runs) then belong to that environment.",
+      "Linked environment to act in. Omit for this one. Ids are then that environment's.",
   }),
 );
 
@@ -613,6 +613,7 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
 export type OrchestratorMcpCapabilitiesResult = typeof OrchestratorMcpCapabilitiesResult.Type;
 
 export const OrchestratorMcpScheduleTaskInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
   projectId: OrchestratorMcpProjectTarget,
   prompt: OrchestratorMcpPrompt,
   schedule: OrchestratorMcpSchedule,
@@ -659,6 +660,7 @@ export const OrchestratorMcpScheduleTaskResult = OrchestratorMcpScheduledTask;
 export type OrchestratorMcpScheduleTaskResult = typeof OrchestratorMcpScheduleTaskResult.Type;
 
 export const OrchestratorMcpListScheduledTasksInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
   projectId: Schema.optional(
     ProjectId.annotate({
       description: "Default: your thread's project, or all outside a thread.",
@@ -675,6 +677,7 @@ export type OrchestratorMcpListScheduledTasksResult =
   typeof OrchestratorMcpListScheduledTasksResult.Type;
 
 export const OrchestratorMcpUpdateScheduledTaskInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
   scheduledTaskId: ScheduledTaskId,
   prompt: Schema.optional(OrchestratorMcpPrompt),
   title: Schema.optional(OrchestratorMcpTitle),
@@ -730,6 +733,7 @@ export const OrchestratorMcpRequestSecretResult = Schema.Union([
 export type OrchestratorMcpRequestSecretResult = typeof OrchestratorMcpRequestSecretResult.Type;
 
 export const OrchestratorMcpDeleteScheduledTaskInput = Schema.Struct({
+  environmentId: OrchestratorMcpEnvironmentTarget,
   scheduledTaskId: ScheduledTaskId,
 });
 export type OrchestratorMcpDeleteScheduledTaskInput =

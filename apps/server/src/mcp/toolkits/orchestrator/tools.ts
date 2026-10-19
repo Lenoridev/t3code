@@ -9,6 +9,7 @@ import {
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpDeleteScheduledTaskInput,
   OrchestratorMcpDeleteScheduledTaskResult,
+  OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpRequestSecretInput,
   OrchestratorMcpRequestSecretResult,
   OrchestratorMcpFailure,
@@ -35,6 +36,7 @@ import {
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
+import * as Struct from "effect/Struct";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
@@ -47,8 +49,8 @@ const dependencies = [
   ThreadManagementService.ThreadManagementService,
   OrchestratorMcpService.OrchestratorMcpService,
 ];
-/** Tools that also run in a linked environment, when `environmentId` names one. */
-const forwardingDependencies = [...dependencies, PeerForwarding.PeerForwarding];
+/** Listing this environment's links. */
+const linkDependencies = [...dependencies, PeerForwarding.PeerForwarding];
 const threadMetadataDependencies = [
   McpInvocationContext.McpInvocationContext,
   ThreadManagementService.ThreadManagementService,
@@ -62,7 +64,7 @@ const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
   success: OrchestratorMcpCapabilitiesResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "Get orchestration capabilities")
   .annotate(Tool.Readonly, true)
@@ -111,7 +113,10 @@ const TaskCancelTool = Tool.make("task_cancel", {
 const WorkflowStopTool = Tool.make("t3_workflow_stop", {
   description:
     "Stop a running Claude workflow in a thread. `subagentId`: coordinator from `t3_thread_read` 'activity'. Stops only the workflow, not the thread.",
-  parameters: OrchestrationV2StopWorkflowInput,
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    ...OrchestrationV2StopWorkflowInput.fields,
+  }),
   success: Schema.Struct({}),
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -210,7 +215,7 @@ const ThreadListTool = Tool.make("t3_thread_list", {
   success: OrchestratorMcpThreadListResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "List T3 threads")
   .annotate(Tool.Readonly, true)
@@ -224,7 +229,7 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
   success: OrchestratorMcpThreadReadResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "Read a T3 thread")
   .annotate(Tool.Strict, true)
@@ -235,7 +240,11 @@ const ThreadReadTool = Tool.make("t3_thread_read", {
 const ThreadUpdateTool = Tool.make("t3_thread_update", {
   description:
     "Rename a thread (`action:'rename'` with `title`) or regenerate its title. Omit `threadId` for this thread. Workspace and branch cannot change here.",
-  parameters: ThreadMetadataMcpUpdateInput,
+  // Keeps the input's action/field check, which rebuilding the struct would drop.
+  parameters: ThreadMetadataMcpUpdateInput.mapFields(
+    Struct.assign({ environmentId: OrchestratorMcpEnvironmentTarget }),
+    { unsafePreserveChecks: true },
+  ),
   success: ThreadMetadataMcpUpdateResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
@@ -252,7 +261,7 @@ const ThreadSendTool = Tool.make("t3_thread_send", {
   success: OrchestratorMcpThreadSendResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "Send to a T3 thread")
   .annotate(Tool.Destructive, true)
@@ -265,7 +274,7 @@ const ThreadWaitTool = Tool.make("t3_thread_wait", {
   success: OrchestratorMcpThreadWaitResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "Wait for a T3 thread")
   .annotate(Tool.Readonly, true)
@@ -279,18 +288,18 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   success: OrchestratorMcpThreadInterruptResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies,
 })
   .annotate(Tool.Title, "Interrupt a T3 thread")
   .annotate(Tool.Destructive, true);
 
 const EnvironmentLinksTool = Tool.make("t3_environment_links", {
   description:
-    "List the other T3 Code environments this one is linked to, such as the user's other machines, and whether each answers now. Pass one's environmentId to t3_project_list, t3_thread_launch, t3_thread_list, t3_thread_read, t3_thread_send, t3_thread_wait, t3_thread_interrupt, or orchestrator_capabilities to act there. A linked environment lets this one's agents do at most its access there, and never more than the calling agent may do here. An expired link has to be linked again from a new pairing code.",
+    "List the other T3 Code environments this one is linked to, such as the user's other machines, and whether each answers now. Pass one's environmentId to any tool that takes environmentId, such as t3_thread_launch, t3_thread_send, t3_pending_request_respond, t3_queue_list or t3_project_list, to act there; delegate_task takes it as target.environmentId. A linked environment lets this one's agents do at most its access there, and never more than the calling agent may do here. An expired link has to be linked again from a new pairing code.",
   success: OrchestratorMcpEnvironmentLinksResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies: forwardingDependencies,
+  dependencies: linkDependencies,
 })
   .annotate(Tool.Title, "List linked environments")
   .annotate(Tool.Readonly, true)

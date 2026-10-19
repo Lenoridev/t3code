@@ -76,12 +76,17 @@ token in its own secret store. The other environment needs nothing new: it
 sees one more OAuth client, lists it in Connections, and revokes it there.
 Unlinking on the linking side only forgets the token.
 
+- **A tool runs in a linked environment when its parameters take
+  `OrchestratorMcpEnvironmentTarget`** as `environmentId`.
+  [`McpToolAccess.toLayer`](../../apps/server/src/mcp/McpToolAccess.ts) sends
+  such a call there once the tool's access declaration has checked the caller,
+  so a read-only or ended caller is refused before anything is sent. The
+  thread or project the call names is checked where it lives. A tool that acts
+  as the calling thread itself cannot take a linked environment.
 - **Every forwarded call carries the calling agent's modes** in
   `T3-Mode-Limit`, which the receiving `/mcp` only ever narrows the client's
   approved access with. A plan-mode agent therefore cannot start full-access
-  work through a full-access link. The tool's own access declaration also
-  runs on the linking side first, so a read-only or ended caller is refused
-  before anything is sent.
+  work through a full-access link.
 - **The token goes only to an address that proves it is the linked
   environment**: its descriptor must report the linked environment id. A LAN
   address that now belongs to another machine never receives it.
