@@ -118,5 +118,16 @@ describe("handleAnnotationKeyEvent", () => {
     expect(dispatchKey({ inOverlay: false }, { key: "r" }).action).toBe("marquee");
     expect(dispatchKey({ inOverlay: false }, { key: "Escape" }).action).toBe("cancel");
     expect(dispatchKey({ inOverlay: false }, { key: "r" }, "keyup").action).toBeNull();
+    // The preload shares the page's realm, so the page owns Object.prototype.
+    /* eslint-disable no-extend-native -- the inspected page can do this */
+    const inherited = Object.getOwnPropertyDescriptor(Object.prototype, "x");
+    Object.defineProperty(Object.prototype, "x", { value: "send", configurable: true });
+    try {
+      expect(dispatchKey({ inOverlay: false }, { key: "x" }).action).toBeNull();
+    } finally {
+      if (inherited) Object.defineProperty(Object.prototype, "x", inherited);
+      else Reflect.deleteProperty(Object.prototype, "x");
+    }
+    /* eslint-enable no-extend-native */
   });
 });

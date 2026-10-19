@@ -21,13 +21,6 @@ interface AnnotationKeyEvent extends AnnotationKeyboardEvent {
 
 export type AnnotationKeyAction = "cancel" | AnnotationTool | PreviewAnnotationSubmission;
 
-const TOOL_SHORTCUTS: Readonly<Record<string, AnnotationTool>> = {
-  v: "select",
-  r: "marquee",
-  d: "draw",
-  e: "erase",
-};
-
 // Runs from the preload's window capture listeners, ahead of any listener the
 // inspected page installs. Overlay events are hidden from the page but never
 // cancelled, so the editor still receives Space, caret keys and composition.
@@ -55,7 +48,20 @@ export function handleAnnotationKeyEvent(
     if (submission) event.preventDefault();
     return submission;
   }
-  return TOOL_SHORTCUTS[event.key] ?? null;
+  // Fixed cases, not a table: the preload shares the page's realm, so an
+  // object lookup would also read keys the page planted on Object.prototype.
+  switch (event.key) {
+    case "v":
+      return "select";
+    case "r":
+      return "marquee";
+    case "d":
+      return "draw";
+    case "e":
+      return "erase";
+    default:
+      return null;
+  }
 }
 
 export function resolveAnnotationSubmission(
