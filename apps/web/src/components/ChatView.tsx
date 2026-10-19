@@ -2178,6 +2178,11 @@ export default function ChatView(props: ChatViewProps) {
       ? null
       : clampFileAttachmentUploadBytes(advertisedFileAttachmentBytes);
   const envLocked = Boolean(activeThread && (activeMessageCount > 0 || activeRuntime !== null));
+  // onEnvironmentChange only retargets an unsent draft. envLocked alone does not
+  // rule out a started thread: one whose machine is offline never loads its
+  // messages, so it would otherwise be offered a machine picker that does nothing.
+  const canChangeEnvironment =
+    hasMultipleEnvironments && !envLocked && draftId !== null && !draftThread?.promotedTo;
 
   const loadBalancingSettings = useClientSettings((settings) => ({
     loadBalancingEnabled: settings.loadBalancingEnabled,
@@ -2518,12 +2523,21 @@ export default function ChatView(props: ChatViewProps) {
     ({ item }) =>
       item.type === "compaction" &&
       item.runId === activeActivityRun?.runId &&
-      item.status === "completed",
+      (item.status === "completed" ||
+        item.status === "failed" ||
+        item.status === "interrupted" ||
+        item.status === "cancelled"),
+  );
+  const compactionRunning = serverVisibleTurnItems.some(
+    ({ item }) =>
+      item.type === "compaction" &&
+      item.runId !== null &&
+      item.runId === activeRuntime?.activeRunId &&
+      item.status === "running",
   );
   const isCompacting =
     (isSendBusy || phase === "connecting" || phase === "running") &&
-    compactRequestIsActive &&
-    !compactionSettled;
+    (compactionRunning || (compactRequestIsActive && !compactionSettled));
   const isWorking =
     phase === "running" ||
     isSendBusy ||
@@ -5618,7 +5632,7 @@ export default function ChatView(props: ChatViewProps) {
       "composer.mode": openComposerControl("composer.mode"),
       "composer.workspace": openComposerControl("composer.workspace"),
       "composer.cycleHost": ({ event }) => {
-        if (envLocked || !draftId || !hasMultipleEnvironments) return false;
+        if (!canChangeEnvironment) return false;
         if (event.repeat) return;
         const currentId = readPendingEnvironmentChange()?.environmentId ?? environmentId;
         const index = logicalProjectEnvironments.findIndex(
@@ -8384,7 +8398,7 @@ export default function ChatView(props: ChatViewProps) {
                                 {...(canCheckoutPullRequestIntoThread
                                   ? { onCheckoutPullRequestRequest: openPullRequestDialogStable }
                                   : {})}
-                                {...(hasMultipleEnvironments
+                                {...(canChangeEnvironment
                                   ? { onEnvironmentChange: onEnvironmentChangeStable }
                                   : {})}
                                 autoEnvironmentLabel={autoEnvironmentLabel}
@@ -8471,7 +8485,7 @@ export default function ChatView(props: ChatViewProps) {
                   ? onAutoEnvironmentStable
                   : undefined
               }
-              onEnvironmentChange={onEnvironmentChangeStable}
+              {...(canChangeEnvironment ? { onEnvironmentChange: onEnvironmentChangeStable } : {})}
               onEnvModeChange={onEnvModeChangeStable}
               envMode={envMode}
               {...(canOverrideServerThreadEnvMode
