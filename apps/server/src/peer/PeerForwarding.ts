@@ -75,11 +75,10 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
 
   /**
-   * The caller's own limits here, which travel with every call it forwards.
-   * The peer sees only the link's credential, so a credential that may not
-   * control threads here is refused here. Work a link started here never uses
-   * this environment's own links: the peer would see this environment's
-   * session, not the link the work came from, so its fence could not hold.
+   * The caller's own limits, which travel with every forwarded call: the peer sees only the
+   * link's credential, so a caller that may not control threads here is refused here. Work a
+   * link started never uses this environment's links, since the peer would see this
+   * environment's session instead of that link, and its fence could not hold.
    */
   const callerLimits = (scope: Scope) =>
     readCaller().pipe(
