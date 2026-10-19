@@ -290,9 +290,20 @@ export const writesEnvironment = <P, A, E, R>(
     params: P,
     check: Effect.Effect<Caller, OrchestratorMcpFailure, CheckServices>,
   ) => Effect.Effect<A, E, R>,
+  options?: {
+    /**
+     * Whether a linked caller may make it, as for adding a project: it leaves
+     * everything already here as it was.
+     */
+    readonly linkedCallers?: "allowed";
+  },
 ) => {
   const check = orchestratingCaller.pipe(
-    Effect.tap((caller) => assertNotLinked(caller, "change projects or environment settings")),
+    Effect.tap((caller) =>
+      options?.linkedCallers === "allowed"
+        ? Effect.void
+        : assertNotLinked(caller, "change projects or environment settings"),
+    ),
     Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
   );
   return declare(
