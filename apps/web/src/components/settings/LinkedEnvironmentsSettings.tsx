@@ -18,6 +18,7 @@ import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { Button } from "../ui/button";
 import {
   Dialog,
+  DialogClose,
   DialogDescription,
   DialogFooter,
   DialogHeader,
@@ -30,19 +31,13 @@ import { Input } from "../ui/input";
 import { RadioGroup } from "../ui/radio-group";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
-import { SettingsRow, SettingsSection, useRelativeTimeTick } from "./settingsLayout";
+import { SettingsRow, SettingsSection } from "./settingsLayout";
+import { useNowMinute } from "../../hooks/useNowMinute";
 import { searchableSetting } from "./settingsSearch";
 
 const failureToast = (title: string, description: string) =>
   toastManager.add(stackedThreadToast({ type: "error", title, description }));
 
-/**
- * Other environments this one links to, so its agents can work there. Each
- * link is an outside agent session on the other environment, revoked from
- * that environment's own Connections. `environmentLabel` names the linking
- * environment when several are listed; only the first section is the search
- * target.
- */
 export function LinkedEnvironmentsSettings({
   environmentId,
   environmentLabel,
@@ -90,8 +85,8 @@ function LinkedEnvironmentRow({
   readonly environmentId: EnvironmentId;
   readonly link: PeerLinkSummary;
 }) {
-  const nowMs = useRelativeTimeTick(60_000);
-  const health = peerLinkHealth(link, DateTime.makeUnsafe(nowMs));
+  const nowMinute = useNowMinute();
+  const health = peerLinkHealth(link, DateTime.makeUnsafe(nowMinute));
   const unlink = useAtomCommand(peerLinkEnvironment.unlink, { label: "unlink environment" });
   const canUnlink = useAtomValue(peerLinkEnvironment.unlink.permissionAtom(environmentId));
   const [busy, setBusy] = useState(false);
@@ -169,10 +164,13 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
   const formId = useId();
   const accessLabelId = `${formId}-access`;
   const link = useAtomCommand(peerLinkEnvironment.link, { label: "link environment" });
-  const reset = () => {
-    setUrl("");
-    setPairingCode("");
-    setAccess("approval-required");
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (!next) {
+      setUrl("");
+      setPairingCode("");
+      setAccess("approval-required");
+    }
   };
   const submit = async () => {
     setBusy(true);
@@ -183,8 +181,7 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
     setBusy(false);
     if (result._tag === "Success") {
       toastManager.add({ type: "success", title: `Linked ${result.value.label}` });
-      reset();
-      setOpen(false);
+      handleOpenChange(false);
     } else if (!isAtomCommandInterrupted(result)) {
       failureToast("Could not link the environment", String(squashAtomCommandFailure(result)));
     }
@@ -193,10 +190,8 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        // A link that finishes after a close would still be made, and would close a reopened form.
         if (!next && busy) return;
-        setOpen(next);
-        if (!next) reset();
+        handleOpenChange(next);
       }}
     >
       <DialogTrigger
@@ -254,6 +249,7 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
               </span>
               <RadioGroup
                 aria-labelledby={accessLabelId}
+                disabled={busy}
                 value={access}
                 onValueChange={(value) => setAccess(value as AuthMcpClientAccess)}
               >
@@ -262,16 +258,17 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
                 ))}
               </RadioGroup>
               <p className="text-xs text-muted-foreground">
-                An agent here never gets more there than its own mode here either. Threads it starts
-                there cannot change that environment's own threads, projects or settings.
+                An agent never gets more access there than its own mode here. Below full access, it
+                can change only threads this link started, not that environment's own threads,
+                projects or settings.
               </p>
             </div>
           </form>
         </DialogPanel>
         <DialogFooter variant="bare">
-          <Button variant="outline" type="button" disabled={busy} onClick={() => setOpen(false)}>
+          <DialogClose disabled={busy} render={<Button variant="outline" type="button" />}>
             Cancel
-          </Button>
+          </DialogClose>
           <Button
             form={formId}
             type="submit"
