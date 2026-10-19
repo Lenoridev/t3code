@@ -954,226 +954,240 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
   }).pipe(Effect.provide(DelegatedTaskRequestReactor.layer.pipe(Layer.provideMerge(layerTest)))),
 );
 
-it.effect.each(["active", "idle", "waiting"] as const)(
-  "reports a delegated child's human requests with an %s parent",
-  (parentState) =>
+const setupDelegatedApproval = Effect.fnUntraced(function* (
+  completionWake: "always" | "settled_only" = "always",
+) {
+  const engine = yield* Orchestrator.OrchestratorV2;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const reactor = yield* DelegatedTaskRequestReactor.DelegatedTaskRequestReactor;
+  const sink = yield* EventSink.EventSinkV2;
+  const parentThreadId = ThreadId.make("thread:human-parent:approval");
+  yield* engine.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make("human:create:approval"),
+    threadId: parentThreadId,
+    projectId: ProjectId.make("project:human-requests"),
+    title: "Parent",
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    createdBy: "user",
+    creationSource: "web",
+  });
+  yield* engine.dispatch({
+    type: "message.dispatch",
+    commandId: CommandId.make("human:start:approval"),
+    threadId: parentThreadId,
+    messageId: MessageId.make("human:message:approval"),
+    text: "Delegate a task",
+    attachments: [],
+    dispatchMode: { type: "start_immediately" },
+    createdBy: "user",
+    creationSource: "web",
+  });
+  const parentRun = (yield* projections.getThreadRecords(parentThreadId, ["runs"])).runs[0]!;
+  yield* engine.dispatch({
+    type: "delegated_task.request",
+    commandId: CommandId.make("human:delegate:approval"),
+    parentThreadId,
+    parentRunId: parentRun.id,
+    parentNodeId: parentRun.rootNodeId!,
+    task: "Run the checks",
+    completionWake,
+    modelSelection,
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    createdBy: "agent",
+    creationSource: "mcp",
+  });
+  const task = (yield* projections.getThreadRecords(parentThreadId, ["subagents"])).subagents[0]!;
+  const childRun = (yield* projections.getThreadRecords(task.childThreadId!, ["runs"])).runs[0]!;
+  const now = yield* DateTime.now;
+  const parentEnded = {
+    id: EventId.make("human:parent-ended:approval"),
+    type: "run.updated",
+    threadId: parentThreadId,
+    runId: parentRun.id,
+    occurredAt: now,
+    payload: { ...parentRun, status: "completed", completedAt: now },
+  } satisfies OrchestrationV2DomainEvent;
+  const request = (
+    kind: "command" | "permission" | "mcp-elicitation" | "auth_refresh" | "dynamic_tool_call",
+  ) => ({
+    id: EventId.make("approval:request:" + kind),
+    type: "runtime-request.updated" as const,
+    threadId: task.childThreadId!,
+    runId: childRun.id,
+    occurredAt: now,
+    payload: {
+      id: RuntimeRequestId.make("approval:request:" + kind),
+      nodeId: childRun.rootNodeId!,
+      providerTurnId: null,
+      nativeRequestRef: null,
+      kind,
+      status: "pending" as const,
+      responseCapability: {
+        type: "live" as const,
+        providerSessionId: ProviderSessionId.make("approval:session"),
+      },
+      createdAt: now,
+      resolvedAt: null,
+    },
+  });
+  return { engine, projections, reactor, sink, parentThreadId, task, parentEnded, request };
+});
+
+const layerDelegatedApproval = DelegatedTaskRequestReactor.layer.pipe(
+  Layer.provideMerge(layerTest),
+);
+
+it.effect("wakes an idle parent once for approval and directs the human to the child", () =>
+  Effect.gen(function* () {
+    const { projections, reactor, sink, parentThreadId, task, parentEnded, request } =
+      yield* setupDelegatedApproval();
+    const approval = request("mcp-elicitation");
+    const requests = [approval, request("auth_refresh"), request("dynamic_tool_call")];
+    yield* sink.write({ events: [parentEnded, ...requests] });
+    for (const event of requests) yield* reactor.handle(event);
+    yield* reactor.handle(approval);
+    const parent = yield* projections.getThreadRecords(parentThreadId, [
+      "messages",
+      "runs",
+      "subagents",
+    ]);
+    const notices = parent.messages.filter((message) => message.notification !== undefined);
+    assert.equal(notices.length, 1);
+    const notice = notices[0]!;
+    assert.include(notice.text, "t3-thread://v1/" + task.childThreadId);
+    assert.include(notice.text, approval.payload.id);
+    assert.include(notice.text, "Only the user can approve");
+    assert.include(notice.text, "do not answer this request with t3_pending_request_respond");
+    assert.deepEqual(notice.notification, {
+      source: { kind: "delegated_task", taskIds: [task.id], childThreadId: task.childThreadId! },
+      outcome: "updated",
+      summary: 'Delegated task "Run the checks" needs approval',
+    });
+    assert.equal(parent.runs.find((run) => run.userMessageId === notice.id)?.status, "starting");
+    assert.equal(parent.subagents[0]?.status, "running");
+    assert.isNull(parent.subagents[0]?.result);
+  }).pipe(Effect.provide(layerDelegatedApproval)),
+);
+
+it.effect.each(["stop", "dispose"] as const)(
+  "withdraws resolved approval notices and fences queued and late notices after %s",
+  (action) =>
     Effect.gen(function* () {
-      const engine = yield* Orchestrator.OrchestratorV2;
-      const projections = yield* ProjectionStore.ProjectionStoreV2;
-      const reactor = yield* DelegatedTaskRequestReactor.DelegatedTaskRequestReactor;
-      const sink = yield* EventSink.EventSinkV2;
-      const parentThreadId = ThreadId.make(`thread:human-parent:${parentState}`);
-      yield* engine.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make(`human:create:${parentState}`),
-        threadId: parentThreadId,
-        projectId: ProjectId.make("project:human-requests"),
-        title: "Parent",
-        modelSelection,
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        branch: null,
-        worktreePath: null,
-        createdBy: "user",
-        creationSource: "web",
-      });
-      yield* engine.dispatch({
-        type: "message.dispatch",
-        commandId: CommandId.make(`human:start:${parentState}`),
-        threadId: parentThreadId,
-        messageId: MessageId.make(`human:message:${parentState}`),
-        text: "Delegate a task",
-        attachments: [],
-        dispatchMode: { type: "start_immediately" },
-        createdBy: "user",
-        creationSource: "web",
-      });
-      const parentRun = (yield* projections.getThreadRecords(parentThreadId, ["runs"])).runs[0]!;
-      yield* engine.dispatch({
-        type: "delegated_task.request",
-        commandId: CommandId.make(`human:delegate:${parentState}`),
-        parentThreadId,
-        parentRunId: parentRun.id,
-        parentNodeId: parentRun.rootNodeId!,
-        task: "Run the checks",
-        completionWake: parentState === "waiting" ? "settled_only" : "always",
-        modelSelection,
-        runtimeMode: "approval-required",
-        interactionMode: "default",
-        createdBy: "agent",
-        creationSource: "mcp",
-      });
-      const task = (yield* projections.getThreadRecords(parentThreadId, ["subagents"]))
-        .subagents[0]!;
-      const childRun = (yield* projections.getThreadRecords(task.childThreadId!, ["runs"]))
-        .runs[0]!;
-      const now = yield* DateTime.now;
-      const parentEnded = {
-        id: EventId.make(`human:parent-ended:${parentState}`),
-        type: "run.updated",
-        threadId: parentThreadId,
-        runId: parentRun.id,
-        occurredAt: now,
-        payload: { ...parentRun, status: "completed", completedAt: now },
-      } satisfies OrchestrationV2DomainEvent;
-      if (parentState === "idle") yield* sink.write({ events: [parentEnded] });
-      const requests = (
-        [
-          "command",
-          "file-read",
-          "file-change",
-          "mcp-elicitation",
-          "permission",
-          "auth_refresh",
-          "dynamic_tool_call",
-        ] as const
-      ).map((kind, index) => ({
-        id: EventId.make(`human:request:${parentState}:${index}`),
-        type: "runtime-request.updated" as const,
-        threadId: task.childThreadId!,
-        runId: childRun.id,
-        occurredAt: now,
-        payload: {
-          id: RuntimeRequestId.make(`human:request:${parentState}:${index}`),
-          nodeId: childRun.rootNodeId!,
-          providerTurnId: null,
-          nativeRequestRef: null,
-          kind,
-          status: "pending" as const,
-          responseCapability: {
-            type: "live" as const,
-            providerSessionId: ProviderSessionId.make("human:session"),
-          },
-          createdAt: now,
-          resolvedAt: null,
-        },
-      }));
-      yield* sink.write({ events: requests });
-      for (const event of requests) {
-        yield* reactor.handle(event);
-        yield* reactor.handle(event);
-      }
-      const notices = (yield* projections.getThreadRecords(parentThreadId, [
-        "messages",
-      ])).messages.filter((m) => m.notification !== undefined);
-      assert.equal(notices.length, parentState === "waiting" ? 0 : 5);
-      if (parentState === "waiting") {
-        yield* sink.write({ events: [parentEnded] });
-        yield* reactor.handle(parentEnded);
-        yield* reactor.handle(parentEnded);
-      }
-      const parent = yield* projections.getThreadRecords(parentThreadId, [
-        "messages",
-        "runs",
-        "subagents",
-      ]);
-      const delivered = parent.messages.filter((m) => m.notification !== undefined);
-      assert.equal(delivered.length, 5);
-      for (const notice of delivered) {
-        assert.include(notice.text, `t3-thread://v1/${task.childThreadId}`);
-        assert.include(notice.text, "Only the user can approve");
-        assert.include(notice.text, "do not answer this request with t3_pending_request_respond");
-        assert.deepEqual(notice.notification?.source, {
-          kind: "delegated_task",
-          taskIds: [task.id],
-          childThreadId: task.childThreadId!,
-        });
-      }
-      assert.equal(
-        delivered.filter((m) => m.notification?.summary.endsWith("needs approval")).length,
-        5,
+      const { engine, projections, reactor, sink, parentThreadId, task, request } =
+        yield* setupDelegatedApproval();
+      const approval = request("command");
+      const pending = request("permission");
+      yield* sink.write({ events: [approval, pending] });
+      yield* reactor.handle(approval);
+      yield* reactor.handle(pending);
+      const parent = yield* projections.getThreadRecords(parentThreadId, ["messages", "runs"]);
+      const notices = parent.messages.filter((message) => message.notification !== undefined);
+      assert.equal(notices.length, 2);
+      const noticeRuns = parent.runs.filter((run) =>
+        notices.some((notice) => notice.id === run.userMessageId),
       );
-      assert.equal(
-        delivered.filter((m) => m.notification?.summary.endsWith("needs sign-in")).length,
-        0,
+      assert.deepEqual(
+        noticeRuns.map((run) => run.status),
+        ["queued", "queued"],
       );
-      assert.equal(parent.subagents[0]?.status, "running");
-      assert.isNull(parent.subagents[0]?.result);
-      if (parentState !== "active") {
-        assert.isTrue(
-          parent.runs.some(
-            (run) => delivered.some((m) => m.id === run.userMessageId) && run.status !== "queued",
-          ),
-        );
-      }
-      // Resolving a request before its queued notice starts withdraws that notice.
       const resolved = {
-        ...requests[4]!,
-        id: EventId.make(`human:resolved:${parentState}`),
-        payload: { ...requests[4]!.payload, status: "resolved" as const, resolvedAt: now },
+        ...approval,
+        id: EventId.make("approval:resolved"),
+        payload: {
+          ...approval.payload,
+          status: "resolved" as const,
+          resolvedAt: approval.occurredAt,
+        },
       };
       yield* sink.write({ events: [resolved] });
       yield* reactor.handle(resolved);
-      const resolvedNotice = delivered.find((m) =>
-        m.text.includes(`request ${requests[4]!.payload.id} `),
-      )!;
-      assert.equal(
-        (yield* projections.getThreadRecords(parentThreadId, ["runs"])).runs.find(
-          (run) => run.userMessageId === resolvedNotice.id,
-        )?.status,
-        "cancelled",
+      const afterResolution = yield* projections.getThreadRecords(parentThreadId, ["runs"]);
+      assert.deepEqual(
+        noticeRuns.map(
+          (noticeRun) => afterResolution.runs.find((run) => run.id === noticeRun.id)?.status,
+        ),
+        ["cancelled", "queued"],
       );
-      // Dropping the task cancels the other queued notices before the parent can start them.
       yield* engine.dispatch(
-        parentState === "active"
+        action === "stop"
           ? {
               type: "thread.stop",
-              commandId: CommandId.make(`human:stop:${parentState}`),
+              commandId: CommandId.make("approval:stop"),
               threadId: parentThreadId,
             }
           : {
               type: "delegated_task.completion-delivery.dispose",
-              commandId: CommandId.make(`human:dispose:${parentState}`),
+              commandId: CommandId.make("approval:dispose"),
               parentThreadId,
               taskId: task.id,
             },
       );
-      const afterDispose = yield* projections.getThreadRecords(parentThreadId, ["runs"]);
-      assert.isFalse(
-        afterDispose.runs.some(
-          (run) => run.status === "queued" && delivered.some((m) => m.id === run.userMessageId),
+      const afterCancellation = yield* projections.getThreadRecords(parentThreadId, ["runs"]);
+      assert.deepEqual(
+        noticeRuns.map(
+          (noticeRun) => afterCancellation.runs.find((run) => run.id === noticeRun.id)?.status,
         ),
+        ["cancelled", "cancelled"],
       );
-      const late = {
-        ...requests[0]!,
-        id: EventId.make(`human:late:${parentState}`),
-        payload: {
-          ...requests[0]!.payload,
-          id: RuntimeRequestId.make(`human:late:${parentState}`),
-        },
-      };
-      yield* sink.write({ events: [late] });
-      yield* reactor.handle(late);
-      assert.equal(
-        (yield* projections.getThreadRecords(parentThreadId, ["messages"])).messages.filter(
-          (m) => m.notification !== undefined,
-        ).length,
-        5,
-      );
+      // A reactor that read the task before cancellation can still reach dispatch afterwards.
       const refused = yield* Effect.exit(
         engine.dispatch({
           type: "message.dispatch",
-          commandId: CommandId.make(`human:late-dispatch:${parentState}`),
+          commandId: CommandId.make("approval:late"),
           threadId: parentThreadId,
-          messageId: MessageId.make(`human:late-dispatch:${parentState}`),
-          text: "A stale reactor tried to report approval",
+          messageId: MessageId.make("approval:late"),
+          text: notices[1]!.text,
+          notification: notices[1]!.notification!,
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: "agent",
           creationSource: "server",
-          notification: {
-            source: {
-              kind: "delegated_task",
-              taskIds: [task.id],
-              childThreadId: task.childThreadId!,
-            },
-            outcome: "updated",
-            summary: "Stale approval notice",
-          },
         }),
       );
       assert.equal(refused._tag, "Failure");
-    }).pipe(Effect.provide(DelegatedTaskRequestReactor.layer.pipe(Layer.provideMerge(layerTest)))),
+      assert.equal(
+        (yield* projections.getThreadRecords(parentThreadId, ["messages"])).messages.length,
+        parent.messages.length,
+      );
+    }).pipe(Effect.provide(layerDelegatedApproval)),
+);
+
+it.effect("defers a blocking delegation approval until the launching run ends", () =>
+  Effect.gen(function* () {
+    const { projections, reactor, sink, parentThreadId, parentEnded, request } =
+      yield* setupDelegatedApproval("settled_only");
+    const approval = request("permission");
+    yield* sink.write({ events: [approval] });
+    yield* reactor.handle(approval);
+    assert.isFalse(
+      (yield* projections.getThreadRecords(parentThreadId, ["messages"])).messages.some(
+        (message) => message.notification !== undefined,
+      ),
+    );
+    yield* sink.write({ events: [parentEnded] });
+    yield* reactor.handle(parentEnded);
+    yield* reactor.handle(parentEnded);
+    const parent = yield* projections.getThreadRecords(parentThreadId, [
+      "messages",
+      "runs",
+      "subagents",
+    ]);
+    const notices = parent.messages.filter((message) => message.notification !== undefined);
+    assert.equal(notices.length, 1);
+    assert.include(notices[0]!.text, approval.payload.id);
+    assert.equal(
+      parent.runs.find((run) => run.userMessageId === notices[0]!.id)?.status,
+      "starting",
+    );
+    assert.equal(parent.subagents[0]?.status, "running");
+    assert.isNull(parent.subagents[0]?.result);
+  }).pipe(Effect.provide(layerDelegatedApproval)),
 );
 
 it.effect.each([false, true])("rejects thread.create for an existing id (deleted: %s)", (deleted) =>

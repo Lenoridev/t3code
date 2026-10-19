@@ -37,11 +37,11 @@ const make = Effect.gen(function* () {
     const key = `${task.threadId}:${request.id}`;
     const label = reportLabel(task.title?.trim() || task.prompt);
     const question = request.kind === "user_input";
-    const situation = !question
-      ? `Delegated task ${task.id} needs the user's approval.`
-      : request.responseCapability.type === "message"
+    const situation = question
+      ? request.responseCapability.type === "message"
         ? `Delegated task ${task.id} asked a question and is still working.`
-        : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`;
+        : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`
+      : `Delegated task ${task.id} needs the user's approval.`;
     yield* engine.dispatch({
       type: "message.dispatch",
       commandId: CommandId.make(`server:delegated-task-question:${key}`),
@@ -153,11 +153,10 @@ const make = Effect.gen(function* () {
       ) {
         return;
       }
-      // A blocking wait delivers a live question itself. Approval notices wait
-      // until the parent ends; approvals do not yet end a blocking wait.
+      // Blocking delegation returns live questions, but cannot return approvals yet.
       if (
         task.completionWake === "settled_only" &&
-        (event.payload.kind !== "user_input" || event.payload.responseCapability.type === "live") &&
+        (request.kind !== "user_input" || request.responseCapability.type === "live") &&
         parent.runs.some(
           (run) =>
             run.id === task.runId &&

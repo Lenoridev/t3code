@@ -1968,7 +1968,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .filter((message) => {
           const notice = message.notification;
           return (
+            message.delegatedCompletion === undefined &&
             notice?.source.kind === "delegated_task" &&
+            notice.source.childThreadId !== undefined &&
             notice.outcome === "updated" &&
             notice.source.taskIds.some((taskId) => input.taskIds.includes(taskId))
           );
@@ -4638,10 +4640,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
       const notice = command.notification;
-      if (notice?.source.kind === "delegated_task" && notice.outcome === "updated") {
+      if (
+        command.delegatedCompletion === undefined &&
+        notice?.source.kind === "delegated_task" &&
+        notice.source.childThreadId !== undefined &&
+        notice.outcome === "updated"
+      ) {
         const source = notice.source;
-        // Recheck under the parent lock: Stop or task_cancel may have won after
-        // the request reactor read the task, and must also fence late notices.
+        // Stop and disposal can win the parent lock after the reactor reads the task.
         if (
           !source.taskIds.every((taskId) =>
             projection.subagents.some(
@@ -4650,7 +4656,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 task.origin === "app_owned" &&
                 task.childThreadId === source.childThreadId &&
                 task.completionDelivery?.state !== "disposed" &&
-                !["completed", "failed", "cancelled", "interrupted"].includes(task.status),
+                !isTerminalDelegatedTaskStatus(task.status),
             ),
           )
         ) {
