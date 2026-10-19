@@ -471,8 +471,10 @@ through that wait instead. Approvals do not yet end that wait;
 their notices arrive when the parent's launching run ends.
 If the provider cuts that wait short, a still-pending live question also wakes the
 parent when its launching run completes, fails, or waits for post-turn work.
-Stopping or interrupting the parent prevents this catch-up. Dropping a task cancels
-its queued request notices and prevents late notices from starting another turn.
+Stopping or interrupting the parent, or cancelling a queued completion delivery,
+disposes the affected delegated cohort. Disposing an individual task suppresses
+that task's notices. These paths cancel queued question and approval notices and
+suppress future ones, even if the child keeps running.
 
 A failed run exposes its provider error before any progress text. Successful
 results use the latest assistant content from the final work turn.

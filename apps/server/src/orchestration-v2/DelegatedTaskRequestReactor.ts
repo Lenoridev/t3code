@@ -72,7 +72,6 @@ const make = Effect.gen(function* () {
           if (
             task.origin !== "app_owned" ||
             task.runId !== event.payload.id ||
-            task.completionWake !== "settled_only" ||
             task.completionDelivery?.state === "disposed" ||
             task.childThreadId === null ||
             ["completed", "failed", "cancelled", "interrupted"].includes(task.status)
@@ -87,7 +86,9 @@ const make = Effect.gen(function* () {
               request.kind === "dynamic_tool_call" ||
               request.kind === "auth_refresh" ||
               request.status !== "pending" ||
-              (request.kind === "user_input" && request.responseCapability.type !== "live")
+              (request.kind === "user_input" &&
+                (task.completionWake !== "settled_only" ||
+                  request.responseCapability.type !== "live"))
             ) {
               continue;
             }

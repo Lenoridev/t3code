@@ -1160,7 +1160,7 @@ it.effect.each(["stop", "dispose"] as const)(
 
 it.effect("defers a blocking delegation approval until the launching run ends", () =>
   Effect.gen(function* () {
-    const { projections, reactor, sink, parentThreadId, parentEnded, request } =
+    const { engine, projections, reactor, sink, parentThreadId, task, parentEnded, request } =
       yield* setupDelegatedApproval("settled_only");
     const approval = request("permission");
     yield* sink.write({ events: [approval] });
@@ -1170,6 +1170,13 @@ it.effect("defers a blocking delegation approval until the launching run ends", 
         (message) => message.notification !== undefined,
       ),
     );
+    yield* engine.dispatch({
+      type: "delegated_task.wake-policy",
+      commandId: CommandId.make("approval:wait-ended"),
+      parentThreadId,
+      taskId: task.id,
+      completionWake: "always",
+    });
     yield* sink.write({ events: [parentEnded] });
     yield* reactor.handle(parentEnded);
     yield* reactor.handle(parentEnded);
