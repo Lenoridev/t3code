@@ -272,8 +272,19 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       return result.value;
     }),
   ),
-  t3_project_create: McpToolAccess.writesEnvironment(({ workspaceRoot, ...input }) =>
+  t3_project_create: McpToolAccess.writesEnvironment((params) =>
     Effect.gen(function* () {
+      const { scope, target } = yield* remoteTarget(params);
+      if (target !== undefined) {
+        const forwarding = yield* PeerForwarding.PeerForwarding;
+        return yield* forwarding.call(
+          scope,
+          ProjectToolkit.tools.t3_project_create,
+          target,
+          params,
+        );
+      }
+      const { environmentId: _here, workspaceRoot, ...input } = params;
       const projects = yield* Project.ProjectService;
       if (workspaceRoot === undefined) {
         // Project creation records no model default (only an update does), so
@@ -332,8 +343,14 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         .pipe(Effect.mapError(projectFailure));
     }),
   ),
-  t3_project_clone: McpToolAccess.writesEnvironment((input) =>
+  t3_project_clone: McpToolAccess.writesEnvironment((params) =>
     Effect.gen(function* () {
+      const { scope, target } = yield* remoteTarget(params);
+      if (target !== undefined) {
+        const forwarding = yield* PeerForwarding.PeerForwarding;
+        return yield* forwarding.call(scope, ProjectToolkit.tools.t3_project_clone, target, params);
+      }
+      const { environmentId: _here, ...input } = params;
       const repositories = yield* Repositories.SourceControlRepositoryService;
       return yield* repositories.cloneRepository(input).pipe(
         Effect.mapError(
