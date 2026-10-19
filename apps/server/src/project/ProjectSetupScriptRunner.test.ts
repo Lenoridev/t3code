@@ -78,8 +78,8 @@ it.effect("resolves setup scripts through the standalone project service", () =>
           getById: () => Effect.succeed(Option.some(project)),
         }),
         Layer.mock(TerminalManager.TerminalManager)({ open, write, subscribe, closeIdle }),
-        // `thread-linked` was started from a linked environment; `thread-unread`
-        // cannot be read.
+        // `thread-linked` was started from a linked environment, `thread-trusted`
+        // from one linked with full access; `thread-unread` cannot be read.
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getThreadShell: (threadId) =>
             threadId === ThreadId.make("thread-unread")
@@ -88,9 +88,18 @@ it.effect("resolves setup scripts through the standalone project service", () =>
                   threadId === ThreadId.make("thread-linked")
                     ? {
                         ...liveThreadShell(threadId),
-                        linkOrigin: { sessionId: "s", label: "Laptop" },
+                        linkOrigin: { sessionId: "s", label: "Laptop", access: "auto" as const },
                       }
-                    : null,
+                    : threadId === ThreadId.make("thread-trusted")
+                      ? {
+                          ...liveThreadShell(threadId),
+                          linkOrigin: {
+                            sessionId: "t",
+                            label: "Desk",
+                            access: "full-access" as const,
+                          },
+                        }
+                      : null,
                 ),
         }),
         ServerSettings.layerTest(),
@@ -195,7 +204,7 @@ it.effect("resolves setup scripts through the standalone project service", () =>
       terminalId: observedTerminalId,
     });
 
-    // The project's own script never runs for work a linked environment started.
+    // The project's own script never runs for work a link below full access started.
     const opened = open.mock.calls.length;
     const linked = yield* runner.runForThread({
       threadId: "thread-linked",
@@ -209,5 +218,12 @@ it.effect("resolves setup scripts through the standalone project service", () =>
       .pipe(Effect.flip);
     assert.equal(unread._tag, "ProjectSetupScriptOperationError");
     assert.equal(open.mock.calls.length, opened);
+    // A full-access link's work runs as this environment's own.
+    const trusted = yield* runner.runForThread({
+      threadId: "thread-trusted",
+      projectId,
+      worktreePath: "/repo-worktree",
+    });
+    assert.equal(trusted.status, "started");
   }).pipe(Effect.provide(layer));
 });
