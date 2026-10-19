@@ -45,7 +45,10 @@ type Scope = McpInvocationContext.McpInvocationScope;
 export class PeerForwarding extends Context.Service<
   PeerForwarding,
   {
-    /** Runs `tool` in the linked environment `environmentId` with `params`. */
+    /**
+     * Runs `tool` in the linked environment `environmentId` with `params`. A
+     * `t3_thread_wait` goes in pieces short enough to survive any route.
+     */
     readonly call: <T extends Tool.Any>(
       scope: Scope,
       tool: T,
@@ -53,16 +56,6 @@ export class PeerForwarding extends Context.Service<
       params: Tool.Parameters<T>,
       options?: { readonly expectedLinkIdentity: string },
     ) => Effect.Effect<Tool.Success<T>, OrchestratorMcpFailure>;
-    /**
-     * Runs `here` unless `params.environmentId` names a linked environment, in
-     * which case `tool` runs there with the same parameters.
-     */
-    readonly route: <T extends Tool.Any, A, E, R>(
-      scope: Scope,
-      tool: T,
-      params: Tool.Parameters<T> & { readonly environmentId?: EnvironmentId | undefined },
-      here: Effect.Effect<A, E, R>,
-    ) => Effect.Effect<A | Tool.Success<T>, E | OrchestratorMcpFailure, R>;
     /** `t3_thread_read` there. */
     readonly readThread: (
       scope: Scope,
@@ -80,6 +73,7 @@ export class PeerForwarding extends Context.Service<
       scope: Scope,
       environmentId: EnvironmentId,
       input: OrchestratorMcpThreadWaitInput,
+      options?: { readonly expectedLinkIdentity: string },
     ) => Effect.Effect<OrchestratorMcpThreadWaitResult, OrchestratorMcpFailure>;
     /** The environments this one links to, as an agent sees them. */
     readonly links: (
@@ -160,22 +154,6 @@ const make = Effect.gen(function* () {
       });
     });
 
-  const call: PeerForwarding["Service"]["call"] = (scope, tool, environmentId, params, options) =>
-    forward(
-      scope,
-      tool.name,
-      tool.parametersSchema,
-      tool.successSchema,
-      environmentId,
-      params,
-      options,
-    );
-
-  const route: PeerForwarding["Service"]["route"] = (scope, tool, params, here) => {
-    const target = remoteTarget(scope, params.environmentId);
-    return target === undefined ? here : call(scope, tool, target, params);
-  };
-
   const readThread: PeerForwarding["Service"]["readThread"] = (scope, environmentId, input) =>
     forward<OrchestratorMcpThreadReadResult>(
       scope,
@@ -200,7 +178,12 @@ const make = Effect.gen(function* () {
       input,
     );
 
-  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (scope, environmentId, input) =>
+  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (
+    scope,
+    environmentId,
+    input,
+    options,
+  ) =>
     Effect.gen(function* () {
       let remaining = Math.min(
         MAX_WAIT_TIMEOUT_MS,
@@ -223,6 +206,7 @@ const make = Effect.gen(function* () {
               ? {}
               : { untilDelegatedWorkSettled: input.untilDelegatedWorkSettled }),
           },
+          options,
         );
         remaining -= chunk;
         if (!result.timedOut || remaining <= 0) return result;
@@ -230,6 +214,24 @@ const make = Effect.gen(function* () {
         runId = result.runId ?? undefined;
       }
     });
+
+  const call: PeerForwarding["Service"]["call"] = (scope, tool, environmentId, params, options) =>
+    tool.name === "t3_thread_wait"
+      ? (waitForThread(
+          scope,
+          environmentId,
+          params as OrchestratorMcpThreadWaitInput,
+          options,
+        ) as Effect.Effect<Tool.Success<typeof tool>, OrchestratorMcpFailure>)
+      : forward(
+          scope,
+          tool.name,
+          tool.parametersSchema,
+          tool.successSchema,
+          environmentId,
+          params,
+          options,
+        );
 
   const listLinks: PeerForwarding["Service"]["links"] = (scope) =>
     Effect.gen(function* () {
@@ -255,7 +257,6 @@ const make = Effect.gen(function* () {
 
   return PeerForwarding.of({
     call,
-    route,
     readThread,
     interruptThread,
     waitForThread,
