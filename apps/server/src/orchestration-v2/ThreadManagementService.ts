@@ -925,15 +925,16 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(loadError));
       return pending ? undefined : progress.resultRun;
     });
-    const evaluate = (runs: ReadonlyArray<OrchestrationV2Run>) =>
-      Effect.gen(function* () {
-        const current = yield* outcome(runs);
-        if (!current.settled || !untilDelegatedWorkSettled) {
-          return { ...current, resultRun: undefined };
-        }
-        const resultRun = yield* delegatedWorkResult;
-        return { ...current, settled: resultRun !== undefined, resultRun };
-      });
+    const evaluate = Effect.fn("orchestrationV2.threadManagement.evaluate")(function* (
+      runs: ReadonlyArray<OrchestrationV2Run>,
+    ) {
+      const current = yield* outcome(runs);
+      if (!current.settled || !untilDelegatedWorkSettled) {
+        return { ...current, resultRun: undefined };
+      }
+      const resultRun = yield* delegatedWorkResult;
+      return { ...current, settled: resultRun !== undefined, resultRun };
+    });
     const settledResult = (current: Effect.Success<ReturnType<typeof evaluate>>) => ({
       threadId: input.threadId,
       run: current.run,
