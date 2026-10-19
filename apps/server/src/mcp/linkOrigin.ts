@@ -11,9 +11,9 @@ import type { Caller } from "./threadAccess.ts";
  * Work a linked environment starts here stays within that link. An agent
  * reaches this environment through a link as one MCP client session, and
  * everything that session starts, and everything that work starts in turn,
- * carries the session in `linkOrigin`. Such a caller may change only work from
- * the same link: not the user's own threads, not projects or settings, and
- * not work from another link. Reads are not fenced.
+ * carries the session in `linkOrigin`. Such a caller may add projects, but
+ * change only work from the same link: not the user's own threads, existing
+ * projects or settings, nor work from another link. Reads are not fenced.
  *
  * This is a routing rule for T3's own tools. An agent the link starts still
  * runs as this environment's user.
@@ -45,7 +45,7 @@ export const assertSameLink = (
     : Effect.fail(outsideLink(origin, `it may change only threads that link started.`));
 };
 
-/** Linked work never changes the environment itself: projects, settings, scheduled runs. */
+/** Linked work never changes what the environment already has: projects, settings, scheduled runs. */
 export const assertNotLinked = (caller: Pick<Caller, "scope" | "caller">, what: string) => {
   const origin = callerLinkOrigin(caller);
   return origin === undefined
