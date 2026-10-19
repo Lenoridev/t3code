@@ -255,7 +255,9 @@ terminal, use `t3 environment link <address> --pairing-code <code> --access <mod
   agent also never gets more there than its own mode here.
 - Threads a link starts are marked **From** and this machine's name there.
   They can change only other threads the same link started, not that machine's
-  own threads, projects or settings, and they skip its project setup scripts.
+  own threads, existing projects or settings, and they skip its project setup
+  scripts. A full-access link can add projects there, such as a repository to
+  work in.
 - The link shows up in that machine's **Settings → Connections** like any
   outside agent. Revoke it there to end it. **Forget** on this machine only
   removes it here.

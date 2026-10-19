@@ -164,7 +164,7 @@ const make = Effect.gen(function* () {
         code: "invalid_request",
         message:
           matches.length === 0
-            ? `No project there has this repository (${key}). Pass target.projectId; t3_project_list with this environmentId lists them.`
+            ? `No project there has this repository (${key}). Pass target.projectId; t3_project_list with this environmentId lists them. To bring the repository there, use t3_project_clone and then t3_project_create with this environmentId.`
             : `Several projects there have this repository: ${matches.map((project) => `${project.title} (${project.id})`).join(", ")}. Pass target.projectId.`,
       });
     });

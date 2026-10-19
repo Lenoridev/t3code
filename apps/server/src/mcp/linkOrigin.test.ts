@@ -129,6 +129,17 @@ const layerTools = Layer.mergeAll(
   Layer.provide(
     Layer.mock(ProjectService.ProjectService)({
       getById: () => Effect.die("unused"),
+      create: (input) =>
+        Effect.succeed({
+          id: input.projectId,
+          title: input.title,
+          workspaceRoot: input.workspaceRoot,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-10-18T00:00:00.000Z",
+          updatedAt: "2026-10-18T00:00:00.000Z",
+          deletedAt: null,
+        }),
       update: () => Effect.die("A linked caller must never reach a project update."),
     }),
   ),
@@ -140,7 +151,16 @@ const layerTools = Layer.mergeAll(
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/p" }),
   ),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-  Layer.provide(Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({})),
+  Layer.provide(
+    Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
+      cloneRepository: (input) =>
+        Effect.succeed({
+          cwd: input.destinationPath,
+          remoteUrl: "https://github.com/pingdotgg/t3code.git",
+          repository: null,
+        }),
+    }),
+  ),
   Layer.provide(
     ServerConfig.layerTest(process.cwd(), { prefix: "t3-link-origin-" }).pipe(
       Layer.provide(NodeServices.layer),
@@ -292,54 +312,64 @@ it.layer(Layer.provideMerge(layerTools, layerOrchestration))("work a link starts
     }),
   );
 
-  it.effect("changes only that link's threads, and never the environment", () =>
-    Effect.gen(function* () {
-      const projections = yield* ProjectionStore.ProjectionStoreV2;
-      const users = yield* usersOwnThread;
-      const ownLaunch = yield* launch(laptop, "The laptop's");
-      const rename = (scope: McpInvocationContext.McpInvocationScope, threadId: ThreadId) =>
-        call(scope, "t3_thread_update", {
-          threadId,
-          action: "rename",
-          title: `Renamed by ${scope.client!.sessionId}`,
-        });
+  it.effect(
+    "changes only that link's threads, and adds to the environment without changing it",
+    () =>
+      Effect.gen(function* () {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const users = yield* usersOwnThread;
+        const ownLaunch = yield* launch(laptop, "The laptop's");
+        const rename = (scope: McpInvocationContext.McpInvocationScope, threadId: ThreadId) =>
+          call(scope, "t3_thread_update", {
+            threadId,
+            action: "rename",
+            title: `Renamed by ${scope.client!.sessionId}`,
+          });
 
-      // The link may change what it started.
-      assert.equal((yield* rename(laptop, ownLaunch)).isError, false);
-      assert.equal((yield* projections.getThreadShell(ownLaunch))?.title, "Renamed by laptop");
-      // Not the user's own thread, nor another link's.
-      assert.equal(failureCode(yield* rename(laptop, users)), "capability_denied");
-      assert.equal(failureCode(yield* rename(desk, ownLaunch)), "capability_denied");
-      assert.equal((yield* projections.getThreadShell(users))?.title, "The user's own");
-      // An ordinary outside agent is not fenced.
-      assert.equal((yield* rename(claudeCode, users)).isError, false);
-      // Naming this environment's own id is still this environment's thread.
-      for (const [name, args] of [
-        ["t3_thread_send", { message: "From the laptop." }],
-        ["t3_thread_interrupt", {}],
-      ] as const) {
-        const result = yield* call(laptop, name, {
-          ...args,
-          environmentId: laptop.environmentId,
-          threadId: users,
-        });
-        assert.equal(failureCode(result), "capability_denied", name);
-      }
+        // The link may change what it started.
+        assert.equal((yield* rename(laptop, ownLaunch)).isError, false);
+        assert.equal((yield* projections.getThreadShell(ownLaunch))?.title, "Renamed by laptop");
+        // Not the user's own thread, nor another link's.
+        assert.equal(failureCode(yield* rename(laptop, users)), "capability_denied");
+        assert.equal(failureCode(yield* rename(desk, ownLaunch)), "capability_denied");
+        assert.equal((yield* projections.getThreadShell(users))?.title, "The user's own");
+        // An ordinary outside agent is not fenced.
+        assert.equal((yield* rename(claudeCode, users)).isError, false);
+        // Naming this environment's own id is still this environment's thread.
+        for (const [name, args] of [
+          ["t3_thread_send", { message: "From the laptop." }],
+          ["t3_thread_interrupt", {}],
+        ] as const) {
+          const result = yield* call(laptop, name, {
+            ...args,
+            environmentId: laptop.environmentId,
+            threadId: users,
+          });
+          assert.equal(failureCode(result), "capability_denied", name);
+        }
 
-      // Nor the environment itself: projects and settings (one declaration
-      // covers both), and scheduled tasks.
-      assert.equal(
-        failureCode(yield* call(laptop, "t3_project_update", { projectId, title: "Mine now" })),
-        "capability_denied",
-      );
-      assert.equal(
-        failureCode(yield* call(laptop, "delete_scheduled_task", { scheduledTaskId: "any" })),
-        "capability_denied",
-      );
+        // Nor what the environment already has: its projects and settings (one
+        // declaration covers both), and scheduled tasks.
+        assert.equal(
+          failureCode(yield* call(laptop, "t3_project_update", { projectId, title: "Mine now" })),
+          "capability_denied",
+        );
+        // It may bring a repository of its own to work in.
+        for (const [name, args] of [
+          ["t3_project_clone", { repository: "pingdotgg/t3code", destinationPath: "/p/t3code" }],
+          ["t3_project_create", { title: "t3code", workspaceRoot: "/p/t3code" }],
+        ] as const) {
+          const added = yield* call(laptop, name, args);
+          assert.equal(added.isError, false, `${name}: ${JSON.stringify(added.content)}`);
+        }
+        assert.equal(
+          failureCode(yield* call(laptop, "delete_scheduled_task", { scheduledTaskId: "any" })),
+          "capability_denied",
+        );
 
-      // Reads are not fenced.
-      const read = yield* call(laptop, "t3_thread_read", { threadId: users });
-      assert.equal(read.isError, false);
-    }),
+        // Reads are not fenced.
+        const read = yield* call(laptop, "t3_thread_read", { threadId: users });
+        assert.equal(read.isError, false);
+      }),
   );
 });

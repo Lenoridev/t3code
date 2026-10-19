@@ -4,6 +4,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   EnvironmentId,
   type OrchestrationV2Run,
+  type SourceControlCloneRepositoryInput,
   ProjectId,
   ProviderInstanceId,
   RunId,
@@ -47,10 +48,19 @@ interface Seen {
   readonly sends: ReadonlyArray<ThreadManagement.ThreadManagementSendInput>;
   readonly waits: ReadonlyArray<ThreadManagement.ThreadManagementWaitInput>;
   readonly launches: ReadonlyArray<ThreadLaunch.ThreadLaunchInput>;
+  readonly projects: ReadonlyArray<ProjectService.ProjectCreateInput>;
+  readonly clones: ReadonlyArray<SourceControlCloneRepositoryInput>;
   /** Commands dispatched and delegated-task stops, as `<type> <threadId>`. */
   readonly stops: ReadonlyArray<string>;
 }
-const nothingSeen: Seen = { sends: [], waits: [], launches: [], stops: [] };
+const nothingSeen: Seen = {
+  sends: [],
+  waits: [],
+  launches: [],
+  projects: [],
+  clones: [],
+  stops: [],
+};
 
 /** The box user's own thread, which no link started. */
 const usersThread = ThreadId.make("thread:box-users-own");
@@ -140,6 +150,39 @@ const boxLaunches = (seen: Ref.Ref<Seen>) =>
       ),
   });
 
+/** B clones and registers whatever it is asked to, and records it. */
+const boxProjects = (seen: Ref.Ref<Seen>) =>
+  Layer.merge(
+    Layer.mock(ProjectService.ProjectService)({
+      create: (input) =>
+        Ref.update(seen, (current) => ({
+          ...current,
+          projects: [...current.projects, input],
+        })).pipe(
+          Effect.as({
+            id: input.projectId,
+            title: input.title,
+            workspaceRoot: input.workspaceRoot,
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: "2026-10-18T00:00:00.000Z",
+            updatedAt: "2026-10-18T00:00:00.000Z",
+            deletedAt: null,
+          }),
+        ),
+    }),
+    Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
+      cloneRepository: (input) =>
+        Ref.update(seen, (current) => ({ ...current, clones: [...current.clones, input] })).pipe(
+          Effect.as({
+            cwd: input.destinationPath,
+            remoteUrl: "https://github.com/pingdotgg/t3code.git",
+            repository: null,
+          }),
+        ),
+    }),
+  );
+
 /**
  * The orchestrator and project toolkits on B's real `/mcp`, behind its real
  * OAuth. `linkSession` is filled in once A links, so B's fixture thread reads
@@ -159,7 +202,7 @@ const serveBox = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) =>
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/projects" }),
       ),
       Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-      Layer.provide(Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({})),
+      Layer.provide(boxProjects(seen)),
       Layer.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-peer-forwarding-box-" }).pipe(
           Layer.provide(NodeServices.layer),
@@ -169,7 +212,6 @@ const serveBox = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) =>
       Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
       Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
       Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
-      Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
       Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
       Layer.provide(ServerSettings.layerTest()),
       Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -455,6 +497,56 @@ it.effect("launches in a linked environment with the caller's modes, retry-safe"
       expect(failureOf(withUpload)).toMatchObject({ code: "invalid_request" });
       expect(yield* Ref.get(b.bearers)).toEqual([]);
       expect((yield* Ref.get(seen)).launches).toHaveLength(2);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("brings a repository to a linked environment, only through full access", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const seen = yield* Ref.make<Seen>(nothingSeen);
+      const b = yield* serveBox(seen, yield* Ref.make(""));
+      const a = yield* makeLaptop;
+      const clone = { repository: "pingdotgg/t3code", destinationPath: "/home/box/t3code" };
+      const register = { title: "t3code", workspaceRoot: "/home/box/t3code" };
+
+      yield* linkTo(a.links, b, "full-access");
+      const cloned = yield* a.call("thread:laptop-full", "t3_project_clone", {
+        environmentId: box.environmentId,
+        ...clone,
+      });
+      expect(cloned.structuredContent).toMatchObject({ cwd: clone.destinationPath });
+      const created = yield* a.call("thread:laptop-full", "t3_project_create", {
+        environmentId: box.environmentId,
+        ...register,
+      });
+      expect(created.structuredContent).toMatchObject(register);
+      expect((yield* Ref.get(seen)).clones).toEqual([clone]);
+      expect((yield* Ref.get(seen)).projects).toMatchObject([register]);
+
+      // A plan-mode agent here may not, and nothing leaves.
+      yield* Ref.set(b.bearers, []);
+      const planned = yield* a.call("thread:laptop-plan", "t3_project_create", {
+        environmentId: box.environmentId,
+        ...register,
+      });
+      expect(failureOf(planned)).toMatchObject({ code: "capability_denied" });
+      expect(yield* Ref.get(b.bearers)).toEqual([]);
+
+      // Nor may a full-access agent through a link with less: the box holds it.
+      yield* linkTo(a.links, b, "auto");
+      for (const [name, args] of [
+        ["t3_project_clone", clone],
+        ["t3_project_create", register],
+      ] as const) {
+        const refused = yield* a.call("thread:laptop-full", name, {
+          environmentId: box.environmentId,
+          ...args,
+        });
+        expect(failureOf(refused), name).toMatchObject({ code: "capability_denied" });
+      }
+      expect((yield* Ref.get(seen)).clones).toHaveLength(1);
+      expect((yield* Ref.get(seen)).projects).toHaveLength(1);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

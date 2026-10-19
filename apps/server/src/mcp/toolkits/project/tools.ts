@@ -74,13 +74,18 @@ const ProjectReadTool = Tool.make("t3_project_read", {
 const ProjectCreateTool = Tool.make("t3_project_create", {
   ...shared,
   description:
-    "Register a project directory through the existing project service. Set createWorkspaceRootIfMissing to create a directory. Omit workspaceRoot to start a new project from just its title: the app makes a Git repository for it in its own projects folder, with a README, an icon, and a first commit (commitError says why a commit failed; the project exists either way). Each call creates a new request; an existing registered workspace is rejected. Clone separately with t3_project_clone when needed.",
+    "Register a project directory through the existing project service. Set createWorkspaceRootIfMissing to create a directory. Omit workspaceRoot to start a new project from just its title: the app makes a Git repository for it in its own projects folder, with a README, an icon, and a first commit (commitError says why a commit failed; the project exists either way). Each call creates a new request; an existing registered workspace is rejected. Clone separately with t3_project_clone when needed. Pass environmentId to create it in a linked environment; workspaceRoot and defaultModelSelection then name that environment's paths and providers.",
   parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
     ...ProjectCreatePayload.fields,
     workspaceRoot: Schema.optional(ProjectCreatePayload.fields.workspaceRoot),
   }),
   success: Schema.Struct({ ...Project.fields, commitError: Schema.optional(Schema.String) }),
-  dependencies: [...shared.dependencies, ManagedProjectFolders.ManagedProjectFolders],
+  dependencies: [
+    ...shared.dependencies,
+    ManagedProjectFolders.ManagedProjectFolders,
+    PeerForwarding.PeerForwarding,
+  ],
 }).annotate(Tool.Destructive, true);
 const ProjectUpdateTool = Tool.make("t3_project_update", {
   ...shared,
@@ -97,12 +102,16 @@ const ProjectDeleteTool = Tool.make("t3_project_delete", {
 const ProjectCloneTool = Tool.make("t3_project_clone", {
   ...shared,
   description:
-    "Clone a repository using the app's source-control service. This only clones; register the returned cwd with t3_project_create. An existing destination is not adopted or removed on failure.",
-  parameters: SourceControlCloneRepositoryInput,
+    "Clone a repository using the app's source-control service. This only clones; register the returned cwd with t3_project_create. An existing destination is not adopted or removed on failure. Pass environmentId to clone in a linked environment, then register it there with t3_project_create and the same environmentId.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    ...SourceControlCloneRepositoryInput.fields,
+  }),
   success: SourceControlCloneRepositoryResult,
   dependencies: [
     ...shared.dependencies,
     SourceControlRepositoryService.SourceControlRepositoryService,
+    PeerForwarding.PeerForwarding,
   ],
 })
   .annotate(Tool.Destructive, true)
