@@ -189,6 +189,7 @@ import {
   readEnvironmentScope,
   readPreparedConnection,
   useEnvironmentScope,
+  usePreparedConnection,
 } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -206,6 +207,7 @@ import {
   resolvePullRequestPreviewTarget,
   useOpenChangeRequestLink,
 } from "~/lib/openPullRequestLink";
+import { observeResize } from "~/lib/observeResize";
 import { useOpenLink } from "../browser/useOpenLink";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { isPreviewAvailableFor } from "../browser/previewRuntime";
@@ -234,6 +236,7 @@ interface ChatMarkdownProps {
   onUseArtifactTemplate?: ((template: CodexArtifactTemplate) => void) | undefined;
   onRunShellCommand?: ((command: string) => void) | undefined;
   imageBaseDir?: string | undefined;
+  workspaceMutationId?: string | null | undefined;
   onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
   extraRemarkPlugins?: NonNullable<ReactMarkdownOptions["remarkPlugins"]>;
   renderContextReference?: ((reference: ChatMarkdownContextReference) => ReactNode) | undefined;
@@ -535,14 +538,58 @@ function readInitialWordWrapSetting(): boolean {
   return getClientSettings().wordWrap;
 }
 
+/**
+ * Whether any cell is clipped in the unwrapped layout. Only then does the wrap
+ * toggle change anything, so short tables hide it. Measures with the container
+ * briefly unwrapped and restores it before the browser paints.
+ */
+function tableHasClippedCells(container: HTMLElement, table: HTMLTableElement): boolean {
+  const viewport = table.closest<HTMLElement>('[data-slot="scroll-area-viewport"]');
+  const scrollLeft = viewport?.scrollLeft ?? 0;
+  const previous = container.dataset.expanded;
+  container.dataset.expanded = "false";
+  try {
+    for (const row of table.rows) {
+      for (const cell of row.cells) {
+        if (cell.scrollWidth > cell.clientWidth) return true;
+      }
+    }
+    return false;
+  } finally {
+    if (previous === undefined) delete container.dataset.expanded;
+    else container.dataset.expanded = previous;
+    // The unwrapped layout can be narrower and clamp a sideways scroll.
+    if (viewport && scrollLeft > 0) viewport.scrollLeft = scrollLeft;
+  }
+}
+
 function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const tableRef = useRef<HTMLTableElement | null>(null);
   const [expanded, setExpanded] = useState(readInitialWordWrapSetting);
+  const [hasClippedCells, setHasClippedCells] = useState(false);
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expandLabel = expanded ? "Collapse table cells" : "Expand table cells";
   const copyLabel = copied ? "Copied" : "Copy table";
+
+  const measureClippedCells = () => {
+    const container = containerRef.current;
+    const table = tableRef.current;
+    if (!container || !table) return;
+    setHasClippedCells(tableHasClippedCells(container, table));
+  };
+
+  // A streamed cell can grow until it clips while the table keeps its size,
+  // so remeasure after every render, not only on resize.
+  useLayoutEffect(measureClippedCells);
+
+  // Column width changes can clip a cell without rendering this table.
+  useLayoutEffect(() => {
+    const table = tableRef.current;
+    if (!table) return;
+    return observeResize(table, measureClippedCells);
+  }, [measureClippedCells]);
 
   function toggleExpanded() {
     const table = tableRef.current;
@@ -616,23 +663,27 @@ function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
         </table>
       </ScrollArea>
       <div className="mt-0.5 flex items-center justify-between select-none">
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                type="button"
-                variant={expanded ? "secondary" : "ghost-muted"}
-                size="icon-xs"
-                aria-pressed={expanded}
-                onClick={toggleExpanded}
-                aria-label={expandLabel}
-              />
-            }
-          >
-            <MorphIcon className="size-3" icon={expanded ? Minimize2 : Maximize2} />
-          </TooltipTrigger>
-          <TooltipPopup side="top">{expandLabel}</TooltipPopup>
-        </Tooltip>
+        {hasClippedCells ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant={expanded ? "secondary" : "ghost-muted"}
+                  size="icon-xs"
+                  aria-pressed={expanded}
+                  onClick={toggleExpanded}
+                  aria-label={expandLabel}
+                />
+              }
+            >
+              <MorphIcon className="size-3" icon={expanded ? Minimize2 : Maximize2} />
+            </TooltipTrigger>
+            <TooltipPopup side="top">{expandLabel}</TooltipPopup>
+          </Tooltip>
+        ) : (
+          <span />
+        )}
         <Menu>
           <Tooltip>
             <TooltipTrigger
@@ -1525,11 +1576,47 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
   readonly framed?: boolean | undefined;
   readonly fallbackSrc?: string | undefined;
   readonly workspaceRoot?: string | undefined;
+  readonly workspaceMutationId?: string | null | undefined;
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }) {
   const assetUrl = useAssetUrlState(props.environmentId, props.resource);
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, props.resource);
+  const connectionReady = usePreparedConnection(props.environmentId)._tag === "Some";
   const resource = props.resource;
+  const refreshToken = JSON.stringify([props.environmentId, resource, props.workspaceMutationId]);
+  const handledRefreshToken = useRef<string | null | undefined>(undefined);
+  const assetLoading = assetUrl._tag === "Loading" || assetUrl.waiting === true;
+  useEffect(() => {
+    if (!connectionReady) {
+      handledRefreshToken.current = null;
+      return;
+    }
+    if (
+      props.workspaceMutationId === undefined ||
+      props.kind === "video" ||
+      (resource._tag !== "media-file" && resource._tag !== "workspace-file") ||
+      handledRefreshToken.current === refreshToken
+    ) {
+      return;
+    }
+    if (assetLoading) {
+      // Only the initial mount shares a pending request; edits and reconnects need a new one.
+      if (handledRefreshToken.current === undefined) {
+        handledRefreshToken.current = refreshToken;
+      }
+      return;
+    }
+    handledRefreshToken.current = refreshToken;
+    void refreshAssetUrl().catch(() => undefined);
+  }, [
+    assetLoading,
+    connectionReady,
+    props.kind,
+    props.workspaceMutationId,
+    refreshAssetUrl,
+    refreshToken,
+    resource._tag,
+  ]);
   const path =
     resource._tag === "media-file"
       ? resource.path
@@ -2250,6 +2337,7 @@ function useChatMarkdownState({
   onUseArtifactTemplate,
   onRunShellCommand,
   imageBaseDir,
+  workspaceMutationId,
   onImageExpand,
   renderContextReference,
   headingLevelOffset = 0,
@@ -2639,6 +2727,7 @@ function useChatMarkdownState({
     renderContextReference,
     headingLevelOffset,
     imageBaseDir,
+    workspaceMutationId,
     inlineCodeFileLinkMetaByText,
     isStreaming,
     linkTargetPreference,
@@ -3087,6 +3176,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
       githubMedia,
       imageBaseDir,
       threadRef,
+      workspaceMutationId,
       renderContextReference,
     } = use(ChatMarkdownRendererContext);
     const imageExpand = use(MarkdownLinkContext) ? undefined : expandMedia;
@@ -3198,6 +3288,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
           standalone={standalone}
           style={authoredSizeStyle}
           workspaceRoot={cwd}
+          workspaceMutationId={workspaceMutationId}
           onImageExpand={imageExpand}
         />
       );
