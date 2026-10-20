@@ -248,18 +248,17 @@ export const startsThreads = <P, A, E, R>(
   handle: (params: P, modes: StartedModes) => Effect.Effect<A, E, R>,
   linked: "stamped" | { readonly refused: string },
 ) => {
-  const started = (caller: Caller, params: P) =>
-    Effect.gen(function* () {
-      const requested = modes(params);
-      return {
-        runtimeMode: yield* resolveRuntimeMode(caller.limits.runtimeMode, requested.runtimeMode),
-        interactionMode: yield* resolveInteractionMode(
-          caller.limits.interactionMode,
-          requested.interactionMode,
-        ),
-        linkOrigin: callerLinkOrigin(caller),
-      } satisfies StartedModes;
-    });
+  const started = Effect.fn("McpToolAccess.started")(function* (caller: Caller, params: P) {
+    const requested = modes(params);
+    return {
+      runtimeMode: yield* resolveRuntimeMode(caller.limits.runtimeMode, requested.runtimeMode),
+      interactionMode: yield* resolveInteractionMode(
+        caller.limits.interactionMode,
+        requested.interactionMode,
+      ),
+      linkOrigin: callerLinkOrigin(caller),
+    } satisfies StartedModes;
+  });
   return declare(
     (params: P) =>
       Effect.gen(function* () {
@@ -303,7 +302,9 @@ export const writesEnvironment = <P, A, E, R>(
     (params: P) => check.pipe(Effect.flatMap(() => handle(params, check))),
     // Linked work never reaches a link at all; that is checked as the call goes.
     () =>
-      orchestratingCaller.pipe(Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired))),
+      orchestratingCaller.pipe(
+        Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
+      ),
   );
 };
 
@@ -366,38 +367,37 @@ const linksUnavailable = new OrchestratorMcpFailure({
  * environment, which checks the rest. The handler here never sees
  * `environmentId`, so it cannot leak into what it writes.
  */
-const routed = <Tools extends Record<string, Tool.Any>>(
+const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record<string, Tool.Any>>(
   toolkit: Toolkit.Toolkit<Tools>,
   declarations: Handlers<Tools>,
   checked: Toolkit.HandlersFrom<Tools>,
-) =>
-  Effect.gen(function* () {
-    // Optional so toolkits that never leave this environment build without it.
-    const forwarding = yield* Effect.serviceOption(PeerForwarding.PeerForwarding);
-    const handlers: Record<string, unknown> = { ...checked };
-    for (const [name, declaration] of Object.entries<Declaration<unknown>>(declarations)) {
-      const tool = toolkit.tools[name];
-      if (tool === undefined || !takesLinkedEnvironment(tool)) continue;
-      const remote = remoteCheckOf(declaration);
-      if (remote === undefined)
-        return yield* Effect.die(
-          `${name} takes a linked environment, but it acts as its calling thread, which is here.`,
-        );
-      const here = handlers[name] as (
-        params: object,
-      ) => Effect.Effect<unknown, Tool.Failure<Tools[keyof Tools]>>;
-      handlers[name] = ({ environmentId, ...params }: { readonly environmentId?: EnvironmentId }) =>
-        Effect.gen(function* () {
-          const scope = yield* McpInvocationContext.McpInvocationContext;
-          const target = PeerForwarding.remoteTarget(scope, environmentId);
-          if (target === undefined) return yield* here(params);
-          yield* (remote as RemoteCheck<typeof params>)(params);
-          if (Option.isNone(forwarding)) return yield* linksUnavailable;
-          return yield* forwarding.value.call(scope, tool, target, { ...params, environmentId });
-        });
-    }
-    return handlers as Toolkit.HandlersFrom<Tools>;
-  });
+) {
+  // Optional so toolkits that never leave this environment build without it.
+  const forwarding = yield* Effect.serviceOption(PeerForwarding.PeerForwarding);
+  const handlers: Record<string, unknown> = { ...checked };
+  for (const [name, declaration] of Object.entries<Declaration<unknown>>(declarations)) {
+    const tool = toolkit.tools[name];
+    if (tool === undefined || !takesLinkedEnvironment(tool)) continue;
+    const remote = remoteCheckOf(declaration);
+    if (remote === undefined)
+      return yield* Effect.die(
+        `${name} takes a linked environment, but it acts as its calling thread, which is here.`,
+      );
+    const here = handlers[name] as (
+      params: object,
+    ) => Effect.Effect<unknown, Tool.Failure<Tools[keyof Tools]>>;
+    handlers[name] = ({ environmentId, ...params }: { readonly environmentId?: EnvironmentId }) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const target = PeerForwarding.remoteTarget(scope, environmentId);
+        if (target === undefined) return yield* here(params);
+        yield* (remote as RemoteCheck<typeof params>)(params);
+        if (Option.isNone(forwarding)) return yield* linksUnavailable;
+        return yield* forwarding.value.call(scope, tool, target, { ...params, environmentId });
+      });
+  }
+  return handlers as Toolkit.HandlersFrom<Tools>;
+});
 
 export const toLayer = <Tools extends Record<string, Tool.Any>, EX = never, RX = never>(
   toolkit: Toolkit.Toolkit<Tools>,

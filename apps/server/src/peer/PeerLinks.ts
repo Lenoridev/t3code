@@ -180,21 +180,19 @@ const make = Effect.gen(function* () {
       Effect.option,
     );
 
-  const toLink = (row: PeerLinkRow) =>
-    Effect.gen(function* () {
-      return {
-        environmentId: EnvironmentId.make(row.environment_id),
-        launchIdentity: yield* launchIdentity(row.secret_name),
-        label: row.label,
-        urls: yield* decodeUrls(row.urls_json),
-        access: yield* decodeAccess(row.access),
-        linkedAt: DateTime.makeUnsafe(row.linked_at),
-        expiresAt: DateTime.makeUnsafe(row.expires_at),
-        lastReachedAt:
-          row.last_reached_at === null ? null : DateTime.makeUnsafe(row.last_reached_at),
-        lastError: row.last_error,
-      } satisfies StoredPeerLink;
-    }).pipe(Effect.catch(failStorage));
+  const toLink = Effect.fn("PeerLinks.toLink")(function* (row: PeerLinkRow) {
+    return {
+      environmentId: EnvironmentId.make(row.environment_id),
+      launchIdentity: yield* launchIdentity(row.secret_name),
+      label: row.label,
+      urls: yield* decodeUrls(row.urls_json),
+      access: yield* decodeAccess(row.access),
+      linkedAt: DateTime.makeUnsafe(row.linked_at),
+      expiresAt: DateTime.makeUnsafe(row.expires_at),
+      lastReachedAt: row.last_reached_at === null ? null : DateTime.makeUnsafe(row.last_reached_at),
+      lastError: row.last_error,
+    } satisfies StoredPeerLink;
+  }, Effect.catch(failStorage));
 
   const readRows = sql<PeerLinkRow>`
     SELECT * FROM peer_environment_links ORDER BY label, environment_id
@@ -209,8 +207,8 @@ const make = Effect.gen(function* () {
     );
 
   /** Signs in to the peer's `/mcp` with a pairing code: register, decide, exchange. */
-  const signIn = (origin: string, input: PeerLinkCreateInput, clientName: string) =>
-    Effect.gen(function* () {
+  const signIn = Effect.fn("PeerLinks.signIn")(
+    function* (origin: string, input: PeerLinkCreateInput, clientName: string) {
       const client = yield* clientFor(origin);
       // Only the peer's own refusals are rejections. A dropped connection or
       // an answer this version cannot read is classified below.
@@ -299,78 +297,77 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
-    }).pipe(
-      // Endpoint errors are mapped above; what is left is the transport or an
-      // answer this version cannot decode.
-      Effect.catchTags({
-        SchemaError: (cause) =>
-          Effect.fail(
-            new PeerLinkError({
-              reason: "incompatible",
-              message: `${origin} answered in a shape this version does not understand. Update both environments.`,
-              cause,
-            }),
-          ),
-        HttpClientError: (cause) =>
-          Effect.fail(
-            new PeerLinkError({
-              reason: "unreachable",
-              message: `${origin} stopped answering while linking.`,
-              cause,
-            }),
-          ),
-      }),
-    );
+    },
+    (effect, origin, input, clientName) =>
+      effect.pipe(
+        // Endpoint errors are mapped above; what is left is the transport or an
+        // answer this version cannot decode.
+        Effect.catchTags({
+          SchemaError: (cause) =>
+            Effect.fail(
+              new PeerLinkError({
+                reason: "incompatible",
+                message: `${origin} answered in a shape this version does not understand. Update both environments.`,
+                cause,
+              }),
+            ),
+          HttpClientError: (cause) =>
+            Effect.fail(
+              new PeerLinkError({
+                reason: "unreachable",
+                message: `${origin} stopped answering while linking.`,
+                cause,
+              }),
+            ),
+        }),
+      ),
+  );
 
-  const link: PeerLinks["Service"]["link"] = (input) =>
-    Effect.gen(function* () {
-      const origins = yield* Effect.forEach(
-        [input.url, ...(input.alternateUrls ?? [])],
-        peerOrigin,
-      );
-      const primary = origins[0]!;
-      const descriptor = yield* describe(primary);
-      if (Option.isNone(descriptor)) {
-        return yield* new PeerLinkError({
-          reason: "not_a_t3_environment",
-          message: `Nothing at ${primary} answered as a T3 Code environment.`,
-        });
-      }
-      const peer = descriptor.value;
-      const self = yield* environment.getDescriptor;
-      if (peer.environmentId === self.environmentId) {
-        return yield* new PeerLinkError({
-          reason: "self",
-          message: "That address is this environment.",
-        });
-      }
-      if (!linkLimitsHold(peer)) {
-        return yield* new PeerLinkError({
-          reason: "incompatible",
-          message: `${peer.label} runs a T3 Code version that cannot keep a linked agent's limits. Update it, then link again.`,
-        });
-      }
-      const issued = yield* signIn(primary, input, `T3 Code · ${self.label}`);
-      const now = yield* DateTime.now;
-      const linked: PeerLink = {
-        environmentId: peer.environmentId,
-        label: peer.label,
-        urls: origins,
-        access: input.access,
-        linkedAt: now,
-        expiresAt: DateTime.add(now, { seconds: issued.expires_in }),
-        lastReachedAt: now,
-        lastError: null,
-      };
-      // The token goes under a name of its own before the row points at it,
-      // so the row and its token are replaced together.
-      const secretName = yield* newSecretName;
-      yield* secrets
-        .set(secretName, new TextEncoder().encode(issued.access_token))
-        .pipe(Effect.catch(failStorage));
-      const urlsJson = yield* encodeUrls(origins).pipe(Effect.catch(failStorage));
-      const previous = yield* readRow(peer.environmentId);
-      yield* sql`
+  const link: PeerLinks["Service"]["link"] = Effect.fn("PeerLinks.link")(function* (input) {
+    const origins = yield* Effect.forEach([input.url, ...(input.alternateUrls ?? [])], peerOrigin);
+    const primary = origins[0]!;
+    const descriptor = yield* describe(primary);
+    if (Option.isNone(descriptor)) {
+      return yield* new PeerLinkError({
+        reason: "not_a_t3_environment",
+        message: `Nothing at ${primary} answered as a T3 Code environment.`,
+      });
+    }
+    const peer = descriptor.value;
+    const self = yield* environment.getDescriptor;
+    if (peer.environmentId === self.environmentId) {
+      return yield* new PeerLinkError({
+        reason: "self",
+        message: "That address is this environment.",
+      });
+    }
+    if (!linkLimitsHold(peer)) {
+      return yield* new PeerLinkError({
+        reason: "incompatible",
+        message: `${peer.label} runs a T3 Code version that cannot keep a linked agent's limits. Update it, then link again.`,
+      });
+    }
+    const issued = yield* signIn(primary, input, `T3 Code · ${self.label}`);
+    const now = yield* DateTime.now;
+    const linked: PeerLink = {
+      environmentId: peer.environmentId,
+      label: peer.label,
+      urls: origins,
+      access: input.access,
+      linkedAt: now,
+      expiresAt: DateTime.add(now, { seconds: issued.expires_in }),
+      lastReachedAt: now,
+      lastError: null,
+    };
+    // The token goes under a name of its own before the row points at it,
+    // so the row and its token are replaced together.
+    const secretName = yield* newSecretName;
+    yield* secrets
+      .set(secretName, new TextEncoder().encode(issued.access_token))
+      .pipe(Effect.catch(failStorage));
+    const urlsJson = yield* encodeUrls(origins).pipe(Effect.catch(failStorage));
+    const previous = yield* readRow(peer.environmentId);
+    yield* sql`
         INSERT INTO peer_environment_links (
           environment_id, secret_name, label, urls_json, access, linked_at, expires_at,
           last_reached_at, last_error, fenced
@@ -390,13 +387,13 @@ const make = Effect.gen(function* () {
           last_reached_at = excluded.last_reached_at,
           last_error = NULL
       `.pipe(Effect.catch(failStorage));
-      // Linking again replaces the old token. A racing link may leave its own
-      // behind; it is unused either way.
-      if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
-        yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
-      }
-      return linked;
-    });
+    // Linking again replaces the old token. A racing link may leave its own
+    // behind; it is unused either way.
+    if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
+      yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
+    }
+    return linked;
+  });
 
   const statusOf = (link: PeerLink, now: DateTime.Utc) =>
     DateTime.isLessThanOrEqualTo(link.expiresAt, now)
@@ -433,8 +430,8 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const unlink: PeerLinks["Service"]["unlink"] = (environmentId) =>
-    Effect.gen(function* () {
+  const unlink: PeerLinks["Service"]["unlink"] = Effect.fn("PeerLinks.unlink")(
+    function* (environmentId) {
       const deleted = yield* sql<{ secret_name: string }>`
         DELETE FROM peer_environment_links WHERE environment_id = ${environmentId}
         RETURNING secret_name
@@ -443,10 +440,11 @@ const make = Effect.gen(function* () {
         yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
       }
       return deleted.length > 0;
-    });
+    },
+  );
 
-  const resolve: PeerLinks["Service"]["resolve"] = (environmentId) =>
-    Effect.gen(function* () {
+  const resolve: PeerLinks["Service"]["resolve"] = Effect.fn("PeerLinks.resolve")(
+    function* (environmentId) {
       const row = yield* readRow(environmentId);
       if (Option.isNone(row)) {
         return yield* new PeerLinkError({
@@ -503,7 +501,8 @@ const make = Effect.gen(function* () {
         });
       }
       return { link, url: url.value, token: new TextDecoder().decode(stored.value) };
-    });
+    },
+  );
 
   const recordOutcome: PeerLinks["Service"]["recordOutcome"] = (environmentId, outcome) =>
     DateTime.now.pipe(

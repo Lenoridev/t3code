@@ -119,7 +119,7 @@ const make = Effect.gen(function* () {
     );
 
   /** Tool and contract schemas are plain data: they encode and decode without services. */
-  const forward = <A>(
+  const forward = Effect.fn("PeerForwarding.forward")(function* <A>(
     scope: Scope,
     toolName: string,
     parameters: Schema.Top,
@@ -127,32 +127,31 @@ const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
     params: unknown,
     options?: { readonly expectedLinkIdentity: string },
-  ) =>
-    Effect.gen(function* () {
-      const limits = yield* callerLimits(scope);
-      const encoded = (yield* Schema.encodeUnknownEffect(parameters as Schema.Encoder<unknown>)(
-        params,
-      ).pipe(Effect.mapError(unavailable))) as Record<string, unknown>;
-      const { environmentId: _target, ...args } = encoded;
-      // A pending upload lives here, so it cannot go with the call.
-      if (Array.isArray(args.attachments) && args.attachments.length > 0) {
-        return yield* new OrchestratorMcpFailure({
-          code: "invalid_request",
-          message: "A launch in a linked environment cannot carry attachments yet.",
-        });
-      }
-      if (typeof args.clientRequestId === "string") {
-        args.clientRequestId = yield* scopedRequestId(scope.requestNamespace, args.clientRequestId);
-      }
-      return yield* peers.call({
-        environmentId,
-        tool: toolName,
-        arguments: args,
-        limits,
-        success: success as Schema.Decoder<A>,
-        ...(options === undefined ? {} : options),
+  ) {
+    const limits = yield* callerLimits(scope);
+    const encoded = (yield* Schema.encodeUnknownEffect(parameters as Schema.Encoder<unknown>)(
+      params,
+    ).pipe(Effect.mapError(unavailable))) as Record<string, unknown>;
+    const { environmentId: _target, ...args } = encoded;
+    // A pending upload lives here, so it cannot go with the call.
+    if (Array.isArray(args.attachments) && args.attachments.length > 0) {
+      return yield* new OrchestratorMcpFailure({
+        code: "invalid_request",
+        message: "A launch in a linked environment cannot carry attachments yet.",
       });
+    }
+    if (typeof args.clientRequestId === "string") {
+      args.clientRequestId = yield* scopedRequestId(scope.requestNamespace, args.clientRequestId);
+    }
+    return yield* peers.call({
+      environmentId,
+      tool: toolName,
+      arguments: args,
+      limits,
+      success: success as Schema.Decoder<A>,
+      ...(options === undefined ? {} : options),
     });
+  });
 
   const readThread: PeerForwarding["Service"]["readThread"] = (scope, environmentId, input) =>
     forward<OrchestratorMcpThreadReadResult>(
@@ -178,42 +177,38 @@ const make = Effect.gen(function* () {
       input,
     );
 
-  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (
-    scope,
-    environmentId,
-    input,
-    options,
-  ) =>
-    Effect.gen(function* () {
-      let remaining = Math.min(
-        MAX_WAIT_TIMEOUT_MS,
-        Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+  const waitForThread: PeerForwarding["Service"]["waitForThread"] = Effect.fn(
+    "PeerForwarding.waitForThread",
+  )(function* (scope, environmentId, input, options) {
+    let remaining = Math.min(
+      MAX_WAIT_TIMEOUT_MS,
+      Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+    );
+    let runId = input.runId;
+    while (true) {
+      const chunk = Math.min(remaining, FORWARDED_WAIT_CHUNK_MS);
+      const result = yield* forward<OrchestratorMcpThreadWaitResult>(
+        scope,
+        "t3_thread_wait",
+        OrchestratorMcpThreadWaitInput,
+        OrchestratorMcpThreadWaitResult,
+        environmentId,
+        {
+          threadId: input.threadId,
+          ...(runId === undefined ? {} : { runId }),
+          timeoutMs: chunk,
+          ...(input.untilDelegatedWorkSettled === undefined
+            ? {}
+            : { untilDelegatedWorkSettled: input.untilDelegatedWorkSettled }),
+        },
+        options,
       );
-      let runId = input.runId;
-      while (true) {
-        const chunk = Math.min(remaining, FORWARDED_WAIT_CHUNK_MS);
-        const result = yield* forward<OrchestratorMcpThreadWaitResult>(
-          scope,
-          "t3_thread_wait",
-          OrchestratorMcpThreadWaitInput,
-          OrchestratorMcpThreadWaitResult,
-          environmentId,
-          {
-            threadId: input.threadId,
-            ...(runId === undefined ? {} : { runId }),
-            timeoutMs: chunk,
-            ...(input.untilDelegatedWorkSettled === undefined
-              ? {}
-              : { untilDelegatedWorkSettled: input.untilDelegatedWorkSettled }),
-          },
-          options,
-        );
-        remaining -= chunk;
-        if (!result.timedOut || remaining <= 0) return result;
-        // Later pieces wait for the run the first one picked, not a newer one.
-        runId = result.runId ?? undefined;
-      }
-    });
+      remaining -= chunk;
+      if (!result.timedOut || remaining <= 0) return result;
+      // Later pieces wait for the run the first one picked, not a newer one.
+      runId = result.runId ?? undefined;
+    }
+  });
 
   const call: PeerForwarding["Service"]["call"] = (scope, tool, environmentId, params, options) =>
     tool.name === "t3_thread_wait"
@@ -233,8 +228,8 @@ const make = Effect.gen(function* () {
           options,
         );
 
-  const listLinks: PeerForwarding["Service"]["links"] = (scope) =>
-    Effect.gen(function* () {
+  const listLinks: PeerForwarding["Service"]["links"] = Effect.fn("PeerForwarding.listLinks")(
+    function* (scope) {
       yield* callerLimits(scope);
       const listed = yield* links.list.pipe(
         Effect.mapError(
@@ -253,7 +248,8 @@ const make = Effect.gen(function* () {
           lastError: link.lastError,
         })),
       };
-    });
+    },
+  );
 
   return PeerForwarding.of({
     call,
