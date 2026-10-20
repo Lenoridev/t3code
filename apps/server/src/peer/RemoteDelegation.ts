@@ -395,8 +395,8 @@ const make = Effect.gen(function* () {
     });
 
   /** Replays the stored launch identity; a different follower namespace would launch another child. */
-  const launchPending = (parentThreadId: ThreadId, taskId: NodeId) =>
-    Effect.gen(function* () {
+  const launchPending = Effect.fn("RemoteDelegation.launchPending")(
+    function* (parentThreadId: ThreadId, taskId: NodeId) {
       let records = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
       let task = records.subagents.find((candidate) => candidate.id === taskId);
       if (task?.remoteChild === undefined || task.remoteChild.threadId !== undefined) return;
@@ -514,16 +514,16 @@ const make = Effect.gen(function* () {
         runId: launched.runId,
         modelSelection: launched.modelSelection,
       });
-    }).pipe(
-      Effect.mapError((error) =>
-        error._tag === "OrchestratorMcpFailure"
-          ? error
-          : new OrchestratorMcpFailure({
-              code: "orchestration_error",
-              message: "Unable to reconcile the remote task's launch.",
-            }),
-      ),
-    );
+    },
+    Effect.mapError((error) =>
+      error._tag === "OrchestratorMcpFailure"
+        ? error
+        : new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: "Unable to reconcile the remote task's launch.",
+          }),
+    ),
+  );
 
   /**
    * How this environment reaches a task's thread there: as the parent
