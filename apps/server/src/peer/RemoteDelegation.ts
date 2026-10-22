@@ -120,6 +120,15 @@ const make = Effect.gen(function* () {
   // Followers live as long as this service, so shutting down stops them.
   const followers = yield* Scope.Scope;
 
+  // One follower runs per open task and holds what it read across a wait of
+  // up to FOLLOW_WAIT_MS, so it reads its own task, never the parent's whole
+  // task list: a parent with thousands of tasks made every restart decode
+  // that list once per open task at the same time and ran out of heap.
+  const readTask = (parentThreadId: ThreadId, taskId: NodeId) =>
+    threads
+      .getThreadRecords(parentThreadId, ["subagents"], { subagentIds: [taskId] })
+      .pipe(Effect.map(({ thread, subagents }) => ({ thread, task: subagents[0] })));
+
   /** The peer's project with this thread's repository, or the one the caller named. */
   const resolveRemoteProject = Effect.fn("RemoteDelegation.resolveRemoteProject")(function* (
     scope: ThreadScope,
@@ -367,15 +376,9 @@ const make = Effect.gen(function* () {
       })
       .pipe(
         Effect.catch((error) =>
-          threads
-            .getThreadRecords(parentThreadId, ["subagents"])
-            .pipe(
-              Effect.flatMap(({ subagents }) =>
-                subagents.find((task) => task.id === taskId)?.result != null
-                  ? Effect.void
-                  : Effect.fail(error),
-              ),
-            ),
+          readTask(parentThreadId, taskId).pipe(
+            Effect.flatMap(({ task }) => (task?.result != null ? Effect.void : Effect.fail(error))),
+          ),
         ),
       );
   });
@@ -485,9 +488,8 @@ const make = Effect.gen(function* () {
     function* (parentThreadId: ThreadId, taskId: NodeId, error: OrchestratorMcpFailure) {
       if (isFinal(error)) return error.message;
       if (error.code !== "invalid_request") return undefined;
-      const { subagents } = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-      const environmentId = subagents.find((task) => task.id === taskId)?.remoteChild
-        ?.environmentId;
+      const { task } = yield* readTask(parentThreadId, taskId);
+      const environmentId = task?.remoteChild?.environmentId;
       if (environmentId === undefined) return error.message;
       const link = yield* links.get(environmentId);
       return Option.isSome(link) ? undefined : error.message;
@@ -515,8 +517,8 @@ const make = Effect.gen(function* () {
             const reason = yield* finalReason(parentThreadId, taskId, error);
             if (reason === undefined) return yield* error;
             // Gone there, or no link to reach it by: nothing left to stop there.
-            const { subagents } = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-            const stopCount = subagents.find((task) => task.id === taskId)?.remoteChild?.stopCount;
+            const { task } = yield* readTask(parentThreadId, taskId);
+            const stopCount = task?.remoteChild?.stopCount;
             yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
           }),
       }),
@@ -534,12 +536,11 @@ const make = Effect.gen(function* () {
     taskId: NodeId,
   ) {
     const sequence = yield* threads.getThreadEventSequence(parentThreadId);
-    const records = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-    const task = records.subagents.find((candidate) => candidate.id === taskId);
+    const { thread, task } = yield* readTask(parentThreadId, taskId);
     if (task?.remoteChild === undefined) return true;
     const remote = task.remoteChild;
     const scope = followScope(
-      { threadId: parentThreadId, providerInstanceId: records.thread.providerInstanceId },
+      { threadId: parentThreadId, providerInstanceId: thread.providerInstanceId },
       remote,
     );
     // Ended here, maybe while this follower backed off from an unreachable
@@ -642,14 +643,9 @@ const make = Effect.gen(function* () {
    * the next look sends it.
    */
   const settled = (parentThreadId: ThreadId, taskId: NodeId) =>
-    threads
-      .getThreadRecords(parentThreadId, ["subagents"])
-      .pipe(
-        Effect.map(
-          ({ subagents }) =>
-            subagents.find((task) => task.id === taskId)?.remoteChild?.stoppedThere === true,
-        ),
-      );
+    readTask(parentThreadId, taskId).pipe(
+      Effect.map(({ task }) => task?.remoteChild?.stoppedThere === true),
+    );
 
   const following = new Map<NodeId, { again: boolean }>();
 
