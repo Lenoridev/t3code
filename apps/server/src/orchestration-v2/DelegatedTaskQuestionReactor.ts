@@ -1,6 +1,7 @@
 import {
   CommandId,
   MessageId,
+  ProviderRequestKind,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
@@ -8,6 +9,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
@@ -25,6 +27,18 @@ export class DelegatedTaskQuestionReactor extends Context.Service<
   }
 >()("t3/orchestration-v2/DelegatedTaskQuestionReactor") {}
 
+const isApprovalRequestKind = Schema.is(ProviderRequestKind);
+
+// Questions can be answered by the parent; approvals need a live callback and only a human can decide them.
+const routesToParent = (
+  request: Pick<OrchestrationV2RuntimeRequest, "kind" | "responseCapability">,
+) =>
+  request.kind === "user_input" ||
+  (isApprovalRequestKind(request.kind) && request.responseCapability.type === "live");
+
+const isTerminalTask = (task: OrchestrationV2Subagent) =>
+  ["completed", "failed", "cancelled", "interrupted"].includes(task.status);
+
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -36,8 +50,10 @@ const make = Effect.gen(function* () {
     if (task.childThreadId === null) return;
     const key = `${task.threadId}:${request.id}`;
     const label = reportLabel(task.title?.trim() || task.prompt);
-    const situation =
-      request.responseCapability.type === "message"
+    const question = request.kind === "user_input";
+    const situation = !question
+      ? `Delegated task ${task.id} needs the user's approval.`
+      : request.responseCapability.type === "message"
         ? `Delegated task ${task.id} asked a question and is still working.`
         : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`;
     yield* engine.dispatch({
@@ -45,11 +61,13 @@ const make = Effect.gen(function* () {
       commandId: CommandId.make(`server:delegated-task-question:${key}`),
       threadId: task.threadId,
       messageId: MessageId.make(`message:delegated-task-question:${key}`),
-      text: `${situation} Read it with t3_pending_request_read using threadId ${task.childThreadId} and requestId ${request.id}. Answer it with t3_pending_request_respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.`,
+      text: !question
+        ? `${situation} Ask the user to open [the child thread](t3-thread://v1/${task.childThreadId}) and handle request ${request.id} there. Only the user can approve; do not answer this request with t3_pending_request_respond. If it is no longer pending, no action is needed.`
+        : `${situation} Read it with t3_pending_request_read using threadId ${task.childThreadId} and requestId ${request.id}. Answer it with t3_pending_request_respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.`,
       notification: {
         source: { kind: "delegated_task", taskIds: [task.id], childThreadId: task.childThreadId },
         outcome: "updated",
-        summary: `Delegated task${label === undefined ? "" : ` "${label}"`} has a question`,
+        summary: `Delegated task${label === undefined ? "" : ` "${label}"`} ${question ? "has a question" : "needs approval"}`,
       },
       attachments: [],
       dispatchMode: { type: "queue_after_active" },
@@ -72,7 +90,7 @@ const make = Effect.gen(function* () {
             task.completionWake !== "settled_only" ||
             task.completionDelivery?.state === "disposed" ||
             task.childThreadId === null ||
-            ["completed", "failed", "cancelled", "interrupted"].includes(task.status)
+            isTerminalTask(task)
           ) {
             continue;
           }
@@ -81,7 +99,7 @@ const make = Effect.gen(function* () {
           ]);
           for (const request of child.runtimeRequests) {
             if (
-              request.kind !== "user_input" ||
+              !routesToParent(request) ||
               request.status !== "pending" ||
               request.responseCapability.type !== "live"
             ) {
@@ -100,7 +118,7 @@ const make = Effect.gen(function* () {
         }
         return;
       }
-      if (event.type !== "runtime-request.updated" || event.payload.kind !== "user_input") {
+      if (event.type !== "runtime-request.updated" || !routesToParent(event.payload)) {
         return;
       }
       const child = yield* projections.getThread(event.threadId);
@@ -137,12 +155,15 @@ const make = Effect.gen(function* () {
       );
       if (
         task === undefined ||
+        task.childThreadId !== child.id ||
+        task.completionDelivery?.state === "disposed" ||
+        isTerminalTask(task) ||
         parent.thread.archivedAt !== null ||
         parent.thread.deletedAt !== null
       ) {
         return;
       }
-      // A blocking delegate_task wait delivers the question itself.
+      // A blocking delegate_task wait delivers live questions and approvals itself.
       if (
         task.completionWake === "settled_only" &&
         event.payload.responseCapability.type === "live" &&
