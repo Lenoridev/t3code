@@ -19,13 +19,13 @@ import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
-export class DelegatedTaskQuestionReactor extends Context.Service<
-  DelegatedTaskQuestionReactor,
+export class DelegatedTaskRequestReactor extends Context.Service<
+  DelegatedTaskRequestReactor,
   {
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly handle: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
   }
->()("t3/orchestration-v2/DelegatedTaskQuestionReactor") {}
+>()("t3/orchestration-v2/DelegatedTaskRequestReactor") {}
 
 const isApprovalRequestKind = Schema.is(ProviderRequestKind);
 
@@ -51,11 +51,11 @@ const make = Effect.gen(function* () {
     const key = `${task.threadId}:${request.id}`;
     const label = reportLabel(task.title?.trim() || task.prompt);
     const question = request.kind === "user_input";
-    const situation = !question
-      ? `Delegated task ${task.id} needs the user's approval.`
-      : request.responseCapability.type === "message"
+    const situation = question
+      ? request.responseCapability.type === "message"
         ? `Delegated task ${task.id} asked a question and is still working.`
-        : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`;
+        : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`
+      : `Delegated task ${task.id} needs the user's approval.`;
     yield* engine.dispatch({
       type: "message.dispatch",
       commandId: CommandId.make(`server:delegated-task-question:${key}`),
@@ -77,7 +77,7 @@ const make = Effect.gen(function* () {
   });
 
   // Runs for every domain event; most events return before any work is needed.
-  const handle: DelegatedTaskQuestionReactor["Service"]["handle"] = Effect.fnUntraced(
+  const handle: DelegatedTaskRequestReactor["Service"]["handle"] = Effect.fnUntraced(
     function* (event) {
       if (event.type === "run.updated") {
         if (!["completed", "failed", "waiting"].includes(event.payload.status)) return;
@@ -87,7 +87,6 @@ const make = Effect.gen(function* () {
           if (
             task.origin !== "app_owned" ||
             task.runId !== event.payload.id ||
-            task.completionWake !== "settled_only" ||
             task.completionDelivery?.state === "disposed" ||
             task.childThreadId === null ||
             isTerminalTask(task)
@@ -101,13 +100,15 @@ const make = Effect.gen(function* () {
             if (
               !routesToParent(request) ||
               request.status !== "pending" ||
-              request.responseCapability.type !== "live"
+              (request.kind === "user_input" &&
+                (task.completionWake !== "settled_only" ||
+                  request.responseCapability.type !== "live"))
             ) {
               continue;
             }
             yield* wakeParent(task, request).pipe(
               Effect.catchCause((cause) =>
-                Effect.logWarning("catching up a delegated task question failed", {
+                Effect.logWarning("catching up a delegated task request failed", {
                   taskId: task.id,
                   requestId: request.id,
                   cause,
@@ -166,7 +167,7 @@ const make = Effect.gen(function* () {
       // A blocking delegate_task wait delivers live questions and approvals itself.
       if (
         task.completionWake === "settled_only" &&
-        event.payload.responseCapability.type === "live" &&
+        (request.kind !== "user_input" || request.responseCapability.type === "live") &&
         parent.runs.some(
           (run) =>
             run.id === task.runId &&
@@ -180,7 +181,7 @@ const make = Effect.gen(function* () {
     (effect, event) =>
       effect.pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("waking the parent of a delegated task question failed", {
+          Effect.logWarning("waking the parent of a delegated task request failed", {
             threadId: event.threadId,
             cause,
           }),
@@ -188,16 +189,16 @@ const make = Effect.gen(function* () {
       ),
   );
 
-  const start: DelegatedTaskQuestionReactor["Service"]["start"] = () =>
+  const start: DelegatedTaskRequestReactor["Service"]["start"] = () =>
     forkParked(
       Stream.runForEach(engine.streamDomainEvents, handle).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("delegated task question event stream failed", { cause }),
+          Effect.logWarning("delegated task request event stream failed", { cause }),
         ),
       ),
     );
 
-  return { start, handle } satisfies DelegatedTaskQuestionReactor["Service"];
+  return { start, handle } satisfies DelegatedTaskRequestReactor["Service"];
 });
 
-export const layer = Layer.effect(DelegatedTaskQuestionReactor, make);
+export const layer = Layer.effect(DelegatedTaskRequestReactor, make);
