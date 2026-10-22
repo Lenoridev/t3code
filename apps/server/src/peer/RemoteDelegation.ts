@@ -45,10 +45,17 @@ import * as PeerLinks from "./PeerLinks.ts";
 const FOLLOW_WAIT_MS = 10 * 60 * 1_000;
 /** A linked environment that stops answering is retried, backing off to this. */
 const FOLLOW_MAX_BACKOFF = Duration.minutes(5);
-const backoff = Schedule.exponential(Duration.seconds(2)).pipe(
-  Schedule.modifyDelay(({ duration }) =>
-    Effect.succeed(Duration.min(duration, FOLLOW_MAX_BACKOFF)),
-  ),
+/** How a follower retries; tests step it by hand. */
+export const FollowRetrySchedule = Context.Reference<Schedule.Schedule<unknown>>(
+  "t3/peer/RemoteDelegation/FollowRetrySchedule",
+  {
+    defaultValue: () =>
+      Schedule.exponential(Duration.seconds(2)).pipe(
+        Schedule.modifyDelay(({ duration }) =>
+          Effect.succeed(Duration.min(duration, FOLLOW_MAX_BACKOFF)),
+        ),
+      ),
+  },
 );
 
 type ThreadScope = McpInvocationContext.McpThreadInvocationScope;
@@ -91,22 +98,23 @@ export class RemoteDelegation extends Context.Service<
   }
 >()("t3/peer/RemoteDelegation") {}
 
-/**
- * Refusals that following again cannot change: the link was revoked, expired
- * or forgotten, or the thread or run there is gone. Anything else (the other
- * machine asleep, a dropped route) is worth retrying.
- */
 /** The other side refused because the thread there runs above this caller's modes. */
 const isModeRefusal = (error: OrchestratorMcpFailure) =>
   error.code === "runtime_mode_escalation_denied" ||
   error.code === "interaction_mode_escalation_denied";
 
+/**
+ * Refusals that following again cannot change: the link was revoked, expired
+ * or forgotten, or the thread or run there is gone. Anything else (the other
+ * machine asleep, a dropped route) is worth retrying.
+ */
 const isFinal = (error: OrchestratorMcpFailure) =>
   error.code === "capability_denied" ||
   error.code === "thread_not_found" ||
   error.code === "run_not_found";
 
 const make = Effect.gen(function* () {
+  const followRetry = yield* FollowRetrySchedule;
   const forwarding = yield* PeerForwarding.PeerForwarding;
   const links = yield* PeerLinks.PeerLinks;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -119,6 +127,15 @@ const make = Effect.gen(function* () {
   );
   // Followers live as long as this service, so shutting down stops them.
   const followers = yield* Scope.Scope;
+
+  // One follower runs per open task and holds what it read across a wait of
+  // up to FOLLOW_WAIT_MS, so it reads its own task, never the parent's whole
+  // task list: a parent with thousands of tasks made every restart decode
+  // that list once per open task at the same time and ran out of heap.
+  const readTask = (parentThreadId: ThreadId, taskId: NodeId) =>
+    threads
+      .getThreadRecords(parentThreadId, ["subagents"], { subagentIds: [taskId] })
+      .pipe(Effect.map(({ thread, subagents }) => ({ thread, task: subagents[0] })));
 
   /** The peer's project with this thread's repository, or the one the caller named. */
   const resolveRemoteProject = Effect.fn("RemoteDelegation.resolveRemoteProject")(function* (
@@ -339,11 +356,10 @@ const make = Effect.gen(function* () {
   );
 
   /**
-   * Completes `task` here with its thread there's final state. Each attempt
-   * is its own command, so one that failed never blocks the next. A report
-   * refused because the task already has its result (from a cancel, a Stop
-   * or an earlier report) is done. `stoppedThere` records that nothing is
-   * left to stop there, also on a task that already has its result.
+   * Completes `task` here with its thread there's final state. Each attempt is its own
+   * command, so a failed one never blocks the next; a report refused because the task already
+   * has its result (a cancel, a Stop or an earlier report) is done. `stoppedThere` records that
+   * nothing is left to stop there, even on a task that already has its result.
    */
   const complete = Effect.fn("RemoteDelegation.complete")(function* (
     parentThreadId: ThreadId,
@@ -367,15 +383,9 @@ const make = Effect.gen(function* () {
       })
       .pipe(
         Effect.catch((error) =>
-          threads
-            .getThreadRecords(parentThreadId, ["subagents"])
-            .pipe(
-              Effect.flatMap(({ subagents }) =>
-                subagents.find((task) => task.id === taskId)?.result != null
-                  ? Effect.void
-                  : Effect.fail(error),
-              ),
-            ),
+          readTask(parentThreadId, taskId).pipe(
+            Effect.flatMap(({ task }) => (task?.result != null ? Effect.void : Effect.fail(error))),
+          ),
         ),
       );
   });
@@ -402,11 +412,9 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Stops the task's thread there as its Stop button does: its running turn,
-   * its queued messages, its pull request watches and the tasks it delegated.
-   * The thread there is the task's own, so whatever runs on it is stopped.
-   * `key` names the stop: the follower sends one, each cancel its own, and
-   * each is recorded there once however often it is sent.
+   * Stops the task's own thread there as its Stop button does: its running turn, queued
+   * messages, pull request watches and delegated tasks. `key` names the stop (the follower
+   * sends one, each cancel its own), and each is recorded there once however often it is sent.
    */
   const stopThere = (
     scope: ThreadScope,
@@ -485,9 +493,8 @@ const make = Effect.gen(function* () {
     function* (parentThreadId: ThreadId, taskId: NodeId, error: OrchestratorMcpFailure) {
       if (isFinal(error)) return error.message;
       if (error.code !== "invalid_request") return undefined;
-      const { subagents } = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-      const environmentId = subagents.find((task) => task.id === taskId)?.remoteChild
-        ?.environmentId;
+      const { task } = yield* readTask(parentThreadId, taskId);
+      const environmentId = task?.remoteChild?.environmentId;
       if (environmentId === undefined) return error.message;
       const link = yield* links.get(environmentId);
       return Option.isSome(link) ? undefined : error.message;
@@ -499,28 +506,26 @@ const make = Effect.gen(function* () {
   const noReply = "(The thread in the linked environment ended without a reply.)";
 
   /**
-   * Waits on the task's thread there until its run ends, then completes the
-   * task here, and stops it there if it ended here first. A revoked, expired
-   * or forgotten link, or a thread or run gone there, fails the task and
-   * leaves nothing to stop; anything else (the other machine asleep, a
-   * dropped route) is retried, backing off. Completing is retried the same way.
+   * Waits for the task's run there to end, completes the task here, and stops it there if it
+   * ended here first. A revoked, expired or forgotten link, or a thread or run gone there,
+   * fails the task with nothing left to stop; anything else (the other machine asleep, a
+   * dropped route) is retried with back-off, and so is completing.
    */
   const follow = (parentThreadId: ThreadId, taskId: NodeId): Effect.Effect<void> =>
     followOnce(parentThreadId, taskId).pipe(
       // `false` means it is still running there: follow again straight away.
       Effect.repeat({ while: (done) => !done }),
       Effect.catchTags({
-        OrchestratorMcpFailure: (error) =>
-          Effect.gen(function* () {
-            const reason = yield* finalReason(parentThreadId, taskId, error);
-            if (reason === undefined) return yield* error;
-            // Gone there, or no link to reach it by: nothing left to stop there.
-            const { subagents } = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-            const stopCount = subagents.find((task) => task.id === taskId)?.remoteChild?.stopCount;
-            yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
-          }),
+        OrchestratorMcpFailure: Effect.fn("RemoteDelegation.followFailed")(function* (error) {
+          const reason = yield* finalReason(parentThreadId, taskId, error);
+          if (reason === undefined) return yield* error;
+          // Gone there, or no link to reach it by: nothing left to stop there.
+          const { task } = yield* readTask(parentThreadId, taskId);
+          const stopCount = task?.remoteChild?.stopCount;
+          yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
+        }),
       }),
-      Effect.retry(backoff),
+      Effect.retry(followRetry),
       Effect.ignoreCause({ log: true }),
     );
 
@@ -534,12 +539,11 @@ const make = Effect.gen(function* () {
     taskId: NodeId,
   ) {
     const sequence = yield* threads.getThreadEventSequence(parentThreadId);
-    const records = yield* threads.getThreadRecords(parentThreadId, ["subagents"]);
-    const task = records.subagents.find((candidate) => candidate.id === taskId);
+    const { thread, task } = yield* readTask(parentThreadId, taskId);
     if (task?.remoteChild === undefined) return true;
     const remote = task.remoteChild;
     const scope = followScope(
-      { threadId: parentThreadId, providerInstanceId: records.thread.providerInstanceId },
+      { threadId: parentThreadId, providerInstanceId: thread.providerInstanceId },
       remote,
     );
     // Ended here, maybe while this follower backed off from an unreachable
@@ -642,14 +646,9 @@ const make = Effect.gen(function* () {
    * the next look sends it.
    */
   const settled = (parentThreadId: ThreadId, taskId: NodeId) =>
-    threads
-      .getThreadRecords(parentThreadId, ["subagents"])
-      .pipe(
-        Effect.map(
-          ({ subagents }) =>
-            subagents.find((task) => task.id === taskId)?.remoteChild?.stoppedThere === true,
-        ),
-      );
+    readTask(parentThreadId, taskId).pipe(
+      Effect.map(({ task }) => task?.remoteChild?.stoppedThere === true),
+    );
 
   const following = new Map<NodeId, { again: boolean }>();
 
