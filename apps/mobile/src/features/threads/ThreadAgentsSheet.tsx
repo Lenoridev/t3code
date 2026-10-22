@@ -60,8 +60,8 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
     if (
       openInspector(target, {
         type: "thread",
-        environmentId: target.environmentId,
-        threadId: childThreadId,
+        environmentId: child.environmentId,
+        threadId: child.threadId,
       })
     )
       return;
