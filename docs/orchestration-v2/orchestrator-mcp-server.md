@@ -484,11 +484,12 @@ async question, still working. If the question is answered or dismissed before
 the notification starts a turn, that queued turn is cancelled. Approval requests
 also notify the parent, but tell it to ask the user to open the child thread and
 handle the request there. The pending request tools cannot approve for the user.
-A parent still blocked in a `delegate_task` wait gets the blocking question
-through that wait instead. Approvals do not yet end that wait;
-their notices arrive when the parent's launching run ends.
-If the provider cuts that wait short, a still-pending live question also wakes the
-parent when its launching run completes, fails, or waits for post-turn work.
+A parent still blocked in a `delegate_task` wait gets the blocking question or
+live approval through that wait instead, as `hasPendingQuestion` or
+`pendingApproval`.
+If the provider cuts that wait short, a still-pending live question or approval
+wakes the parent when its launching run completes, fails, or waits for post-turn
+work.
 Stopping or interrupting the parent, or cancelling a queued completion delivery,
 disposes the affected delegated cohort. Disposing an individual task suppresses
 that task's notices. These paths cancel queued question and approval notices and

@@ -29,6 +29,9 @@ export class DelegatedTaskRequestReactor extends Context.Service<
 
 const isApprovalRequestKind = Schema.is(ProviderRequestKind);
 
+const isRoutedRequestKind = (kind: OrchestrationV2RuntimeRequest["kind"]) =>
+  kind === "user_input" || isApprovalRequestKind(kind);
+
 // Questions can be answered by the parent; approvals need a live callback and only a human can decide them.
 const routesToParent = (
   request: Pick<OrchestrationV2RuntimeRequest, "kind" | "responseCapability">,
@@ -97,12 +100,12 @@ const make = Effect.gen(function* () {
             "runtimeRequests",
           ]);
           for (const request of child.runtimeRequests) {
+            // An incomplete wait upgrades the task to "always" after returning the request itself.
             if (
               !routesToParent(request) ||
               request.status !== "pending" ||
-              (request.kind === "user_input" &&
-                (task.completionWake !== "settled_only" ||
-                  request.responseCapability.type !== "live"))
+              task.completionWake !== "settled_only" ||
+              request.responseCapability.type !== "live"
             ) {
               continue;
             }
@@ -119,7 +122,8 @@ const make = Effect.gen(function* () {
         }
         return;
       }
-      if (event.type !== "runtime-request.updated" || !routesToParent(event.payload)) {
+      // Withdrawal must not depend on capability: interruption ends a live approval as not_resumable.
+      if (event.type !== "runtime-request.updated" || !isRoutedRequestKind(event.payload.kind)) {
         return;
       }
       const child = yield* projections.getThread(event.threadId);
@@ -143,6 +147,7 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      if (!routesToParent(request)) return;
       const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"]);
       const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
       const run =

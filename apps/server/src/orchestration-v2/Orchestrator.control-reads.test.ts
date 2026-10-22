@@ -819,9 +819,10 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
     const question = requestEvent("event:question", "request:question", "live");
     const asyncQuestion = requestEvent("event:async-question", "request:async-question");
     const answered = requestEvent("event:answered", "request:answered", "live");
+    const approval = requestEvent("event:approval", "request:approval", "message", "command");
     const eventSink = yield* EventSink.EventSinkV2;
     yield* eventSink.write({
-      events: [question, asyncQuestion, answered],
+      events: [question, asyncQuestion, answered, approval],
     });
 
     yield* reactor.handle(question);
@@ -849,6 +850,7 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
       ],
     });
     yield* reactor.handle(answered);
+    yield* reactor.handle(approval);
 
     const wakes = (yield* projections.getThreadProjection(parentThreadId)).messages.filter(
       (message) => message.notification !== undefined,
@@ -1276,43 +1278,82 @@ it.effect.each(["stop", "dispose"] as const)(
     }).pipe(Effect.provide(layerDelegatedApproval)),
 );
 
-it.effect("defers a blocking delegation approval until the launching run ends", () =>
-  Effect.gen(function* () {
-    const { engine, projections, reactor, sink, parentThreadId, task, parentEnded, request } =
-      yield* setupDelegatedApproval("settled_only");
-    const approval = request("permission");
-    yield* sink.write({ events: [approval] });
-    yield* reactor.handle(approval);
-    assert.isFalse(
-      (yield* projections.getThreadRecords(parentThreadId, ["messages"])).messages.some(
-        (message) => message.notification !== undefined,
-      ),
-    );
-    yield* engine.dispatch({
-      type: "delegated_task.wake-policy",
-      commandId: CommandId.make("approval:wait-ended"),
-      parentThreadId,
-      taskId: task.id,
-      completionWake: "always",
-    });
-    yield* sink.write({ events: [parentEnded] });
-    yield* reactor.handle(parentEnded);
-    yield* reactor.handle(parentEnded);
-    const parent = yield* projections.getThreadRecords(parentThreadId, [
-      "messages",
-      "runs",
-      "subagents",
-    ]);
-    const notices = parent.messages.filter((message) => message.notification !== undefined);
-    assert.equal(notices.length, 1);
-    assert.include(notices[0]!.text, approval.payload.id);
-    assert.equal(
-      parent.runs.find((run) => run.userMessageId === notices[0]!.id)?.status,
-      "starting",
-    );
-    assert.equal(parent.subagents[0]?.status, "running");
-    assert.isNull(parent.subagents[0]?.result);
-  }).pipe(Effect.provide(layerDelegatedApproval)),
+it.effect.each(["cancelled", "expired"] as const)(
+  "withdraws a queued approval notice when the request is %s without a live callback",
+  (status) =>
+    Effect.gen(function* () {
+      const { projections, reactor, sink, parentThreadId, request } =
+        yield* setupDelegatedApproval();
+      const approval = request("command");
+      yield* sink.write({ events: [approval] });
+      yield* reactor.handle(approval);
+      const ended = {
+        ...approval,
+        id: EventId.make("approval:ended"),
+        payload: {
+          ...approval.payload,
+          status,
+          resolvedAt: approval.occurredAt,
+          responseCapability: {
+            type: "not_resumable" as const,
+            reason: "The run was interrupted.",
+          },
+        },
+      };
+      yield* sink.write({ events: [ended] });
+      yield* reactor.handle(ended);
+      const parent = yield* projections.getThreadRecords(parentThreadId, ["messages", "runs"]);
+      const notice = parent.messages.find((message) => message.notification !== undefined);
+      assert.equal(
+        parent.runs.find((run) => run.userMessageId === notice?.id)?.status,
+        "cancelled",
+      );
+    }).pipe(Effect.provide(layerDelegatedApproval)),
+);
+
+it.effect.each([false, true])(
+  "catches up a blocking delegation approval at run end unless the wait returned it (returned: %s)",
+  (waitReturned) =>
+    Effect.gen(function* () {
+      const { engine, projections, reactor, sink, parentThreadId, task, parentEnded, request } =
+        yield* setupDelegatedApproval("settled_only");
+      const approval = request("permission");
+      yield* sink.write({ events: [approval] });
+      yield* reactor.handle(approval);
+      assert.isFalse(
+        (yield* projections.getThreadRecords(parentThreadId, ["messages"])).messages.some(
+          (message) => message.notification !== undefined,
+        ),
+      );
+      if (waitReturned) {
+        yield* engine.dispatch({
+          type: "delegated_task.wake-policy",
+          commandId: CommandId.make("approval:wait-ended"),
+          parentThreadId,
+          taskId: task.id,
+          completionWake: "always",
+        });
+      }
+      yield* sink.write({ events: [parentEnded] });
+      yield* reactor.handle(parentEnded);
+      yield* reactor.handle(parentEnded);
+      const parent = yield* projections.getThreadRecords(parentThreadId, [
+        "messages",
+        "runs",
+        "subagents",
+      ]);
+      const notices = parent.messages.filter((message) => message.notification !== undefined);
+      assert.equal(notices.length, waitReturned ? 0 : 1);
+      if (!waitReturned) {
+        assert.include(notices[0]!.text, approval.payload.id);
+        assert.equal(
+          parent.runs.find((run) => run.userMessageId === notices[0]!.id)?.status,
+          "starting",
+        );
+      }
+      assert.equal(parent.subagents[0]?.status, "running");
+      assert.isNull(parent.subagents[0]?.result);
+    }).pipe(Effect.provide(layerDelegatedApproval)),
 );
 
 it.effect.each([false, true])("rejects thread.create for an existing id (deleted: %s)", (deleted) =>
