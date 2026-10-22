@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassification";
@@ -167,9 +168,15 @@ const make = Effect.gen(function* () {
       .digest("SHA-256", new TextEncoder().encode(secretName))
       .pipe(Effect.map(Hex.encode), Effect.orDie);
 
+  // Only the origin `peerOrigin` checked may receive a pairing code or token:
+  // a redirect could forward them anywhere, including plain http.
+  const peerHttpClient = HttpClient.transform(httpClient, (response) =>
+    Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
+  );
+
   const clientFor = (origin: string) =>
     HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin }).pipe(
-      Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(HttpClient.HttpClient, peerHttpClient),
     );
 
   /** The environment answering at `origin`, or nothing when it does not answer as T3 Code. */

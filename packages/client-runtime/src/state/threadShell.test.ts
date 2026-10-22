@@ -276,6 +276,12 @@ describe("v2 thread shell lists", () => {
     // parent's environment is switched off.
     registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [] });
     expect(listed()).toEqual([`${remoteEnvironmentId}/${task.id}`]);
+    // Archiving the parent here leaves the task there unarchived, so it is listed on its own.
+    registry.set(snapshotAtom(environmentId), {
+      ...v2ShellSnapshot,
+      threads: [{ ...parent, archivedAt: v2Now }],
+    });
+    expect(listed()).toEqual([`${remoteEnvironmentId}/${task.id}`]);
     registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [parent] });
     expect(listed()).toEqual([`${environmentId}/${parent.id}`]);
     const catalog = registry.get(catalogValueAtom);

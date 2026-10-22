@@ -11,6 +11,13 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool, Toolkit } from "effect/ai";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpServer,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
 
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -160,6 +167,64 @@ it.effect("two links racing to one peer leave the stored access matching the tok
       expect(modes).toBe(
         stored!.access === "read-only" ? "approval-required/default" : "full-access/default",
       );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+/** A bare HTTP server on a socket of its own, answering with `handle`. */
+const serveRaw = <E, R>(
+  handle: (
+    request: HttpServerRequest.HttpServerRequest,
+  ) => Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+) =>
+  Layer.build(Layer.fresh(NodeHttpServer.layerTest)).pipe(
+    Effect.flatMap((server) =>
+      Effect.gen(function* () {
+        yield* HttpServer.serve(Effect.flatMap(HttpServerRequest.HttpServerRequest, handle)).pipe(
+          Layer.build,
+        );
+        const address = (yield* HttpServer.HttpServer).address;
+        if (address._tag === "UnixPathAddress") return yield* Effect.die("expected a TCP address");
+        return `http://127.0.0.1:${address.port}`;
+      }).pipe(Effect.provideContext(server)),
+    ),
+  );
+
+it.effect("never follows a peer's redirect with the pairing code", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const b = yield* serveB(box);
+      const received = yield* Ref.make<ReadonlyArray<string>>([]);
+      const elsewhere = yield* serveRaw((request) =>
+        Ref.update(received, (seen) => [...seen, `${request.method} ${request.url}`]).pipe(
+          Effect.as(HttpServerResponse.empty({ status: 404 })),
+        ),
+      );
+      // Answers as B, then sends every linking request on to another address.
+      const front = yield* serveRaw((request) =>
+        request.url.startsWith("/.well-known/t3/environment")
+          ? HttpClient.get(`${b.url}${request.url}`).pipe(
+              Effect.flatMap((response) => response.text),
+              Effect.map((body) =>
+                HttpServerResponse.text(body, { contentType: "application/json" }),
+              ),
+              Effect.provide(FetchHttpClient.layer),
+              Effect.orDie,
+            )
+          : Effect.succeed(
+              HttpServerResponse.empty({
+                status: 307,
+                headers: { location: `${elsewhere}${request.url}` },
+              }),
+            ),
+      );
+      const a = yield* makeA(laptop);
+      const pairing = yield* b.auth.issuePairingCredential();
+      yield* a.links
+        .link({ url: front, pairingCode: pairing.credential, access: "auto" })
+        .pipe(Effect.flip);
+      expect(yield* Ref.get(received)).toEqual([]);
+      expect(yield* a.links.list).toEqual([]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

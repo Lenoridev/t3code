@@ -491,7 +491,9 @@ export function createEnvironmentThreadShellAtoms(input: {
         if (
           parent !== undefined &&
           environmentIds.has(parent.environmentId) &&
-          get(environmentThreadIndexAtom(parent.environmentId)).has(parent.threadId)
+          // An archived parent leaves navigation; its task there stays listed on its own.
+          get(environmentThreadIndexAtom(parent.environmentId)).get(parent.threadId)?.archivedAt ===
+            null
         ) {
           next.add(threadKey({ environmentId, threadId: thread.id }));
         }
