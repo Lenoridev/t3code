@@ -1,5 +1,4 @@
 import { presentThreadShell } from "@t3tools/client-runtime/state/models";
-import { threadKey } from "@t3tools/client-runtime/state/entities";
 import * as DateTime from "effect/DateTime";
 import { deriveActiveWorkStartedAt } from "../session-logic.ts";
 import { describe, expect, it, vi } from "vite-plus/test";
