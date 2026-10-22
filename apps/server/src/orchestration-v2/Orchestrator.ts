@@ -2139,6 +2139,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ),
   );
 
+  // The enclosing dispatch span owns this cancellation work; a helper span would duplicate it.
   const cancelQueuedDelegatedRequests = Effect.fnUntraced(function* (input: {
     readonly command: OrchestrationV2ServerCommand;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
