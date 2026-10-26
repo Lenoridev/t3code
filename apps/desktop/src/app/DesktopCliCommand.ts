@@ -28,14 +28,8 @@ const pathEntries = (value: string | undefined, separator: string) =>
 const sameWindowsPath = (left: string, right: string) =>
   left.replace(/[\\/]+$/, "").toLowerCase() === right.replace(/[\\/]+$/, "").toLowerCase();
 
-/**
- * Reads, or with `T3_SET` set writes, the user's PATH in the registry, keeping
- * `%VAR%` entries unexpanded. Writes keep REG_EXPAND_SZ (Windows' default for
- * PATH; `SetEnvironmentVariable` would store REG_SZ and break every `%VAR%`
- * entry), then broadcast WM_SETTINGCHANGE so Explorer and the terminals it
- * opens see the change. A failed read exits nonzero rather than reading as
- * empty, so a write never replaces the user's PATH wholesale.
- */
+// Preserve REG_EXPAND_SZ and %VAR% expansion; notify Explorer with WM_SETTINGCHANGE.
+// Failed reads must exit nonzero to prevent replacing PATH wholesale.
 const WINDOWS_USER_PATH_SCRIPT = `
 $ErrorActionPreference = 'Stop'
 if ($env:T3_SET -eq '1') {
@@ -64,7 +58,7 @@ export class DesktopCliCommand extends Context.Service<
   }
 >()("@t3tools/desktop/app/DesktopCliCommand") {}
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fs = yield* FileSystem.FileSystem;
@@ -83,15 +77,17 @@ export const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => false),
     );
 
-  const isOurLink = (link: string) =>
-    Effect.gen(function* () {
+  const isOurLink = Effect.fn("DesktopCliCommand.isOurLink")(
+    function* (link: string) {
       yield* fs.readLink(link);
       // The launcher is a few KB; never read a large binary another `t3` links to.
       const info = yield* fs.stat(link);
       if (info.type !== "File" || Number(info.size) > 16_384) return false;
       const content = yield* fs.readFileString(link);
       return content.includes(DesktopCliShim.MARKER);
-    }).pipe(Effect.orElseSucceed(() => false));
+    },
+    Effect.orElseSucceed(() => false),
+  );
 
   const powershell = (env: Record<string, string>) =>
     Effect.scoped(

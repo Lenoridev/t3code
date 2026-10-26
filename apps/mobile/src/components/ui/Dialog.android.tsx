@@ -54,7 +54,6 @@ export function prompt(request: TextInputDialogRequest): void {
   presentRequest?.({ kind: "text-input", request });
 }
 
-/** Android presenter for Dialog.alert, Dialog.confirm and Dialog.prompt; mounted once at the app root. */
 export function Host() {
   const [presented, setPresented] = useState<(DialogRequest & { readonly id: number }) | null>(
     null,
@@ -62,12 +61,15 @@ export function Host() {
   const [inputValue, setInputValue] = useState("");
   const nextPresentationId = useRef(0);
   useEffect(() => {
-    presentRequest = (request) => {
+    const present = (request: DialogRequest) => {
       setInputValue(request.kind === "text-input" ? request.request.initialValue : "");
       setPresented({ ...request, id: ++nextPresentationId.current });
     };
+    presentRequest = present;
     return () => {
-      presentRequest = null;
+      // When Android replaces the activity, the new root's Host registers before the old root
+      // unmounts. Clearing unconditionally would leave the live Host without dialogs.
+      if (presentRequest === present) presentRequest = null;
     };
   }, []);
 

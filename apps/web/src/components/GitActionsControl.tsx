@@ -120,6 +120,7 @@ import { getSourceControlPresentation, sourceControlIcon } from "~/sourceControl
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { formatDiffCount } from "@t3tools/client-runtime/diff-count";
 import { useOpenLink } from "~/browser/useOpenLink";
+import { useClientSettings } from "~/hooks/useSettings";
 
 interface GitActionsControlProps {
   presentation?: "toolbar" | "menu";
@@ -1091,6 +1092,9 @@ export default function GitActionsControl({
   const changesTotals = gitStatusForActions?.branchChanges ?? gitStatusForActions?.workingTree;
 
   const allFiles = gitStatusForActions?.workingTree.files ?? [];
+  // Changed-file paths are repository-relative, so they must resolve against
+  // the worktree root from the same status snapshot, not the project cwd.
+  const workingTreeRoot = gitStatusForActions?.workingTree.rootPath ?? null;
   const selectedFiles = allFiles.filter((f) => !excludedFiles.has(f.path));
   const allSelected = excludedFiles.size === 0;
   const noneSelected = selectedFiles.length === 0;
@@ -1148,6 +1152,17 @@ export default function GitActionsControl({
       ? (quickAction.hint ?? "This action is currently unavailable.")
       : null;
   const gitActionProgress = resolveGitActionProgressPresentation(vcsActionState);
+  const redesign = useClientSettings((s) => s.redesignEnabled);
+  // A fresh draft with nothing to commit, push, or diff hides those rows until there is work.
+  const quietEmptyDraft =
+    redesign &&
+    isPanel &&
+    draftId !== undefined &&
+    gitActionProgress === null &&
+    !gitStatusError &&
+    quickAction.disabled &&
+    !changesTotals?.insertions &&
+    !changesTotals?.deletions;
   const pendingDefaultBranchActionCopy = pendingDefaultBranchAction
     ? resolveDefaultBranchActionDialogCopy({
         action: pendingDefaultBranchAction.action,
@@ -1156,9 +1171,7 @@ export default function GitActionsControl({
         terminology: changeRequestTerminology,
       })
     : null;
-  // Follows the live status so the button tracks the tree while the dialog is open. Until the
-  // status loads, keep the option enabled: the server stays the authority and rejects a stale
-  // request with its own error.
+  // Keep enabled until live status loads; the server rejects stale requests.
   const featureBranchUnavailableReason = pendingDefaultBranchAction
     ? resolveFeatureBranchUnavailableReason({
         branchName: pendingDefaultBranchAction.branchName,
@@ -1199,8 +1212,7 @@ export default function GitActionsControl({
     };
   }, [activeEnvironmentId, gitCwd, refreshVcsStatus]);
 
-  // Not an effect event: retained toast actions must stay bound to the checkout and
-  // thread of the render that created them, not follow later selections.
+  // Toast actions must retain their original checkout/thread, so do not use an effect event.
   async function runGitActionWithToast({
     action,
     commitMessage,
@@ -1356,8 +1368,10 @@ export default function GitActionsControl({
     }
   }
 
-  const continuePendingDefaultBranchAction = () => {
-    if (!pendingDefaultBranchAction) return;
+  const continuePendingDefaultBranchAction = (featureBranch: boolean) => {
+    if (!pendingDefaultBranchAction || !canWriteSourceControl) return;
+    if (featureBranch && (!canChangeThreadBranch || featureBranchUnavailableReason !== null))
+      return;
     const { action, commitMessage, onConfirmed, filePaths } = pendingDefaultBranchAction;
     setPendingDefaultBranchAction(null);
     void runGitActionWithToast({
@@ -1365,20 +1379,7 @@ export default function GitActionsControl({
       ...(commitMessage ? { commitMessage } : {}),
       ...(onConfirmed ? { onConfirmed } : {}),
       ...(filePaths ? { filePaths } : {}),
-      skipDefaultBranchPrompt: true,
-    });
-  };
-
-  const checkoutFeatureBranchAndContinuePendingAction = () => {
-    if (!pendingDefaultBranchAction) return;
-    const { action, commitMessage, onConfirmed, filePaths } = pendingDefaultBranchAction;
-    setPendingDefaultBranchAction(null);
-    void runGitActionWithToast({
-      action,
-      ...(commitMessage ? { commitMessage } : {}),
-      ...(onConfirmed ? { onConfirmed } : {}),
-      ...(filePaths ? { filePaths } : {}),
-      featureBranch: true,
+      featureBranch,
       skipDefaultBranchPrompt: true,
     });
   };
@@ -1498,7 +1499,7 @@ export default function GitActionsControl({
   };
 
   const openChangedFileInEditor = (filePath: string) => {
-    if (!gitCwd) {
+    if (workingTreeRoot === null) {
       toastManager.add({
         type: "error",
         title: "Editor opening is unavailable.",
@@ -1506,7 +1507,7 @@ export default function GitActionsControl({
       });
       return;
     }
-    const target = resolvePathLinkTarget(filePath, gitCwd);
+    const target = resolvePathLinkTarget(filePath, workingTreeRoot);
     void (async () => {
       const result = await openInPreferredEditor(target);
       if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
@@ -1616,7 +1617,8 @@ export default function GitActionsControl({
       ) : null}
       {gitStatusForActions?.refName === null && (
         <p className="px-2 py-1.5 text-xs text-warning">
-          Detached HEAD: create and check out a branch to enable push and pull request actions.
+          Detached HEAD: create and check out a branch to enable push and{" "}
+          {changeRequestTerminology.singular} actions.
         </p>
       )}
       {gitStatusForActions &&
@@ -1694,7 +1696,7 @@ export default function GitActionsControl({
             {initAction.isPending ? "Initializing..." : "Initialize Git"}
           </span>
         </ThreadDetailsControl>
-      ) : compact && !gitActionProgress && !visibleInlineSuccess ? null : (
+      ) : quietEmptyDraft || (compact && !gitActionProgress && !visibleInlineSuccess) ? null : (
         <ActionGroup
           role="group"
           aria-label="Git actions"
@@ -1831,7 +1833,7 @@ export default function GitActionsControl({
         </ActionGroup>
       )}
 
-      {isPanel && isRepo ? (
+      {isPanel && isRepo && !quietEmptyDraft ? (
         <ThreadDetailsControl
           type="button"
           variant="ghost"
@@ -1842,11 +1844,21 @@ export default function GitActionsControl({
         >
           <FileDiffIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
           <span className={cn("flex-1 text-left", THREAD_DETAILS_PANEL_LABEL_CLASS)}>Changes</span>
-          <span className="flex items-center gap-1 font-mono text-2xs tabular-nums">
-            <span className="text-diff-addition">
+          <span className="flex items-center gap-1.5 font-mono text-xs tabular-nums">
+            <span
+              className={
+                changesTotals?.insertions
+                  ? "text-diff-addition-foreground"
+                  : "text-muted-foreground"
+              }
+            >
               +{formatDiffCount(changesTotals?.insertions ?? 0)}
             </span>
-            <span className="text-diff-deletion">
+            <span
+              className={
+                changesTotals?.deletions ? "text-diff-deletion-foreground" : "text-muted-foreground"
+              }
+            >
               -{formatDiffCount(changesTotals?.deletions ?? 0)}
             </span>
           </span>
@@ -1943,8 +1955,8 @@ export default function GitActionsControl({
                                 )}
                                 <button
                                   type="button"
-                                  className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
-                                  disabled={!canOperateThread}
+                                  className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left enabled:cursor-pointer"
+                                  disabled={!canOperateThread || workingTreeRoot === null}
                                   aria-label={`Open ${file.path} in editor`}
                                   onClick={() => openChangedFileInEditor(file.path)}
                                 >
@@ -2040,9 +2052,7 @@ export default function GitActionsControl({
       <Dialog
         open={pendingDefaultBranchAction !== null}
         onOpenChange={(open) => {
-          if (!open) {
-            setPendingDefaultBranchAction(null);
-          }
+          if (!open) setPendingDefaultBranchAction(null);
         }}
       >
         <DialogPopup className="max-w-xl">
@@ -2068,7 +2078,7 @@ export default function GitActionsControl({
               className="w-full max-w-full sm:w-auto"
               variant="outline"
               size="sm-multiline"
-              onClick={continuePendingDefaultBranchAction}
+              onClick={() => continuePendingDefaultBranchAction(false)}
               disabled={!canWriteSourceControl}
             >
               {pendingDefaultBranchActionCopy?.continueLabel ?? "Continue"}
@@ -2076,7 +2086,7 @@ export default function GitActionsControl({
             <Button
               className="w-full max-w-full sm:w-auto"
               size="sm-multiline"
-              onClick={checkoutFeatureBranchAndContinuePendingAction}
+              onClick={() => continuePendingDefaultBranchAction(true)}
               disabled={!canChangeThreadBranch || featureBranchUnavailableReason !== null}
             >
               Check out feature branch & continue

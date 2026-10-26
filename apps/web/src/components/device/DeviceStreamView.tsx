@@ -41,8 +41,7 @@ function screenAspect(platform: DevicePlatform, screen: DeviceScreenSize | null)
   return w / h;
 }
 
-// serve-sim streams the raw framebuffer; rotate the display for a device
-// that reports landscape while its frames stay portrait.
+// serve-sim sends raw portrait framebuffers even when iOS reports landscape; rotate the display.
 function screenRotation(platform: DevicePlatform, screen: DeviceScreenSize | null): number {
   if (platform !== "ios" || !screen || screen.width > screen.height) return 0;
   switch (screen.orientation) {
@@ -98,8 +97,6 @@ export function DeviceStreamView(props: {
   const [presentation, setPresentation] = useState<"phone" | "flat">("phone");
   const [keyboardAttached, setKeyboardAttached] = useState(false);
   const [phoneUnavailable, setPhoneUnavailable] = useState(false);
-  // The stream effect and the viewports' scene setup depend on these; a new
-  // identity per render would restart the stream and rebuild the 3D scene.
   const onPhoneUnavailable = useStableCallback(() => setPhoneUnavailable(true));
   const cancelPhoneInputRef = useRef<(() => void) | null>(null);
   const cancelPhoneInput = useStableCallback(() => cancelPhoneInputRef.current?.());
@@ -125,7 +122,6 @@ export function DeviceStreamView(props: {
   const [foldAngle, setFoldAngle] = useState<number | null>(null);
   const [mjpegUrl, setMjpegUrl] = useState<string | null>(null);
   const [mjpegGeneration, setMjpegGeneration] = useState(0);
-  // A new ref callback per render would detach and reattach the MJPEG image.
   const attachMjpegImage = useStableCallback((image: HTMLImageElement | null) => {
     clientRef.current?.setMjpegImage(image);
   });
@@ -164,6 +160,7 @@ export function DeviceStreamView(props: {
           setMjpegUrl(url);
           setMjpegGeneration((generation) => generation + 1);
         },
+        onCanvasVideo: () => setMjpegUrl(null),
         onInputConnected: (connected, detail) => {
           setInputState({ connected, ...(detail ? { detail } : {}) });
           if (!connected) setShowRestartNotice(false);
@@ -222,10 +219,7 @@ export function DeviceStreamView(props: {
   }, [retainingFrame, showPhone]);
   const controlsInset = props.renderControls && !showPhone ? CONTROLS_RAIL_WIDTH : 0;
 
-  // The frame is the largest box at `aspect` that fits the container, so a
-  // narrow panel shows a shorter phone rather than a squeezed one. CSS
-  // `aspect-ratio` alone cannot do this: with the height pinned to 100% the
-  // width clamp wins and distorts the drawn frame.
+  // Fit the frame in both dimensions; pinned CSS height plus a width clamp distorts aspect-ratio.
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [host, setHost] = useState({ width: 0, height: 0 });
   useEffect(() => {
@@ -378,6 +372,8 @@ export function DeviceStreamView(props: {
         ref={hostRef}
         className={cn(
           "relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden outline-none",
+          // Overlay the stream; focus (including pointer-driven focus) marks keyboard capture.
+          "after:pointer-events-none after:absolute after:inset-0 after:z-10 focus:after:ring-2 focus:after:ring-inset focus:after:ring-ring",
           controlsInset && "pr-14",
         )}
         tabIndex={0}
@@ -386,8 +382,20 @@ export function DeviceStreamView(props: {
         onKeyDown={(event) => {
           if (event.target !== event.currentTarget) return;
           if (event.metaKey && !["r", "R"].includes(event.key)) return;
+          // Let browser paste chords fire the paste event.
+          if (
+            (event.ctrlKey && (event.key === "v" || event.key === "V")) ||
+            (event.shiftKey && event.key === "Insert")
+          ) {
+            return;
+          }
           event.preventDefault();
           clientRef.current?.sendKey(event.nativeEvent, "down");
+        }}
+        onPaste={(event) => {
+          if (event.target !== event.currentTarget) return;
+          event.preventDefault();
+          clientRef.current?.sendText(event.clipboardData.getData("text/plain"));
         }}
         onKeyUp={(event) => {
           if (event.target !== event.currentTarget) return;
@@ -541,8 +549,7 @@ export function DeviceStreamView(props: {
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    // An expired ticket surfaces as unauthorized on restart and
-                    // refreshes access through the effect; no need to mint one here.
+                    // Restart's unauthorized response renews expired tickets through the effect.
                     clientRef.current?.stop();
                     setPhoneUnavailable(false);
                     clientRef.current?.start();

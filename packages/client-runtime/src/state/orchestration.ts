@@ -27,25 +27,26 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
   return {
     threadTranscript: createEnvironmentCommand(runtime, {
       label: "environment-data:orchestration:thread-transcript",
-      execute: (input: { readonly threadId: ThreadId }) =>
-        Effect.gen(function* () {
-          const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
-          const prepared = yield* SubscriptionRef.get(supervisor.prepared);
-          if (Option.isNone(prepared)) {
-            return yield* new EnvironmentRpcUnavailableError({
-              environmentId: supervisor.target.environmentId,
-              message: "The source environment is not connected.",
-            });
-          }
-          return yield* fetchEnvironmentThreadTranscript({
-            prepared: prepared.value,
-            threadId: input.threadId,
-            signer: yield* Effect.serviceOption(ManagedRelayDpopSigner.ManagedRelayDpopSigner),
-            remoteAuthorization: yield* Effect.serviceOption(
-              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
-            ),
+      execute: Effect.fn("orchestration.execute")(function* (input: {
+        readonly threadId: ThreadId;
+      }) {
+        const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+        const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+        if (Option.isNone(prepared)) {
+          return yield* new EnvironmentRpcUnavailableError({
+            environmentId: supervisor.target.environmentId,
+            message: "The source environment is not connected.",
           });
-        }),
+        }
+        return yield* fetchEnvironmentThreadTranscript({
+          prepared: prepared.value,
+          threadId: input.threadId,
+          signer: yield* Effect.serviceOption(ManagedRelayDpopSigner.ManagedRelayDpopSigner),
+          remoteAuthorization: yield* Effect.serviceOption(
+            RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+          ),
+        });
+      }),
     }),
     v2: {
       dispatchCommand: createEnvironmentRpcCommand(runtime, {
@@ -126,6 +127,13 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
     archivedShellSnapshot: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:archived-shell-snapshot",
       tag: ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot,
+    }),
+    // Read right before deleting a worktree, so never served from cache.
+    worktreeThreadIds: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:worktree-thread-ids",
+      tag: ORCHESTRATION_V2_WS_METHODS.getWorktreeThreadIds,
+      staleTimeMs: 0,
+      idleTtlMs: 0,
     }),
   };
 }
