@@ -46,10 +46,17 @@ import * as PeerLinks from "./PeerLinks.ts";
 const FOLLOW_WAIT_MS = 10 * 60 * 1_000;
 /** A linked environment that stops answering is retried, backing off to this. */
 const FOLLOW_MAX_BACKOFF = Duration.minutes(5);
-const backoff = Schedule.exponential(Duration.seconds(2)).pipe(
-  Schedule.modifyDelay(({ duration }) =>
-    Effect.succeed(Duration.min(duration, FOLLOW_MAX_BACKOFF)),
-  ),
+/** How a follower retries; tests step it by hand. */
+export const FollowRetrySchedule = Context.Reference<Schedule.Schedule<unknown>>(
+  "t3/peer/RemoteDelegation/FollowRetrySchedule",
+  {
+    defaultValue: () =>
+      Schedule.exponential(Duration.seconds(2)).pipe(
+        Schedule.modifyDelay(({ duration }) =>
+          Effect.succeed(Duration.min(duration, FOLLOW_MAX_BACKOFF)),
+        ),
+      ),
+  },
 );
 
 type ThreadScope = McpInvocationContext.McpThreadInvocationScope;
@@ -92,22 +99,23 @@ export class RemoteDelegation extends Context.Service<
   }
 >()("t3/peer/RemoteDelegation") {}
 
-/**
- * Refusals that following again cannot change: the link was revoked, expired
- * or forgotten, or the thread or run there is gone. Anything else (the other
- * machine asleep, a dropped route) is worth retrying.
- */
 /** The other side refused because the thread there runs above this caller's modes. */
 const isModeRefusal = (error: OrchestratorMcpFailure) =>
   error.code === "runtime_mode_escalation_denied" ||
   error.code === "interaction_mode_escalation_denied";
 
+/**
+ * Refusals that following again cannot change: the link was revoked, expired
+ * or forgotten, or the thread or run there is gone. Anything else (the other
+ * machine asleep, a dropped route) is worth retrying.
+ */
 const isFinal = (error: OrchestratorMcpFailure) =>
   error.code === "capability_denied" ||
   error.code === "thread_not_found" ||
   error.code === "run_not_found";
 
 const make = Effect.gen(function* () {
+  const followRetry = yield* FollowRetrySchedule;
   const forwarding = yield* PeerForwarding.PeerForwarding;
   const links = yield* PeerLinks.PeerLinks;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -655,7 +663,7 @@ const make = Effect.gen(function* () {
           yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
         }),
       }),
-      Effect.retry(backoff),
+      Effect.retry(followRetry),
       Effect.ignoreCause({ log: true }),
     );
 

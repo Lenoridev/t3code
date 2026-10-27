@@ -104,7 +104,7 @@ const ProjectDeleteTool = Tool.make("t3_project_delete", {
 const ProjectCloneTool = Tool.make("t3_project_clone", {
   ...shared,
   description:
-    "Clone a repository (`destinationPath` new or empty). Register after with `t3_project_create`; on a linked machine, pass the same `environmentId` to both.",
+    "Clone a repository (`destinationPath` new or empty). Register after with `t3_project_create`, with the same `environmentId`.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     ...SourceControlCloneRepositoryInput.fields,
@@ -120,7 +120,7 @@ const ProjectCloneTool = Tool.make("t3_project_clone", {
 const ThreadLaunchTool = Tool.make("t3_thread_launch", {
   ...shared,
   description:
-    "Create one new top-level thread, bound to its workspace before the agent starts. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. Pass `clientRequestId` and reuse it when retrying: the same key returns the first call's thread. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
+    "Create one new top-level thread, bound to its workspace before the agent starts. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. After an error or lost reply, retry with the same `clientRequestId`. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
     projectId: Schema.optional(ProjectId),
