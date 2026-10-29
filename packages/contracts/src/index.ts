@@ -44,6 +44,7 @@ export * from "./orchestratorMcp.ts";
 export * from "./peerLink.ts";
 export * from "./threadMetadataMcp.ts";
 export * from "./threadPullRequest.ts";
+export * from "./threadCommandWatch.ts";
 export * from "./threadSearch.ts";
 export * from "./threadTitle.ts";
 export * from "./t3ProjectFile.ts";

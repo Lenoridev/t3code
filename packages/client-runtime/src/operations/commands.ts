@@ -846,6 +846,13 @@ export const interruptThreadTurn = Effect.fn("EnvironmentCommands.interruptThrea
           watching: false,
         });
       }
+      if ((projection.thread.commandWatches ?? []).length > 0) {
+        result = yield* dispatch({
+          type: "thread.command-watch.stop",
+          commandId: yield* allocateCommandId(result.sequence === 0 ? input : {}),
+          threadId: input.threadId,
+        });
+      }
       return result;
     }
   }
@@ -1089,6 +1096,20 @@ export const watchThreadPullRequest = Effect.fn("EnvironmentCommands.watchThread
     return yield* dispatch({
       ...input,
       type: "thread.pull-request.watch",
+      commandId: yield* allocateCommandId(input),
+    });
+  },
+);
+export type StopThreadCommandWatchInput = Omit<
+  Extract<OrchestrationV2Command, { type: "thread.command-watch.stop" }>,
+  "type" | "commandId"
+> &
+  CommandMetadata;
+export const stopThreadCommandWatch = Effect.fn("EnvironmentCommands.stopThreadCommandWatch")(
+  function* (input: StopThreadCommandWatchInput) {
+    return yield* dispatch({
+      ...input,
+      type: "thread.command-watch.stop",
       commandId: yield* allocateCommandId(input),
     });
   },

@@ -56,6 +56,7 @@ import {
   updateThreadMetadata,
   visitThread,
   watchThreadPullRequest,
+  stopThreadCommandWatch,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
@@ -241,6 +242,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     watchPullRequest: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:watch-pull-request",
       execute: watchThreadPullRequest,
+      scheduler,
+      concurrency,
+    }),
+    stopCommandWatch: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:stop-command-watch",
+      execute: stopThreadCommandWatch,
       scheduler,
       concurrency,
     }),

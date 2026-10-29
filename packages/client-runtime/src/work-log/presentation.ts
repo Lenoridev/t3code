@@ -486,6 +486,8 @@ function summaryActionPriority(action: ToolGroupAction | T3McpToolSummaryAction)
     case "schedule-update":
     case "schedule-delete":
     case "schedule-run":
+    case "watch-command":
+    case "unwatch-command":
     case "thread-configure":
     case "thread-fork":
     case "thread-merge":
