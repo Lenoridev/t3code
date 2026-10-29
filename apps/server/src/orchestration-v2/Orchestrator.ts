@@ -486,6 +486,30 @@ const withoutCommandWatches = (
 ): Pick<OrchestrationV2AppThread, "commandWatches"> =>
   thread.commandWatches === undefined ? {} : { commandWatches: [] };
 
+/**
+ * Full access lets a watch run without a prompt. Leaving it sends those watches back for the
+ * user's approval instead of letting them keep authority the thread no longer has; entering it
+ * lets watches that were waiting for approval run.
+ */
+const withCommandWatchRuntimeMode = (
+  thread: OrchestrationV2AppThread,
+  runtimeMode: OrchestrationV2AppThread["runtimeMode"],
+): Pick<OrchestrationV2AppThread, "commandWatches"> =>
+  thread.commandWatches === undefined
+    ? {}
+    : {
+        commandWatches: thread.commandWatches.map((watch): ThreadCommandWatch => {
+          if (runtimeMode === "full-access") {
+            return watch.status === "awaiting_approval"
+              ? { ...watch, authority: { kind: "full-access" }, status: "baselining" }
+              : watch;
+          }
+          if (watch.authority?.kind !== "full-access") return watch;
+          const { pauseReason: _reason, ...rest } = watch;
+          return { ...rest, authority: null, status: "awaiting_approval" };
+        }),
+      };
+
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
   switch (command.type) {
     case "thread.create":
@@ -517,6 +541,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.pull-request-watch.sync":
     case "thread.command-watch.start":
     case "thread.command-watch.stop":
+    case "thread.command-watch.approve":
+    case "thread.command-watch.resume":
     case "thread.command-watch.sync":
     case "thread.pull-request.sync":
     case "thread.title.regeneration.complete":
@@ -2828,8 +2854,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   /**
-   * Starts, stops and records command watches (`watch_command`). Each change emits the whole
-   * thread so every projection applies it, and a recorded wake is queued in the same step.
+   * Starts, approves, resumes, stops and records command watches (`watch_command`). Each change
+   * emits the whole thread so every projection applies it, and an update for the agent is queued
+   * in the same step.
    */
   const dispatchCommandWatch = Effect.fn("orchestrationV2.dispatch.commandWatch")(function* (
     command: Extract<
@@ -2838,6 +2865,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly type:
           | "thread.command-watch.start"
           | "thread.command-watch.stop"
+          | "thread.command-watch.approve"
+          | "thread.command-watch.resume"
           | "thread.command-watch.sync";
       }
     >,
@@ -2865,7 +2894,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       thread.settledAt !== null ||
       isProviderNativeSubagentThread(thread);
     const now = yield* DateTime.now;
+    const replaceWatch = (id: string, change: (watch: ThreadCommandWatch) => ThreadCommandWatch) =>
+      watches.map((watch) => (watch.id === id ? change(watch) : watch));
     let next: ReadonlyArray<ThreadCommandWatch>;
+    /** Watches whose queued, unstarted update is cancelled, because they deliver nothing more. */
+    let cancelled: ReadonlyArray<ThreadCommandWatch> = [];
     switch (command.type) {
       case "thread.command-watch.start": {
         if (inactive) {
@@ -2876,11 +2909,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (thread.lineage.relationshipToParent === "subagent") {
           return yield* refuse(
             `Thread ${command.threadId} is a subagent; its parent thread watches commands.`,
-          );
-        }
-        if (thread.runtimeMode !== "full-access" || thread.interactionMode !== "default") {
-          return yield* refuse(
-            `Thread ${command.threadId} is not in Full access, which command watches need.`,
           );
         }
         // The caller's own run decides, so a slow call from a run Stop reached, or from a run
@@ -2900,22 +2928,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ) {
           return yield* refuse(`The run that asked for this watch on ${command.threadId} ended.`);
         }
-        if (watches.some((watch) => watch.command === command.command)) return;
-        if (watches.length >= THREAD_COMMAND_WATCH_LIMIT) {
+        if (
+          watches.some(
+            (watch) => watch.revisionHash === command.revisionHash && watch.label === command.label,
+          )
+        ) {
+          return;
+        }
+        const replaced =
+          command.replacesWatchId === undefined
+            ? undefined
+            : watches.find((watch) => watch.id === command.replacesWatchId);
+        if (command.replacesWatchId !== undefined && replaced === undefined) {
+          return yield* refuse(
+            `Thread ${command.threadId} has no watch ${command.replacesWatchId}.`,
+          );
+        }
+        const fullAccess = thread.runtimeMode === "full-access";
+        // A replacement allowed by Full access takes over at once; otherwise the old revision
+        // keeps running until the user allows the new one.
+        const kept =
+          fullAccess && replaced !== undefined
+            ? watches.filter((watch) => watch.id !== replaced.id)
+            : watches;
+        const counted = kept.filter((watch) => watch.id !== command.replacesWatchId);
+        if (counted.length >= THREAD_COMMAND_WATCH_LIMIT) {
           return yield* refuse(
             `Thread ${command.threadId} already watches ${THREAD_COMMAND_WATCH_LIMIT} commands.`,
           );
         }
         next = [
-          ...watches,
+          ...kept,
           {
             id: command.watchId,
             command: command.command,
             label: command.label,
             everyMinutes: command.everyMinutes,
+            format: command.format,
+            helpers: command.helpers,
+            reportInitialState: command.reportInitialState,
+            cwd: command.cwd,
             startedAt: DateTime.formatIso(now),
-            lastOutputHash: null,
-            wakes: 0,
+            revisionHash: command.revisionHash,
+            authority: fullAccess ? { kind: "full-access" } : null,
+            status: fullAccess ? "baselining" : "awaiting_approval",
+            ...(replaced === undefined || fullAccess ? {} : { replacesWatchId: replaced.id }),
+            collectionFailures: 0,
+            comparisonFailures: 0,
+            waitingChanges: 0,
           },
         ];
         break;
@@ -2925,15 +2985,91 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (watch) => command.watchId !== undefined && watch.id !== command.watchId,
         );
         if (next.length === watches.length) return;
+        cancelled = watches.filter((watch) => !next.includes(watch));
         break;
+      case "thread.command-watch.approve": {
+        const watch = watches.find((candidate) => candidate.id === command.watchId);
+        if (watch === undefined) return yield* refuse(`The watch ${command.watchId} ended.`);
+        if (watch.status !== "awaiting_approval" || watch.revisionHash !== command.revisionHash) {
+          return yield* refuse(`The watch ${command.watchId} no longer waits for this approval.`);
+        }
+        if (!command.approve) {
+          next = watches.filter((candidate) => candidate.id !== watch.id);
+          break;
+        }
+        const { replacesWatchId, ...approved } = watch;
+        next = watches.flatMap((candidate) =>
+          candidate.id === replacesWatchId
+            ? []
+            : candidate.id === watch.id
+              ? [
+                  {
+                    ...approved,
+                    authority: { kind: "approved", revisionHash: watch.revisionHash },
+                    status: "baselining",
+                  } satisfies ThreadCommandWatch,
+                ]
+              : [candidate],
+        );
+        break;
+      }
+      case "thread.command-watch.resume": {
+        const watch = watches.find((candidate) => candidate.id === command.watchId);
+        if (watch === undefined) return yield* refuse(`The watch ${command.watchId} ended.`);
+        if (watch.status !== "paused") return;
+        next = replaceWatch(
+          watch.id,
+          ({ pauseReason: _reason, lastFailure: _failure, ...rest }) => ({
+            ...rest,
+            status: "watching",
+            collectionFailures: 0,
+            comparisonFailures: 0,
+          }),
+        );
+        break;
+      }
       case "thread.command-watch.sync": {
         const existing = watches.find((watch) => watch.id === command.watchId);
         if (existing?.startedAt !== command.startedAt || (command.wake && inactive)) {
           return yield* refuse("The command watch ended or its thread settled while it ran.");
         }
-        next = watches.flatMap((watch) =>
-          watch !== existing ? [watch] : command.watch === null ? [] : [command.watch],
-        );
+        const { patch } = command;
+        const running = existing.status === "baselining" || existing.status === "watching";
+        const {
+          pauseReason: _reason,
+          lastFailure: _failure,
+          pendingMessageId: _pending,
+          ...base
+        } = existing;
+        const lastFailure =
+          patch.lastFailure === undefined ? existing.lastFailure : (patch.lastFailure ?? undefined);
+        const pendingMessageId =
+          patch.pendingMessageId === undefined
+            ? existing.pendingMessageId
+            : (patch.pendingMessageId ?? undefined);
+        const status = running && patch.status !== undefined ? patch.status : existing.status;
+        const pauseReason =
+          status !== "paused"
+            ? undefined
+            : running && patch.pauseReason !== undefined
+              ? patch.pauseReason
+              : existing.pauseReason;
+        next = replaceWatch(existing.id, () => ({
+          ...base,
+          ...(status === "awaiting_approval" ? { authority: null } : {}),
+          status,
+          ...(pauseReason === undefined ? {} : { pauseReason }),
+          ...(lastFailure === undefined ? {} : { lastFailure }),
+          ...(pendingMessageId === undefined ? {} : { pendingMessageId }),
+          ...(patch.collectionFailures === undefined
+            ? {}
+            : { collectionFailures: patch.collectionFailures }),
+          ...(patch.comparisonFailures === undefined
+            ? {}
+            : { comparisonFailures: patch.comparisonFailures }),
+          ...(patch.waitingChanges === undefined ? {} : { waitingChanges: patch.waitingChanges }),
+          ...(patch.lastChangeAt === undefined ? {} : { lastChangeAt: patch.lastChangeAt }),
+        }));
         break;
       }
     }
@@ -2948,10 +3084,32 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...thread,
         commandWatches: next,
-        // Starting or stopping is activity; what a run recorded is not.
+        // Starting or stopping is activity; what a check recorded is not.
         updatedAt: command.type === "thread.command-watch.sync" ? thread.updatedAt : now,
       },
     });
+    const pending = new Set(
+      cancelled.flatMap((watch) =>
+        watch.pendingMessageId === undefined ? [] : [watch.pendingMessageId],
+      ),
+    );
+    if (pending.size > 0) {
+      const { runs } = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs"])
+        .pipe(mapDispatchError(command));
+      for (const run of runs) {
+        if (run.status !== "queued" || !pending.has(run.userMessageId)) continue;
+        yield* dispatchQueuedRunCancel(
+          {
+            type: "queued-run.cancel",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            runId: run.id,
+          },
+          events,
+        );
+      }
+    }
     if (command.type !== "thread.command-watch.sync" || command.wake === undefined) return;
     yield* dispatchMessage(
       {
@@ -3835,21 +3993,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 updatedAt: now,
               }
             : thread;
-        // Command watches run shell commands outside any turn, so they live only in Full access.
         case "thread.runtime-mode.set":
           return {
             ...thread,
             runtimeMode: command.runtimeMode,
-            ...(command.runtimeMode === "full-access" ? {} : withoutCommandWatches(thread)),
+            ...withCommandWatchRuntimeMode(thread, command.runtimeMode),
             updatedAt: now,
           };
         case "thread.interaction-mode.set":
-          return {
-            ...thread,
-            interactionMode: command.interactionMode,
-            ...(command.interactionMode === "default" ? {} : withoutCommandWatches(thread)),
-            updatedAt: now,
-          };
+          return { ...thread, interactionMode: command.interactionMode, updatedAt: now };
         case "thread.model-selection.set":
         case "provider.switch":
           return {
@@ -12751,6 +12903,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "thread.command-watch.start":
       case "thread.command-watch.stop":
+      case "thread.command-watch.approve":
+      case "thread.command-watch.resume":
       case "thread.command-watch.sync":
         yield* dispatchCommandWatch(command, events, effects);
         break;
@@ -13090,7 +13244,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "thread.guest-share.close" ||
           // Watching a command already watched, or stopping a watch that already ended.
           command.type === "thread.command-watch.start" ||
-          command.type === "thread.command-watch.stop",
+          command.type === "thread.command-watch.stop" ||
+          command.type === "thread.command-watch.resume",
         (_planned) =>
           new OrchestratorDispatchError({
             commandId: command.commandId,

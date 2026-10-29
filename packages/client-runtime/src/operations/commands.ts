@@ -1114,6 +1114,34 @@ export const stopThreadCommandWatch = Effect.fn("EnvironmentCommands.stopThreadC
     });
   },
 );
+export type ApproveThreadCommandWatchInput = Omit<
+  Extract<OrchestrationV2Command, { type: "thread.command-watch.approve" }>,
+  "type" | "commandId"
+> &
+  CommandMetadata;
+export const approveThreadCommandWatch = Effect.fn("EnvironmentCommands.approveThreadCommandWatch")(
+  function* (input: ApproveThreadCommandWatchInput) {
+    return yield* dispatch({
+      ...input,
+      type: "thread.command-watch.approve",
+      commandId: yield* allocateCommandId(input),
+    });
+  },
+);
+export type ResumeThreadCommandWatchInput = Omit<
+  Extract<OrchestrationV2Command, { type: "thread.command-watch.resume" }>,
+  "type" | "commandId"
+> &
+  CommandMetadata;
+export const resumeThreadCommandWatch = Effect.fn("EnvironmentCommands.resumeThreadCommandWatch")(
+  function* (input: ResumeThreadCommandWatchInput) {
+    return yield* dispatch({
+      ...input,
+      type: "thread.command-watch.resume",
+      commandId: yield* allocateCommandId(input),
+    });
+  },
+);
 export const unlinkThreadPullRequest = Effect.fn("EnvironmentCommands.unlinkThreadPullRequest")(
   function* (input: UnlinkThreadPullRequestInput) {
     return yield* dispatch({

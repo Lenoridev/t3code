@@ -117,7 +117,7 @@ type PendingBackgroundWorkPullRequest = Pick<
   readonly snapshot: Pick<NonNullable<ThreadPullRequestLink["snapshot"]>, "state"> | null;
 };
 
-type PendingBackgroundWorkCommandWatch = Pick<ThreadCommandWatch, "id" | "label">;
+type PendingBackgroundWorkCommandWatch = Pick<ThreadCommandWatch, "id" | "label" | "status">;
 
 type PendingBackgroundWorkProviderThread = Pick<
   OrchestrationV2ProviderThread,
@@ -324,7 +324,12 @@ function commandWatchTasks(
 ): Array<PendingBackgroundWorkTask> {
   return (watches ?? []).map((watch) => ({
     taskId: watch.id,
-    description: `Watching: ${watch.label}`,
+    description:
+      watch.status === "awaiting_approval"
+        ? `Waiting for approval: ${watch.label}`
+        : watch.status === "paused"
+          ? `Paused: ${watch.label}`
+          : `Watching: ${watch.label}`,
     kind: "monitor" as const,
   }));
 }

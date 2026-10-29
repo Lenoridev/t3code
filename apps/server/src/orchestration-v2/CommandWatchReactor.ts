@@ -4,6 +4,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Notification,
+  type OrchestrationV2ServerCommand,
   type ThreadCommandWatch,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -12,12 +13,13 @@ import { listLoginShellCandidates } from "@t3tools/shared/shell";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as FiberMap from "effect/FiberMap";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -27,40 +29,60 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
 import {
+  COMMAND_WATCH_BACKLOG_LIMIT_BYTES,
   COMMAND_WATCH_FAILURE_LIMIT,
-  COMMAND_WATCH_LIFETIME_DAYS,
+  COMMAND_WATCH_OUTPUT_LIMIT_BYTES,
   type CommandWatchRun,
-  commandWatchMessage,
-  evaluateCommandWatch,
+  commandWatchPauseNotice,
+  commandWatchRevisionText,
+  commandWatchUpdate,
+  evaluateCommandWatchCheck,
 } from "./commandWatch.ts";
+import * as CommandWatchStore from "./CommandWatchStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import * as ProjectStore from "./ProjectStore.ts";
 
-/** Runs at once across the environment. */
+/** Checks at once across the environment. */
 const CONCURRENT_RUNS = 4;
 const RUN_TIMEOUT_SECONDS = 60;
 /** How often watched threads are looked up while any exist, and when none do. */
 const ACTIVE_SCAN_MS = 30_000;
 const IDLE_SCAN_MS = 5 * 60_000;
-/** Output kept from one run. Anything longer than what a wake can carry ends the watch. */
-const CAPTURE_LIMIT_BYTES = 64 * 1024;
+/** Captured beyond the output limit so an over-long result reads as too long, not as cut. */
+const CAPTURE_LIMIT_BYTES = COMMAND_WATCH_OUTPUT_LIMIT_BYTES * 2;
+/** Storage the agent tool wrote just before starting its watch is not an orphan yet. */
+const ORPHAN_GRACE_MS = 10 * 60_000;
+/** Retry delays grow with failures in a row, up to this many intervals. */
+const MAX_BACKOFF_INTERVALS = 8;
 
-const watchKey = (threadId: ThreadId, watch: ThreadCommandWatch) =>
-  `${threadId} ${watch.id} ${watch.startedAt}`;
+type SyncPatch = Extract<
+  OrchestrationV2ServerCommand,
+  { readonly type: "thread.command-watch.sync" }
+>["patch"];
 
-/** Only an unsettled thread that is not a subagent, in Full access and default mode, runs watches. */
+interface Wake {
+  readonly messageId: MessageId;
+  readonly text: string;
+  readonly notification: OrchestrationV2Notification;
+}
+
+const watchKey = (watch: ThreadCommandWatch) => `${watch.id} ${watch.startedAt}`;
+
+const running = (watch: ThreadCommandWatch) =>
+  watch.status === "baselining" || watch.status === "watching";
+
+/** Only an unsettled thread that is not a subagent runs watches. */
 const mayRun = (
-  thread: Pick<
-    OrchestrationV2AppThread,
-    "lineage" | "settledOverride" | "settledAt" | "runtimeMode" | "interactionMode"
-  >,
+  thread: Pick<OrchestrationV2AppThread, "lineage" | "settledOverride" | "settledAt">,
 ) =>
   thread.lineage.relationshipToParent !== "subagent" &&
   thread.settledOverride !== "settled" &&
-  thread.settledAt === null &&
-  thread.runtimeMode === "full-access" &&
-  thread.interactionMode === "default";
+  thread.settledAt === null;
+
+/** The update message carries the last change it covers, so a restart can tell what it held. */
+const updateMessageId = (watch: ThreadCommandWatch, through: number) =>
+  MessageId.make(`message:command-watch:${watch.id}:${through}`);
+const throughOf = (messageId: string) => Number(messageId.slice(messageId.lastIndexOf(":") + 1));
 
 /**
  * The server's own shell, run non-interactively: the server already loaded the login PATH.
@@ -80,17 +102,17 @@ const resolveShell = Effect.gen(function* () {
 });
 
 /**
- * One watch at a time per thread, and none behind a running turn except a new watch's baseline,
- * so wakes do not pile up. Ending a watch interrupts its run. Due times and failure counts live
- * in memory, so a restart runs each watch at the next look.
+ * Runs each watch's command on its interval, keeps going while the agent is busy, and delivers
+ * detected changes one bounded update at a time. Due times live in memory, so a restart checks
+ * each watch at the next look; everything a check accepted is in storage first.
  */
 export class CommandWatchReactor extends Context.Service<
   CommandWatchReactor,
   {
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
-    /** One look for due watches. Starts their runs without waiting for them. */
+    /** One look for due watches and waiting updates. Starts their work without waiting for it. */
     readonly sweep: Effect.Effect<void>;
-    /** Waits until no run is in flight. */
+    /** Waits until no check is in flight. */
     readonly awaitRuns: Effect.Effect<void>;
   }
 >()("t3/orchestration-v2/CommandWatchReactor") {}
@@ -99,110 +121,145 @@ export class CommandWatchReactor extends Context.Service<
 export const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
-  const projects = yield* ProjectStore.ProjectStoreV2;
+  const store = yield* CommandWatchStore.CommandWatchStore;
   const processes = yield* ProcessRunner.ProcessRunner;
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const permits = yield* Semaphore.make(CONCURRENT_RUNS);
   const shellInvocation = yield* resolveShell;
-  // Keyed by thread: a thread runs one watch at a time.
-  const runs = yield* FiberMap.make<ThreadId, void, never>();
-  /** The watch each thread is running. */
-  const running = new Map<ThreadId, string>();
+  const runs = yield* FiberMap.make<string, void, never>();
   const dueAt = new Map<string, number>();
-  const failures = new Map<string, number>();
   let watchesChanged = true;
   let nextScanAt = 0;
+
+  const sha256 = (text: string) =>
+    crypto.digest("SHA-256", new TextEncoder().encode(text)).pipe(Effect.map(Hex.encode));
 
   const record = Effect.fn("CommandWatchReactor.record")(function* (
     threadId: ThreadId,
     watch: ThreadCommandWatch,
-    next: ThreadCommandWatch | null,
-    wake?: { readonly text: string; readonly notification: OrchestrationV2Notification },
+    patch: SyncPatch,
+    wake?: Wake,
   ) {
-    const uuid = yield* crypto.randomUUIDv4();
+    const suffix = wake === undefined ? yield* crypto.randomUUIDv4() : `update:${wake.messageId}`;
     yield* engine.dispatch({
       type: "thread.command-watch.sync",
-      commandId: CommandId.make(`server:command-watch:${threadId}:${uuid}`),
+      // An update's command id follows its message, so a retry after a crash is not queued twice.
+      commandId: CommandId.make(`server:command-watch:${watch.id}:${suffix}`),
       threadId,
       watchId: watch.id,
       startedAt: watch.startedAt,
-      watch: next,
-      ...(wake === undefined
-        ? {}
-        : { wake: { ...wake, messageId: MessageId.make(`message:command-watch:${uuid}`) } }),
+      patch,
+      ...(wake === undefined ? {} : { wake }),
     });
   });
 
-  // A watch whose thread no longer takes wakes still ends. Any other failure, such as a failed
-  // write, keeps the watch, so the next run reports the same outcome instead of losing it.
-  const end = (
+  /**
+   * Notices when the agent took the queued update, then queues the next one from waiting changes.
+   * Returns the patch and update to record; changes count as delivered once their update starts.
+   */
+  const planDelivery = Effect.fn("CommandWatchReactor.planDelivery")(function* (
     threadId: ThreadId,
     watch: ThreadCommandWatch,
-    wake: { readonly text: string; readonly notification: OrchestrationV2Notification },
-  ) =>
-    record(threadId, watch, null, wake).pipe(
-      Effect.catchTags({
-        OrchestratorDispatchError: (error) =>
-          projections
-            .getThreadsWithCommandWatches(threadId)
-            .pipe(
-              Effect.flatMap(([thread]) =>
-                thread !== undefined && mayRun(thread)
-                  ? Effect.fail(error)
-                  : record(threadId, watch, null),
-              ),
-            ),
-      }),
-    );
+  ) {
+    const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
+    if (watch.pendingMessageId !== undefined) {
+      const { runs: threadRuns } = yield* projections.getThreadRecords(threadId, ["runs"]);
+      const run = threadRuns.find(
+        (candidate) => candidate.userMessageId === watch.pendingMessageId,
+      );
+      if (run !== undefined && (run.status === "queued" || run.status === "preparing")) {
+        return { patch, wake: undefined };
+      }
+      // Started, finished, or removed from the queue by the user: either way it left the queue.
+      yield* store.markDelivered(watch.id, throughOf(watch.pendingMessageId));
+      patch.pendingMessageId = null;
+    }
+    const update = commandWatchUpdate(watch, yield* store.waiting(watch.id));
+    if (update === undefined) {
+      if (watch.waitingChanges !== 0) patch.waitingChanges = 0;
+      return { patch, wake: undefined };
+    }
+    const messageId = updateMessageId(watch, update.through);
+    patch.pendingMessageId = messageId;
+    patch.waitingChanges = update.remaining;
+    return {
+      patch,
+      wake: { messageId, text: update.text, notification: update.notification } satisfies Wake,
+    };
+  });
 
-  const execute = Effect.fn("CommandWatchReactor.execute")(function* (
+  /** Whether the watch's approval still covers what it would run. */
+  const authorized = Effect.fn("CommandWatchReactor.authorized")(function* (
     thread: ProjectionStore.ProjectionThreadCommandWatches,
     watch: ThreadCommandWatch,
+    helpers: ReadonlyArray<CommandWatchStore.CommandWatchHelperFile>,
   ) {
-    const cwd =
-      thread.worktreePath ??
-      (yield* projects
-        .get(thread.projectId)
-        .pipe(
-          Effect.map(Option.match({ onNone: () => null, onSome: (row) => row.workspaceRoot })),
-        ));
-    if (cwd === null || !(yield* fileSystem.exists(cwd).pipe(Effect.orElseSucceed(() => false)))) {
-      return { kind: "failed", reason: "could not run: its working directory is missing" } as const;
+    if (watch.authority === null) return false;
+    if (watch.authority.kind === "full-access") return thread.runtimeMode === "full-access";
+    const helperHashes = yield* Effect.forEach(helpers, (helper) =>
+      sha256(helper.content).pipe(Effect.map((sha) => ({ path: helper.path, sha256: sha }))),
+    );
+    const stored = yield* sha256(
+      commandWatchRevisionText({
+        command: watch.command,
+        format: watch.format,
+        cwd: watch.cwd,
+        helpers: helperHashes,
+      }),
+    );
+    return stored === watch.revisionHash && watch.authority.revisionHash === watch.revisionHash;
+  });
+
+  const execute = Effect.fn("CommandWatchReactor.execute")(function* (
+    watch: ThreadCommandWatch,
+    helpers: ReadonlyArray<CommandWatchStore.CommandWatchHelperFile>,
+  ) {
+    if (!(yield* fileSystem.exists(watch.cwd).pipe(Effect.orElseSucceed(() => false)))) {
+      return {
+        kind: "failed",
+        reason: "could not run: its working directory is missing",
+      } satisfies CommandWatchRun;
     }
+    // The stored helper copies, so editing the workspace files cannot change what runs.
+    const helperDirectory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-watch-" });
+    yield* Effect.forEach(
+      helpers,
+      (helper) =>
+        Effect.gen(function* () {
+          const target = path.join(helperDirectory, helper.path);
+          yield* fileSystem.makeDirectory(path.dirname(target), { recursive: true });
+          yield* fileSystem.writeFileString(target, helper.content);
+          yield* fileSystem.chmod(target, 0o700);
+        }),
+      { discard: true },
+    );
     const shell = shellInvocation(watch.command);
     return yield* processes
       .run({
         command: shell.command,
         args: shell.args,
-        cwd,
+        cwd: watch.cwd,
+        env: { T3_WATCH_HELPERS: helperDirectory },
         timeout: `${RUN_TIMEOUT_SECONDS} seconds`,
         timeoutBehavior: "timedOutResult",
         maxOutputBytes: CAPTURE_LIMIT_BYTES,
         outputMode: "truncate",
       })
       .pipe(
-        Effect.flatMap((output) =>
+        Effect.map((output): CommandWatchRun =>
           output.timedOut
-            ? Effect.succeed<CommandWatchRun>({
-                kind: "failed",
-                reason: `timed out after ${RUN_TIMEOUT_SECONDS} seconds`,
-              })
+            ? { kind: "failed", reason: `timed out after ${RUN_TIMEOUT_SECONDS} seconds` }
             : output.code === null
-              ? Effect.succeed<CommandWatchRun>({
-                  kind: "failed",
-                  reason: "was stopped by a signal",
-                })
-              : crypto.digest("SHA-256", new TextEncoder().encode(output.stdout.trim())).pipe(
-                  Effect.map((digest): CommandWatchRun => ({
-                    kind: "exited",
-                    code: output.code ?? 0,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    stdoutHash: Hex.encode(digest),
-                    stdoutTruncated: output.stdoutTruncated,
-                  })),
-                ),
+              ? { kind: "failed", reason: "was stopped by a signal" }
+              : {
+                  kind: "exited",
+                  code: output.code,
+                  stdout: output.stdout,
+                  stderr: output.stderr,
+                  stdoutTruncated: output.stdoutTruncated,
+                },
         ),
         Effect.catch((error) =>
           Effect.succeed<CommandWatchRun>({
@@ -211,145 +268,196 @@ export const make = Effect.gen(function* () {
           }),
         ),
       );
+  }, Effect.scoped);
+
+  /** One check: run, compare, store what was accepted, then record and deliver in one command. */
+  const check = Effect.fn("CommandWatchReactor.check")(function* (
+    thread: ProjectionStore.ProjectionThreadCommandWatches,
+    watch: ThreadCommandWatch,
+  ) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    let storage = yield* store.get(watch.id);
+    if (storage === undefined) {
+      yield* store.create({ watchId: watch.id, threadId: thread.id, helpers: [], now });
+      storage = { helpers: [], observation: null, deliveredThrough: 0 };
+    }
+    if (!(yield* authorized(thread, watch, storage.helpers))) {
+      // A changed definition or helper never runs under an approval given for another one.
+      yield* record(thread.id, watch, { status: "awaiting_approval" });
+      return;
+    }
+    const outcome = evaluateCommandWatchCheck({
+      format: watch.format,
+      previous: storage.observation,
+      reportInitialState: watch.reportInitialState,
+      run: yield* execute(watch, storage.helpers),
+    });
+    const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
+    let failures = 0;
+    if (outcome.kind === "failed") {
+      const collectionFailures = outcome.stage === "collection" ? watch.collectionFailures + 1 : 0;
+      const comparisonFailures =
+        outcome.stage === "comparison" ? watch.comparisonFailures + 1 : watch.comparisonFailures;
+      failures = Math.max(collectionFailures, comparisonFailures);
+      patch.collectionFailures = collectionFailures;
+      patch.comparisonFailures = comparisonFailures;
+      patch.lastFailure = outcome.reason;
+      if (failures >= COMMAND_WATCH_FAILURE_LIMIT) {
+        yield* store.note({
+          watchId: watch.id,
+          change: commandWatchPauseNotice("failures", outcome.reason, now),
+          now,
+        });
+        patch.status = "paused";
+        patch.pauseReason = "failures";
+      }
+    } else {
+      if (outcome.kind === "accepted") {
+        yield* store.accept({
+          watchId: watch.id,
+          observation: outcome.observation,
+          changes: outcome.changes,
+          now,
+        });
+        if (outcome.changes.length > 0) patch.lastChangeAt = now;
+        if ((yield* store.waitingBytes(watch.id)) > COMMAND_WATCH_BACKLOG_LIMIT_BYTES) {
+          yield* store.note({
+            watchId: watch.id,
+            change: commandWatchPauseNotice("storage-limit", "", now),
+            now,
+          });
+          patch.status = "paused";
+          patch.pauseReason = "storage-limit";
+        }
+      }
+      if (patch.status === undefined && watch.status !== "watching") patch.status = "watching";
+      if (watch.collectionFailures !== 0) patch.collectionFailures = 0;
+      if (watch.comparisonFailures !== 0) patch.comparisonFailures = 0;
+      if (watch.lastFailure !== undefined) patch.lastFailure = null;
+    }
+    const delivery = yield* planDelivery(thread.id, watch);
+    const merged = { ...patch, ...delivery.patch };
+    if (Object.keys(merged).length > 0 || delivery.wake !== undefined) {
+      yield* record(thread.id, watch, merged, delivery.wake);
+    }
+    return failures;
   });
 
-  const runWatch = Effect.fn("CommandWatchReactor.runWatch")(function* (
-    threadId: ThreadId,
-    watchId: string,
+  const deliverOnly = Effect.fn("CommandWatchReactor.deliverOnly")(function* (
+    thread: ProjectionStore.ProjectionThreadCommandWatches,
+    watch: ThreadCommandWatch,
   ) {
-    // The look that chose this watch may be stale by the time a permit frees up.
-    const [thread] = yield* projections.getThreadsWithCommandWatches(threadId);
-    const watch = thread?.commandWatches.find((candidate) => candidate.id === watchId);
-    if (thread === undefined || watch === undefined || !mayRun(thread)) return;
-    const key = watchKey(threadId, watch);
-    // A baseline run wakes nobody, so it does not wait for the turn that started the watch.
-    if (thread.busy && watch.lastOutputHash !== null) {
-      // A turn started meanwhile: look again once it is done instead of a full interval later.
-      dueAt.delete(key);
-      return;
+    const delivery = yield* planDelivery(thread.id, watch);
+    if (Object.keys(delivery.patch).length > 0 || delivery.wake !== undefined) {
+      yield* record(thread.id, watch, delivery.patch, delivery.wake);
     }
-    const outcome = evaluateCommandWatch(watch, yield* execute(thread, watch));
-    if (outcome.kind === "quiet") {
-      failures.delete(key);
-      return;
-    }
-    if (outcome.kind === "failed") {
-      const count = (failures.get(key) ?? 0) + 1;
-      if (count < COMMAND_WATCH_FAILURE_LIMIT) {
-        failures.set(key, count);
-        return;
-      }
-      yield* end(threadId, watch, commandWatchMessage(watch, outcome));
-      failures.delete(key);
-      return;
-    }
-    failures.delete(key);
-    if (outcome.kind === "baseline") return yield* record(threadId, watch, outcome.next);
-    if (outcome.kind === "too-long") {
-      return yield* end(threadId, watch, commandWatchMessage(watch, outcome));
-    }
-    const wake = commandWatchMessage(watch, outcome);
-    return yield* outcome.exhausted
-      ? end(threadId, watch, wake)
-      : record(threadId, watch, outcome.next, wake);
   });
+
+  const removeOrphans = Effect.fn("CommandWatchReactor.removeOrphans")(function* (
+    present: ReadonlySet<string>,
+    now: number,
+  ) {
+    const ids = yield* store.watchIds;
+    for (const id of ids) {
+      if (present.has(id)) continue;
+      const storage = yield* store.get(id);
+      if (storage === undefined) continue;
+      if (!orphanSeenAt.has(id)) {
+        orphanSeenAt.set(id, now);
+        continue;
+      }
+      if (now - orphanSeenAt.get(id)! < ORPHAN_GRACE_MS) continue;
+      orphanSeenAt.delete(id);
+      yield* store.remove(id);
+    }
+  });
+  const orphanSeenAt = new Map<string, number>();
 
   const sweep = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
-    // The scheduler ticks every few seconds and the scan reads every thread row, so it runs only
-    // when a watch changed or a backstop passed: often while watches exist, rarely when none do.
+    // The scheduler ticks every few seconds and the scan reads every watched thread, so it runs
+    // only when a watch or run changed or a backstop passed.
     if (!watchesChanged && now < nextScanAt) return;
     watchesChanged = false;
     const threads = yield* projections.getThreadsWithCommandWatches();
     nextScanAt = now + (threads.length > 0 ? ACTIVE_SCAN_MS : IDLE_SCAN_MS);
-    const present = new Set(
-      threads.flatMap((thread) => thread.commandWatches.map((watch) => watchKey(thread.id, watch))),
+    const present = new Set(threads.flatMap((thread) => thread.commandWatches.map((w) => w.id)));
+    const presentKeys = new Set(threads.flatMap((thread) => thread.commandWatches.map(watchKey)));
+    for (const key of dueAt.keys()) if (!presentKeys.has(key)) dueAt.delete(key);
+    yield* removeOrphans(present, now).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("command watch cleanup failed", { cause })),
     );
-    for (const cache of [dueAt, failures]) {
-      for (const key of cache.keys()) if (!present.has(key)) cache.delete(key);
-    }
-    // A run whose watch ended while the event stream was not listening stops here.
-    for (const [threadId, key] of running) {
-      if (!present.has(key)) yield* FiberMap.remove(runs, threadId);
-    }
     for (const thread of threads) {
-      if (!mayRun(thread)) {
-        // The orchestrator ends these on the transition; a watch left from before that ends here.
-        yield* Effect.forEach(
-          thread.commandWatches,
-          (watch) => record(thread.id, watch, null).pipe(Effect.ignore),
-          { discard: true },
+      if (!mayRun(thread)) continue;
+      for (const watch of thread.commandWatches) {
+        const key = watchKey(watch);
+        if (yield* FiberMap.has(runs, key)) continue;
+        const due = running(watch) && (dueAt.get(key) ?? 0) <= now;
+        const delivering = watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
+        if (!due && !delivering) continue;
+        const work = due
+          ? permits
+              .withPermits(1)(check(thread, watch))
+              .pipe(
+                Effect.tap((failures) =>
+                  Clock.currentTimeMillis.pipe(
+                    Effect.map((finished) => {
+                      // The interval starts when a check ends, so checks of one watch never overlap.
+                      const intervals =
+                        failures === undefined || failures === 0
+                          ? 1
+                          : Math.min(2 ** (failures - 1), MAX_BACKOFF_INTERVALS);
+                      dueAt.set(key, finished + watch.everyMinutes * 60_000 * intervals);
+                    }),
+                  ),
+                ),
+              )
+          : deliverOnly(thread, watch);
+        if (due) dueAt.set(key, Number.POSITIVE_INFINITY);
+        yield* FiberMap.run(
+          runs,
+          key,
+          work.pipe(
+            Effect.asVoid,
+            Effect.catchCause((cause) =>
+              Effect.logWarning("command watch check failed", {
+                threadId: thread.id,
+                watchId: watch.id,
+                cause,
+              }).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    if (due) dueAt.set(key, now + watch.everyMinutes * 60_000);
+                  }),
+                ),
+              ),
+            ),
+          ),
         );
-        continue;
       }
-      const lifetimeStart = now - COMMAND_WATCH_LIFETIME_DAYS * 24 * 60 * 60_000;
-      const expired = thread.commandWatches.filter(
-        (candidate) => Date.parse(candidate.startedAt) <= lifetimeStart,
-      );
-      yield* Effect.forEach(
-        expired,
-        (watch) =>
-          end(thread.id, watch, commandWatchMessage(watch, { kind: "expired" })).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("command watch expiry failed", { threadId: thread.id, cause }),
-            ),
-          ),
-        { discard: true },
-      );
-      if (expired.length > 0 || running.has(thread.id)) continue;
-      // The most overdue first, so a slow watch cannot keep the thread's others from running.
-      // While a turn runs, only a watch still taking its baseline may run.
-      const watch = thread.commandWatches
-        .filter(
-          (candidate) =>
-            (!thread.busy || candidate.lastOutputHash === null) &&
-            (dueAt.get(watchKey(thread.id, candidate)) ?? 0) <= now,
-        )
-        .toSorted(
-          (left, right) =>
-            (dueAt.get(watchKey(thread.id, left)) ?? 0) -
-            (dueAt.get(watchKey(thread.id, right)) ?? 0),
-        )[0];
-      if (watch === undefined) continue;
-      const key = watchKey(thread.id, watch);
-      dueAt.set(key, now + watch.everyMinutes * 60_000);
-      running.set(thread.id, key);
-      yield* FiberMap.run(
-        runs,
-        thread.id,
-        permits
-          .withPermits(1)(runWatch(thread.id, watch.id))
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("command watch run failed", { threadId: thread.id, cause }),
-            ),
-            Effect.ensuring(
-              Effect.sync(() => {
-                if (running.get(thread.id) === key) running.delete(thread.id);
-              }),
-            ),
-          ),
-      );
     }
   }).pipe(
     Effect.catchCause((cause) => Effect.logWarning("command watch sweep failed", { cause })),
     Effect.withSpan("CommandWatchReactor.sweep"),
   );
 
-  /** Interrupts a thread's run as soon as an event shows its watch can no longer run. */
+  /** Looks again soon after a watch or run changes, and stops a check whose watch ended. */
   const onEvent = (event: OrchestrationV2DomainEvent) =>
     Effect.suspend(() => {
-      if (event.type === "thread.command-watches-updated") watchesChanged = true;
-      const key = running.get(event.threadId);
-      if (key === undefined) return Effect.void;
-      if (event.type === "thread.deleted") return FiberMap.remove(runs, event.threadId);
-      if (!("payload" in event) || !isAppThread(event)) return Effect.void;
-      const thread = event.payload;
-      const stillOn =
-        thread.archivedAt === null &&
-        mayRun(thread) &&
-        (thread.commandWatches ?? []).some((watch) => watchKey(thread.id, watch) === key);
-      return stillOn ? Effect.void : FiberMap.remove(runs, event.threadId);
+      if (
+        event.type === "thread.command-watches-updated" ||
+        event.type === "run.created" ||
+        event.type === "run.updated"
+      ) {
+        watchesChanged = true;
+      }
+      if (event.type !== "thread.command-watches-updated") return Effect.void;
+      const live = new Set((event.payload.commandWatches ?? []).map(watchKey));
+      return Effect.forEach(
+        [...dueAt.keys()].filter((key) => !live.has(key) && key.startsWith("command-watch:")),
+        (key) => FiberMap.remove(runs, key),
+        { discard: true },
+      );
     });
 
   const start: CommandWatchReactor["Service"]["start"] = Effect.fn("CommandWatchReactor.start")(
@@ -373,23 +481,6 @@ export const make = Effect.gen(function* () {
     awaitRuns: FiberMap.awaitEmpty(runs).pipe(Effect.ignore),
   } satisfies CommandWatchReactor["Service"];
 });
-
-/** Full-thread events carry the thread as it is after the change. */
-function isAppThread(
-  event: OrchestrationV2DomainEvent,
-): event is Extract<OrchestrationV2DomainEvent, { readonly payload: OrchestrationV2AppThread }> {
-  switch (event.type) {
-    case "thread.archived":
-    case "thread.settled":
-    case "thread.pull-request-synced":
-    case "thread.command-watches-updated":
-    case "thread.runtime-mode-updated":
-    case "thread.interaction-mode-updated":
-      return true;
-    default:
-      return false;
-  }
-}
 
 export const layer = Layer.effect(CommandWatchReactor, make);
 

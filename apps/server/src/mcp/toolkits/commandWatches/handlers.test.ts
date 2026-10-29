@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import {
   EnvironmentId,
   type OrchestrationV2ServerCommand,
@@ -6,6 +7,11 @@ import {
   type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -14,7 +20,10 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import type { Tool } from "effect/ai";
 
+import type * as CommandWatchStore from "../../../orchestration-v2/CommandWatchStore.ts";
+import { CommandWatchStore as CommandWatchStoreService } from "../../../orchestration-v2/CommandWatchStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -23,6 +32,8 @@ import * as CommandWatchesHandlers from "./handlers.ts";
 import { CommandWatchesToolkit } from "./tools.ts";
 
 const THREAD_ID = ThreadId.make("thread:command-watch-mcp");
+const WORKSPACE = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-watch-mcp-"));
+NodeFS.writeFileSync(NodePath.join(WORKSPACE, "check.sh"), "echo checked\n");
 
 const testCrypto = Crypto.make({
   randomBytes: (size) => new Uint8Array(size).fill(7),
@@ -50,11 +61,15 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
   } = {},
 ) {
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
+  const stored = yield* Ref.make<
+    ReadonlyArray<ReadonlyArray<CommandWatchStore.CommandWatchHelperFile>>
+  >([]);
   const shell = {
     ...McpToolAccessTestkit.liveThreadShell(
       THREAD_ID,
       options.runtimeMode === undefined ? {} : { runtimeMode: options.runtimeMode },
     ),
+    worktreePath: WORKSPACE,
     ...(options.subagent === true
       ? {
           lineage: {
@@ -91,6 +106,11 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
             ),
     }),
     Layer.succeed(Crypto.Crypto, testCrypto),
+    Layer.mock(CommandWatchStoreService)({
+      create: ({ helpers }) => Ref.update(stored, (recorded) => [...recorded, helpers]),
+    }),
+    Layer.mock(ProjectService.ProjectService)({}),
+    NodeServices.layer,
   );
   const toolkit = yield* CommandWatchesToolkit.pipe(
     Effect.provide(
@@ -113,36 +133,56 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
       Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       Effect.provide(layerDependencies),
     );
-  return { commands, call };
+  return { commands, stored, call };
 });
 
 describe("command watch toolkit handlers", () => {
-  it.effect("starts a watch for the calling run with the default interval", () =>
+  it.effect("starts a watch in the thread's workspace and stores its helpers first", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      yield* harness.call("watch_command", { command: "gh api", label: "Reply" });
+      yield* harness.call("watch_command", {
+        command: 'sh "$T3_WATCH_HELPERS/check.sh"',
+        label: "Reply",
+        helpers: ["check.sh"],
+      });
+      expect(yield* Ref.get(harness.stored)).toEqual([
+        [{ path: "check.sh", content: "echo checked\n" }],
+      ]);
       expect(yield* Ref.get(harness.commands)).toMatchObject([
         {
           type: "thread.command-watch.start",
           threadId: THREAD_ID,
           callerRunId: RunId.make("run:mcp-test"),
-          command: "gh api",
           label: "Reply",
           everyMinutes: 10,
+          format: "text",
+          cwd: WORKSPACE,
+          helpers: [{ path: "check.sh" }],
+          reportInitialState: false,
         },
       ]);
     }),
   );
 
-  it.effect("refuses outside Full access, for a subagent, and for an outside client", () =>
+  it.effect("leaves approval to the server outside Full access", () =>
     Effect.gen(function* () {
       const supervised = yield* makeHarness({ runtimeMode: "approval-required" });
+      yield* supervised.call("watch_command", { command: "gh api", label: "Reply" });
+      expect(yield* Ref.get(supervised.commands)).toMatchObject([
+        { type: "thread.command-watch.start" },
+      ]);
+    }),
+  );
+
+  it.effect("refuses a helper outside the workspace, a subagent, and an outside client", () =>
+    Effect.gen(function* () {
+      const escaping = yield* makeHarness();
       expect(
-        yield* supervised
-          .call("watch_command", { command: "gh api", label: "Reply" })
+        yield* escaping
+          .call("watch_command", { command: "gh api", label: "Reply", helpers: ["../x.sh"] })
           .pipe(Effect.flip),
-      ).toMatchObject({ _tag: "OrchestratorMcpFailure", code: "capability_denied" });
-      expect(yield* Ref.get(supervised.commands)).toEqual([]);
+      ).toMatchObject({ _tag: "CommandWatchFailedError" });
+      expect(yield* Ref.get(escaping.commands)).toEqual([]);
 
       const subagent = yield* makeHarness({ subagent: true });
       expect(

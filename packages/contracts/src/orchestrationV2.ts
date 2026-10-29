@@ -68,7 +68,10 @@ import {
   ThreadCommandWatch,
   ThreadCommandWatchCommand,
   ThreadCommandWatchEveryMinutes,
+  ThreadCommandWatchFormat,
+  ThreadCommandWatchHelper,
   ThreadCommandWatchLabel,
+  ThreadCommandWatchPauseReason,
 } from "./threadCommandWatch.ts";
 import {
   ProviderApprovalDecision,
@@ -3052,12 +3055,31 @@ export const OrchestrationV2Command = Schema.Union([
       }),
     ),
   }),
-  /** Stop one command watch, or every command watch on the thread when `watchId` is omitted. */
+  /**
+   * Stop one command watch, or every command watch on the thread when `watchId` is omitted. A
+   * stopped watch delivers nothing more: an update it queued that has not started is cancelled.
+   */
   Schema.Struct({
     type: Schema.Literal("thread.command-watch.stop"),
     commandId: CommandId,
     threadId: ThreadId,
     watchId: Schema.optional(TrimmedNonEmptyString),
+  }),
+  /** The user's decision on a watch waiting for approval. Denying ends it. */
+  Schema.Struct({
+    type: Schema.Literal("thread.command-watch.approve"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    watchId: TrimmedNonEmptyString,
+    revisionHash: TrimmedNonEmptyString,
+    approve: Schema.Boolean,
+  }),
+  /** Resumes a paused watch from its last accepted observation. */
+  Schema.Struct({
+    type: Schema.Literal("thread.command-watch.resume"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    watchId: TrimmedNonEmptyString,
   }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request.sync"),
@@ -3364,7 +3386,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
   }),
   /**
    * Starts a command watch for the agent run `callerRunId`. Internal so only the MCP service,
-   * after checking the caller, can make the server run a shell command on an interval.
+   * after checking the caller and storing the helpers, can make the server run a shell command
+   * on an interval. The orchestrator decides whether it may run or waits for approval.
    */
   Schema.Struct({
     type: Schema.Literal("thread.command-watch.start"),
@@ -3375,10 +3398,18 @@ const OrchestrationV2InternalCommand = Schema.Union([
     command: ThreadCommandWatchCommand,
     label: ThreadCommandWatchLabel,
     everyMinutes: ThreadCommandWatchEveryMinutes,
+    format: ThreadCommandWatchFormat,
+    helpers: Schema.Array(ThreadCommandWatchHelper),
+    reportInitialState: Schema.Boolean,
+    cwd: TrimmedNonEmptyString,
+    revisionHash: TrimmedNonEmptyString,
+    replacesWatchId: Schema.optional(TrimmedNonEmptyString),
   }),
   /**
-   * Records what a command watch run saw, and wakes the agent in the same transaction when
-   * `wake` is set. Rejected once the watch started at `startedAt` has ended.
+   * Records what the watch worker owns about a watch, and queues an update to the agent in the
+   * same transaction when `wake` is set. Rejected once the watch started at `startedAt` has
+   * ended. A status change applies only while the watch is running, so it cannot undo a pause
+   * for approval that landed during the check.
    */
   Schema.Struct({
     type: Schema.Literal("thread.command-watch.sync"),
@@ -3386,8 +3417,17 @@ const OrchestrationV2InternalCommand = Schema.Union([
     threadId: ThreadId,
     watchId: TrimmedNonEmptyString,
     startedAt: IsoDateTime,
-    /** The watch to record, or null to end it. */
-    watch: Schema.NullOr(ThreadCommandWatch),
+    patch: Schema.Struct({
+      /** `awaiting_approval` also drops the watch's authority. */
+      status: Schema.optional(Schema.Literals(["watching", "paused", "awaiting_approval"])),
+      pauseReason: Schema.optional(ThreadCommandWatchPauseReason),
+      collectionFailures: Schema.optional(NonNegativeInt),
+      comparisonFailures: Schema.optional(NonNegativeInt),
+      lastFailure: Schema.optional(Schema.NullOr(Schema.String)),
+      waitingChanges: Schema.optional(NonNegativeInt),
+      pendingMessageId: Schema.optional(Schema.NullOr(MessageId)),
+      lastChangeAt: Schema.optional(IsoDateTime),
+    }),
     wake: Schema.optional(
       Schema.Struct({
         messageId: MessageId,

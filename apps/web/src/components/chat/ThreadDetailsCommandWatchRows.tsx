@@ -5,13 +5,14 @@ import {
   type ThreadCommandWatch,
   type ThreadId,
 } from "@t3tools/contracts";
-import { EyeOffIcon, TerminalIcon } from "lucide-react";
+import { EyeOffIcon, PlayIcon, TerminalIcon } from "lucide-react";
 
 import { cn } from "../../lib/utils";
 import { useEnvironmentScope } from "../../state/session";
 import { useThreadProjection } from "../../state/entities";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
@@ -27,9 +28,29 @@ const intervalLabel = (everyMinutes: number) =>
     ? `every ${everyMinutes / 60 === 1 ? "hour" : `${everyMinutes / 60} hours`}`
     : `every ${everyMinutes === 1 ? "minute" : `${everyMinutes} min`}`;
 
+function statusLabel(watch: ThreadCommandWatch): string {
+  switch (watch.status) {
+    case "awaiting_approval":
+      return "Needs your approval";
+    case "baselining":
+      return "Starting";
+    case "paused":
+      return watch.pauseReason === "storage-limit"
+        ? "Paused: too many changes waiting"
+        : `Paused: ${watch.lastFailure ?? "the command kept failing"}`;
+    case "watching":
+      return watch.waitingChanges > 0
+        ? `Watching, ${watch.waitingChanges} ${watch.waitingChanges === 1 ? "change" : "changes"} waiting`
+        : watch.lastFailure === undefined
+          ? "Watching"
+          : `Watching, last check ${watch.lastFailure}`;
+  }
+}
+
 /**
  * Thread details section listing the commands the server runs for this thread's agent
- * (`watch_command`), each with a way to stop it. Renders nothing without watches.
+ * (`watch_command`), each with its way out: approve or deny, resume, and stop.
+ * Renders nothing without watches.
  */
 export function ThreadDetailsCommandWatchRows(props: {
   readonly environmentId: EnvironmentId;
@@ -38,8 +59,21 @@ export function ThreadDetailsCommandWatchRows(props: {
   const projection = useThreadProjection(scopeThreadRef(props.environmentId, props.threadId));
   const watches = projection?.projection.thread.commandWatches ?? EMPTY_WATCHES;
   const stop = useAtomCommand(threadEnvironment.stopCommandWatch, { reportFailure: true });
+  const approve = useAtomCommand(threadEnvironment.approveCommandWatch, { reportFailure: true });
+  const resume = useAtomCommand(threadEnvironment.resumeCommandWatch, { reportFailure: true });
   const canOperateThread = useEnvironmentScope(props.environmentId, AuthOrchestrationOperateScope);
   if (watches.length === 0) return null;
+
+  const decide = (watch: ThreadCommandWatch, allow: boolean) =>
+    void approve({
+      environmentId: props.environmentId,
+      input: {
+        threadId: props.threadId,
+        watchId: watch.id,
+        revisionHash: watch.revisionHash,
+        approve: allow,
+      },
+    });
 
   return (
     <ThreadDetailsSection headingId="thread-details-command-watches-heading" title="Watching">
@@ -47,52 +81,131 @@ export function ThreadDetailsCommandWatchRows(props: {
         {watches.map((watch) => (
           <li
             key={watch.id}
-            className={cn(
-              "flex items-center rounded-lg py-1.5",
-              THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
-            )}
+            className={cn("rounded-lg py-1.5", THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS)}
           >
-            <TerminalIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} />
-            <div className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-medium text-foreground/80">
-                {watch.label}
-              </span>
+            <div className="flex items-center">
+              <TerminalIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+              <div className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-foreground/80">
+                  {watch.label}
+                </span>
+                <p
+                  className={cn(
+                    "truncate text-2xs",
+                    watch.status === "awaiting_approval" || watch.status === "paused"
+                      ? "text-warning-foreground"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {statusLabel(watch)}
+                </p>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <p className="truncate font-mono text-2xs text-muted-foreground">
+                        {intervalLabel(watch.everyMinutes)} · {watch.command}
+                      </p>
+                    }
+                  />
+                  <TooltipPopup>{watch.command}</TooltipPopup>
+                </Tooltip>
+              </div>
+              {watch.status === "paused" ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ThreadDetailsControl
+                        size="icon-xs"
+                        variant="ghost"
+                        part="icon"
+                        aria-label={`Resume watching ${watch.label}`}
+                        disabled={!canOperateThread}
+                        onClick={() =>
+                          void resume({
+                            environmentId: props.environmentId,
+                            input: { threadId: props.threadId, watchId: watch.id },
+                          })
+                        }
+                      >
+                        <PlayIcon className="size-3.5" />
+                      </ThreadDetailsControl>
+                    }
+                  />
+                  <TooltipPopup>Resume watching</TooltipPopup>
+                </Tooltip>
+              ) : null}
               <Tooltip>
                 <TooltipTrigger
                   render={
-                    <p className="truncate font-mono text-2xs text-muted-foreground">
-                      {intervalLabel(watch.everyMinutes)} · {watch.command}
-                    </p>
+                    <ThreadDetailsControl
+                      size="icon-xs"
+                      variant="ghost"
+                      part="icon"
+                      aria-label={`Stop watching ${watch.label}`}
+                      disabled={!canOperateThread}
+                      onClick={() =>
+                        void stop({
+                          environmentId: props.environmentId,
+                          input: { threadId: props.threadId, watchId: watch.id },
+                        })
+                      }
+                    >
+                      <EyeOffIcon className="size-3.5" />
+                    </ThreadDetailsControl>
                   }
                 />
-                <TooltipPopup>{watch.command}</TooltipPopup>
+                <TooltipPopup>Stop watching</TooltipPopup>
               </Tooltip>
             </div>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <ThreadDetailsControl
-                    size="icon-xs"
-                    variant="ghost"
-                    part="icon"
-                    aria-label={`Stop watching ${watch.label}`}
-                    disabled={!canOperateThread}
-                    onClick={() =>
-                      void stop({
-                        environmentId: props.environmentId,
-                        input: { threadId: props.threadId, watchId: watch.id },
-                      })
-                    }
-                  >
-                    <EyeOffIcon className="size-3.5" />
-                  </ThreadDetailsControl>
-                }
+            {watch.status === "awaiting_approval" ? (
+              <CommandWatchApproval
+                watch={watch}
+                disabled={!canOperateThread}
+                onDecide={(allow) => decide(watch, allow)}
               />
-              <TooltipPopup>Stop watching</TooltipPopup>
-            </Tooltip>
+            ) : null}
           </li>
         ))}
       </ul>
     </ThreadDetailsSection>
+  );
+}
+
+function CommandWatchApproval(props: {
+  readonly watch: ThreadCommandWatch;
+  readonly disabled: boolean;
+  readonly onDecide: (allow: boolean) => void;
+}) {
+  const { watch } = props;
+  return (
+    <div className="mt-1.5 flex flex-col gap-1.5 text-2xs text-muted-foreground">
+      <p>
+        This command runs {intervalLabel(watch.everyMinutes)} outside the agent's sandbox, with the
+        T3 server's account permissions, until the watch is stopped.
+      </p>
+      <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-1.5 font-mono text-foreground/80">
+        {watch.command}
+      </pre>
+      <p className="truncate font-mono">in {watch.cwd}</p>
+      {watch.helpers.length > 0 ? (
+        <p>Runs stored copies of {watch.helpers.map((helper) => helper.path).join(", ")}.</p>
+      ) : null}
+      {watch.replacesWatchId === undefined ? null : (
+        <p>Replaces a running watch, which keeps running until you decide.</p>
+      )}
+      <div className="flex gap-1.5">
+        <Button size="xs" disabled={props.disabled} onClick={() => props.onDecide(true)}>
+          Allow this watch
+        </Button>
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={props.disabled}
+          onClick={() => props.onDecide(false)}
+        >
+          Deny
+        </Button>
+      </div>
+    </div>
   );
 }

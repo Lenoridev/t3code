@@ -434,8 +434,12 @@ describe("derivePendingBackgroundWork kinds", () => {
       ]);
     });
 
-    it("lists command watches as monitors, only when passed", () => {
-      const commandWatches = [{ id: "command-watch:1", label: "Maintainer reply" }];
+    it("lists command watches as monitors with their status, only when passed", () => {
+      const commandWatches = [
+        { id: "command-watch:1", label: "Maintainer reply", status: "watching" as const },
+        { id: "command-watch:2", label: "Deploy", status: "awaiting_approval" as const },
+        { id: "command-watch:3", label: "Release", status: "paused" as const },
+      ];
       const tasks = derivePendingBackgroundWork({
         latestRun: null,
         providerThreads: [],
@@ -444,6 +448,8 @@ describe("derivePendingBackgroundWork kinds", () => {
       });
       expect(tasks).toEqual([
         { taskId: "command-watch:1", description: "Watching: Maintainer reply", kind: "monitor" },
+        { taskId: "command-watch:2", description: "Waiting for approval: Deploy", kind: "monitor" },
+        { taskId: "command-watch:3", description: "Paused: Release", kind: "monitor" },
       ]);
       expect(
         derivePendingBackgroundWork({
