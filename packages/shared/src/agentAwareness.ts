@@ -6,7 +6,10 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { backgroundWorkHoldsCompletion } from "./orchestrationV2PendingBackgroundWork.ts";
+import {
+  backgroundWorkBlockedOn,
+  backgroundWorkHoldsCompletion,
+} from "./orchestrationV2PendingBackgroundWork.ts";
 
 export type AgentAwarenessPhase =
   | "starting"
@@ -106,9 +109,10 @@ function resolveThreadAwarenessPhaseV2(
     return "waiting_for_input";
   }
   if (
-    thread.pendingRuntimeRequest !== null &&
-    thread.pendingRuntimeRequest.kind !== "user_input" &&
-    thread.pendingRuntimeRequest.kind !== "auth_refresh"
+    (thread.pendingRuntimeRequest !== null &&
+      thread.pendingRuntimeRequest.kind !== "user_input" &&
+      thread.pendingRuntimeRequest.kind !== "auth_refresh") ||
+    backgroundWorkBlockedOn(thread.pendingBackgroundTasks ?? [], "approval")
   ) {
     return "waiting_for_approval";
   }

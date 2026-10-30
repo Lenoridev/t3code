@@ -1,4 +1,7 @@
-import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import {
+  backgroundWorkBlockedOn,
+  backgroundWorkHoldsCompletion,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { threadPullRequestsOf } from "../threadPullRequests.ts";
 import type {
   ThreadLinkedPullRequest,
@@ -312,9 +315,10 @@ export function presentThreadShell(
       ? {}
       : { latestUserAuthoredMessageAt: nullableIso(thread.latestUserAuthoredMessageAt) }),
     hasPendingApprovals:
-      thread.pendingRuntimeRequest !== null &&
-      thread.pendingRuntimeRequest.kind !== "user_input" &&
-      thread.pendingRuntimeRequest.kind !== "auth_refresh",
+      (thread.pendingRuntimeRequest !== null &&
+        thread.pendingRuntimeRequest.kind !== "user_input" &&
+        thread.pendingRuntimeRequest.kind !== "auth_refresh") ||
+      backgroundWorkBlockedOn(thread.pendingBackgroundTasks ?? [], "approval"),
     hasPendingUserInput:
       thread.pendingRuntimeRequest?.kind === "user_input" &&
       (thread.pendingRuntimeRequest.blocking !== false || !runtimeIsWorking),

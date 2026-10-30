@@ -140,6 +140,16 @@ describe("resolveThreadListV2Status", () => {
     { roster: "dev server", task: { kind: "command" }, status: "ready" },
     { roster: "dev server watchdog", task: { kind: "monitor" }, status: "ready" },
     { roster: "awaited command", task: { kind: "command", awaited: true }, status: "waiting" },
+    {
+      roster: "paused watch",
+      task: { kind: "monitor", awaited: true, blockedOn: "resume" },
+      status: "paused",
+    },
+    {
+      roster: "watch waiting for approval",
+      task: { kind: "monitor", awaited: true, blockedOn: "approval" },
+      status: "approval",
+    },
   ] as const)(
     "presents an unseen completion with a $roster roster as $status",
     ({ task, status }) => {

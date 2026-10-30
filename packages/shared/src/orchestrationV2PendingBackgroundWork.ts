@@ -95,6 +95,14 @@ export function backgroundWorkHoldsCompletion(
   );
 }
 
+/** Whether some held work is stopped until the user approves it or someone resumes it. */
+export function backgroundWorkBlockedOn(
+  tasks: ReadonlyArray<Pick<PendingBackgroundWorkTask, "blockedOn">>,
+  reason: "approval" | "resume",
+): boolean {
+  return tasks.some((task) => task.blockedOn === reason);
+}
+
 // Commands and monitors are as often a dev server or its watchdog as a wait, so they hold
 // only when the agent marks them awaited.
 function backgroundWorkKindHoldsCompletion(kind: PendingBackgroundWorkTask["kind"]): boolean {
@@ -322,14 +330,15 @@ function pullRequestWatchTasks(
 function commandWatchTasks(
   watches: ReadonlyArray<PendingBackgroundWorkCommandWatch> | undefined,
 ): Array<PendingBackgroundWorkTask> {
+  // Every watch holds the thread, so automatic settling never ends a paused or unapproved one.
   return (watches ?? []).map((watch) => ({
     taskId: watch.id,
-    description:
-      watch.status === "awaiting_approval"
-        ? `Waiting for approval: ${watch.label}`
-        : watch.status === "paused"
-          ? `Paused: ${watch.label}`
-          : `Watching: ${watch.label}`,
     kind: "monitor" as const,
+    awaited: true as const,
+    ...(watch.status === "awaiting_approval"
+      ? { description: `Waiting for approval: ${watch.label}`, blockedOn: "approval" as const }
+      : watch.status === "paused"
+        ? { description: `Paused: ${watch.label}`, blockedOn: "resume" as const }
+        : { description: `Watching: ${watch.label}` }),
   }));
 }

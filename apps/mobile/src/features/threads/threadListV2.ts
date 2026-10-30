@@ -1,3 +1,4 @@
+import { backgroundWorkBlockedOn } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import {
   canSnooze,
   effectiveSnoozed,
@@ -67,6 +68,7 @@ export type ThreadListV2Status =
   | "request"
   | "working"
   | "waiting"
+  | "paused"
   | "failed"
   | "limited"
   | "ready";
@@ -207,6 +209,7 @@ export function resolveThreadListV2Status(
     | "pendingGuestMessageCount"
     | "runtime"
     | "blockedOnThreadWait"
+    | "pendingBackgroundTasks"
   >,
 ): ThreadListV2Status {
   if (thread.hasPendingApprovals || thread.pendingSubagentRequest === "approval") {
@@ -227,6 +230,9 @@ export function resolveThreadListV2Status(
     ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
   ) {
     return "working";
+  }
+  if (backgroundWorkBlockedOn(thread.pendingBackgroundTasks, "resume")) {
+    return "paused";
   }
   if (thread.runtime?.status === "idle") {
     return "waiting";

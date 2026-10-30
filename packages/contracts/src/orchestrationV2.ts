@@ -995,6 +995,8 @@ const PendingBackgroundTaskFields = {
    * subagent. Only the agent knows whether a command is a wait or a dev server it left running.
    */
   awaited: Schema.optional(Schema.Literal(true)),
+  /** Stopped until the user approves it or someone resumes it, so the thread shows that instead. */
+  blockedOn: Schema.optional(Schema.Literals(["approval", "resume"])),
 };
 
 export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(

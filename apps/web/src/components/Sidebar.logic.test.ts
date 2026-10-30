@@ -1001,6 +1001,20 @@ describe("unseen completion with background work", () => {
       receded: true,
       pill: "Waiting",
     },
+    {
+      roster: "paused watch",
+      task: { kind: "monitor", awaited: true, blockedOn: "resume" },
+      status: "paused",
+      receded: false,
+      pill: "Paused",
+    },
+    {
+      roster: "watch waiting for approval",
+      task: { kind: "monitor", awaited: true, blockedOn: "approval" },
+      status: "approval",
+      receded: false,
+      pill: "Pending Approval",
+    },
   ] as const)("presents a completed thread with a $roster roster", (expected) => {
     const thread = presentThreadShell(localEnvironmentId, {
       ...makeThreadFixture().source,

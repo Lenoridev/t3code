@@ -162,6 +162,11 @@ describe("projectThreadAwarenessV2", () => {
       [{ taskId: "tests", kind: "command", awaited: true }],
     ],
     [
+      "a watch the user has to approve",
+      "waiting_for_approval",
+      [{ taskId: "watch", kind: "monitor", awaited: true, blockedOn: "approval" }],
+    ],
+    [
       "a dev server and a subagent",
       "running",
       [

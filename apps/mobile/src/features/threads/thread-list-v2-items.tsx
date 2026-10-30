@@ -119,6 +119,12 @@ const STATUS_LABEL_BY_STATUS: Partial<Record<ThreadListV2Status, StatusLabel>> =
     className: "text-foreground-muted",
     iconTintClassName: "accent-foreground-muted",
   },
+  paused: {
+    label: "Paused",
+    icon: "pause",
+    className: "text-warning-foreground",
+    iconTintClassName: "accent-warning-foreground",
+  },
   failed: {
     label: "Failed",
     icon: "exclamationmark.circle",

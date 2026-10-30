@@ -446,11 +446,30 @@ describe("derivePendingBackgroundWork kinds", () => {
         turnItems: [],
         commandWatches,
       });
+      // Every watch holds the thread, so automatic settling cannot end a paused one.
       expect(tasks).toEqual([
-        { taskId: "command-watch:1", description: "Watching: Maintainer reply", kind: "monitor" },
-        { taskId: "command-watch:2", description: "Waiting for approval: Deploy", kind: "monitor" },
-        { taskId: "command-watch:3", description: "Paused: Release", kind: "monitor" },
+        {
+          taskId: "command-watch:1",
+          description: "Watching: Maintainer reply",
+          kind: "monitor",
+          awaited: true,
+        },
+        {
+          taskId: "command-watch:2",
+          description: "Waiting for approval: Deploy",
+          kind: "monitor",
+          awaited: true,
+          blockedOn: "approval",
+        },
+        {
+          taskId: "command-watch:3",
+          description: "Paused: Release",
+          kind: "monitor",
+          awaited: true,
+          blockedOn: "resume",
+        },
       ]);
+      expect(backgroundWorkHoldsCompletion(tasks)).toBe(true);
       expect(
         derivePendingBackgroundWork({
           latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },

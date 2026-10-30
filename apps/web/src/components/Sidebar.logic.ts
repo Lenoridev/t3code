@@ -1,6 +1,9 @@
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
 import { isShownUnderParent } from "@t3tools/client-runtime/state/threads";
-import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import {
+  backgroundWorkBlockedOn,
+  backgroundWorkHoldsCompletion,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { threadPullRequestSearchTerms } from "@t3tools/shared/threadPullRequests";
 import * as React from "react";
 import {
@@ -626,6 +629,7 @@ export interface ThreadStatusPill {
     | "Awaiting Input"
     | "Guest Request"
     | "Waiting"
+    | "Paused"
     | "Plan Ready";
   colorClass: string;
   dotClass: string;
@@ -639,6 +643,7 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   Failed: 3.5,
   Working: 3,
   Connecting: 3,
+  Paused: 2.75,
   Waiting: 2.5,
   "Plan Ready": 2,
   Completed: 1,
@@ -807,6 +812,7 @@ export type SidebarThreadStatus =
   | "request"
   | "working"
   | "waiting"
+  | "paused"
   | "failed"
   | "limited"
   | "ready";
@@ -841,7 +847,8 @@ type SidebarThreadStatusInput = Pick<
   | "pendingGuestMessageCount"
   | "runtime"
   | "blockedOnThreadWait"
->;
+> &
+  Partial<Pick<SidebarThreadSummary, "pendingBackgroundTasks">>;
 
 export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): SidebarThreadStatus {
   if (thread.hasPendingApprovals || thread.pendingSubagentRequest === "approval") {
@@ -862,6 +869,9 @@ export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): Si
     ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
   ) {
     return "working";
+  }
+  if (backgroundWorkBlockedOn(thread.pendingBackgroundTasks ?? [], "resume")) {
+    return "paused";
   }
   if (thread.runtime?.status === "idle") {
     return "waiting";
@@ -1124,6 +1134,15 @@ export function resolveThreadStatusPill(input: {
       colorClass: "text-sky-600 dark:text-sky-300/80",
       dotClass: "bg-sky-500 dark:bg-sky-300/80",
       pulse: true,
+    };
+  }
+
+  if (backgroundWorkBlockedOn(thread.pendingBackgroundTasks ?? [], "resume")) {
+    return {
+      label: "Paused",
+      colorClass: "text-amber-600 dark:text-amber-300/90",
+      dotClass: "bg-amber-500 dark:bg-amber-300/90",
+      pulse: false,
     };
   }
 
