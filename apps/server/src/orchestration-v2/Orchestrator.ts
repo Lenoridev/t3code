@@ -2957,6 +2957,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             `Thread ${command.threadId} already watches ${THREAD_COMMAND_WATCH_LIMIT} commands.`,
           );
         }
+        // Its unstarted update is cancelled; the replacement delivers those changes instead.
+        if (fullAccess && replaced !== undefined) cancelled = [replaced];
         next = [
           ...kept,
           {
@@ -2972,7 +2974,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             revisionHash: command.revisionHash,
             authority: fullAccess ? { kind: "full-access" } : null,
             status: fullAccess ? "baselining" : "awaiting_approval",
-            ...(replaced === undefined || fullAccess ? {} : { replacesWatchId: replaced.id }),
+            ...(replaced === undefined ? {} : { replacesWatchId: replaced.id }),
             collectionFailures: 0,
             comparisonFailures: 0,
             waitingChanges: 0,
@@ -2997,14 +2999,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           next = watches.filter((candidate) => candidate.id !== watch.id);
           break;
         }
-        const { replacesWatchId, ...approved } = watch;
+        cancelled = watches.filter((candidate) => candidate.id === watch.replacesWatchId);
         next = watches.flatMap((candidate) =>
-          candidate.id === replacesWatchId
+          candidate.id === watch.replacesWatchId
             ? []
             : candidate.id === watch.id
               ? [
                   {
-                    ...approved,
+                    ...watch,
                     authority: { kind: "approved", revisionHash: watch.revisionHash },
                     status: "baselining",
                   } satisfies ThreadCommandWatch,
@@ -3039,8 +3041,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           pauseReason: _reason,
           lastFailure: _failure,
           pendingMessageId: _pending,
+          replacesWatchId: _replaced,
           ...base
         } = existing;
+        const replacesWatchId =
+          patch.replacesWatchId === null ? undefined : existing.replacesWatchId;
         const lastFailure =
           patch.lastFailure === undefined ? existing.lastFailure : (patch.lastFailure ?? undefined);
         const pendingMessageId =
@@ -3061,6 +3066,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(pauseReason === undefined ? {} : { pauseReason }),
           ...(lastFailure === undefined ? {} : { lastFailure }),
           ...(pendingMessageId === undefined ? {} : { pendingMessageId }),
+          ...(replacesWatchId === undefined ? {} : { replacesWatchId }),
           ...(patch.collectionFailures === undefined
             ? {}
             : { collectionFailures: patch.collectionFailures }),

@@ -385,6 +385,6 @@ export function commandWatchPauseNotice(
     : {
         kind: "notice",
         summary: "paused, too many changes waiting",
-        content: `T3 Code stopped checking at ${since} because more than ${COMMAND_WATCH_BACKLOG_LIMIT_BYTES / (1024 * 1024)} MB of changes were waiting. None were dropped; they arrive in the following updates. Changes after ${since} are not seen until you call resume_command_watch.`,
+        content: `T3 Code stopped checking at ${since} because more than ${COMMAND_WATCH_BACKLOG_LIMIT_BYTES / (1024 * 1024)} MB of changes were waiting. None were dropped; they arrive in the following updates. Checking resumes by itself once most of them have arrived, and reports what changed since ${since} as one change.`,
       };
 }

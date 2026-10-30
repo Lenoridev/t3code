@@ -27,7 +27,7 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as CommandWatchReactor from "./CommandWatchReactor.ts";
 import * as CommandWatchStore from "./CommandWatchStore.ts";
-import { commandWatchRevisionText } from "./commandWatch.ts";
+import { COMMAND_WATCH_BACKLOG_LIMIT_BYTES, commandWatchRevisionText } from "./commandWatch.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventStore from "./EventStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -180,6 +180,7 @@ const startWatch = (
     readonly helpers?: ReadonlyArray<{ readonly path: string; readonly content: string }>;
     /** What storage holds, when it differs from what was hashed. */
     readonly storedHelpers?: ReadonlyArray<{ readonly path: string; readonly content: string }>;
+    readonly replaces?: string;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -211,6 +212,7 @@ const startWatch = (
       reportInitialState: false,
       cwd,
       revisionHash: sha256(commandWatchRevisionText({ command, format, cwd, helpers })),
+      ...(options.replaces === undefined ? {} : { replacesWatchId: options.replaces }),
     });
   });
 
@@ -410,6 +412,87 @@ it.effect("pauses after repeated failures with a notice and resumes from the acc
       yield* look;
       assert.lengthOf(runner.calls, 10);
       assert.include((yield* updatesOf(threadId)).at(-1)?.text ?? "", "+ closed");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("pauses at the storage limit and resumes once the backlog drains", () =>
+  Effect.gen(function* () {
+    const store = yield* CommandWatchStore.CommandWatchStore;
+    const threadId = ThreadId.make("thread:command-watch-storage");
+    yield* createThread(threadId);
+    // The agent stays busy, so changes pile up behind its run.
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+
+    let next = output({ stdout: "a\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      yield* store.accept({
+        watchId: "command-watch:a",
+        observation: "a\n",
+        changes: [
+          {
+            kind: "output.changed",
+            summary: "large change",
+            content: "x".repeat(COMMAND_WATCH_BACKLOG_LIMIT_BYTES),
+          },
+        ],
+        now: DateTime.formatIso(yield* DateTime.now),
+      });
+      next = output({ stdout: "b\n" });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      const paused = yield* watchOf(threadId);
+      assert.strictEqual(paused?.status, "paused");
+      assert.strictEqual(paused?.pauseReason, "storage-limit");
+
+      // The update carrying the large change is taken, which frees the storage.
+      yield* takeQueued(threadId);
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      const resumed = yield* watchOf(threadId);
+      assert.strictEqual(resumed?.status, "watching");
+      assert.isUndefined(resumed?.pauseReason);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a replacement takes over the changes the replaced watch had not delivered", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-replace");
+    yield* createThread(threadId);
+    // The agent stays busy, so the old watch's changes wait behind its run.
+    const runId = yield* startRun(threadId, "work");
+    yield* startWatch(threadId, runId, "command-watch:old", "gh api");
+
+    let next = output({ stdout: "a\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      next = output({ stdout: "a\nb\n" });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      next = output({ stdout: "a\nb\nc\n" });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+
+      // Full access, so the replacement takes over at once.
+      yield* startWatch(threadId, runId, "command-watch:new", "gh api --paginate", {
+        replaces: "command-watch:old",
+      });
+      assert.deepEqual(yield* watchesOf(threadId), ["command-watch:new"]);
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      const taken = yield* watchOf(threadId);
+      assert.isUndefined(taken?.replacesWatchId);
+      const update = (yield* updatesOf(threadId)).at(-1)?.text ?? "";
+      assert.include(update, "+ b");
+      assert.include(update, "+ c");
     }).pipe(Effect.provide(runner.layer), Effect.scoped);
   }).pipe(Effect.provide(layerTest)),
 );

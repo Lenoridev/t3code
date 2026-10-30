@@ -5,7 +5,11 @@ import {
   presentPendingBackgroundWork,
   type PendingBackgroundWorkItem,
 } from "@t3tools/client-runtime/state/thread-execution";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  type EnvironmentId,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Haptics from "expo-haptics";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import { ScreenStack } from "react-native-screens";
@@ -17,8 +21,11 @@ import { AppText as Text } from "../../components/ui/AppText";
 import { ScreenContent } from "../../components/ui/ScreenContent";
 import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
 import { NativeHeader, NativeScreen } from "../../native/ThemedScreenStack";
+import { useEnvironmentScope } from "../../state/session";
 import { environmentThreadShells } from "../../state/threads";
+import { useQuietThreadStructure } from "../../state/use-thread-detail";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
+import { CommandWatchRow } from "./CommandWatchControls";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 const KIND_LABELS = {
@@ -35,10 +42,16 @@ export function ThreadBackgroundWorkSheet({ route }: StaticScreenProps<Backgroun
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const target = route.params;
-  const thread = useAtomValue(
-    environmentThreadShells.threadShellAtom(scopeThreadRef(target.environmentId, target.threadId)),
-  );
-  const presentation = presentPendingBackgroundWork(thread?.pendingBackgroundTasks ?? []);
+  const threadRef = scopeThreadRef(target.environmentId, target.threadId);
+  const thread = useAtomValue(environmentThreadShells.threadShellAtom(threadRef));
+  // Watches come from the thread itself: the background task list is empty while a run is active.
+  const watches = useQuietThreadStructure(threadRef)?.projection.thread.commandWatches ?? [];
+  const canOperateThread = useEnvironmentScope(target.environmentId, AuthOrchestrationOperateScope);
+  const watchIds = new Set(watches.map((watch) => watch.id));
+  const otherItems =
+    presentPendingBackgroundWork(thread?.pendingBackgroundTasks ?? [])?.items.filter(
+      (item) => !watchIds.has(item.taskId),
+    ) ?? [];
   const openThread = (threadId: ThreadId) => {
     void Haptics.selectionAsync();
     // A thread replaces the leaf sheet so workspace back navigation still works.
@@ -54,15 +67,23 @@ export function ThreadBackgroundWorkSheet({ route }: StaticScreenProps<Backgroun
       contentContainerClassName="px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
-      {presentation === null ? (
+      {watches.length === 0 && otherItems.length === 0 ? (
         <Text className="pt-6 text-center text-sm text-foreground-muted">
           Nothing running in the background.
         </Text>
-      ) : (
-        presentation.items.map((item) => (
-          <BackgroundWorkRow key={item.taskId} item={item} onOpen={openThread} />
-        ))
-      )}
+      ) : null}
+      {watches.map((watch) => (
+        <CommandWatchRow
+          key={watch.id}
+          environmentId={target.environmentId}
+          threadId={target.threadId}
+          watch={watch}
+          canOperateThread={canOperateThread}
+        />
+      ))}
+      {otherItems.map((item) => (
+        <BackgroundWorkRow key={item.taskId} item={item} onOpen={openThread} />
+      ))}
     </ScrollView>
   );
   if (Platform.OS === "ios") {

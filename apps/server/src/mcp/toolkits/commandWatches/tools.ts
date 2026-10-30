@@ -74,7 +74,7 @@ export const WatchCommandInput = Schema.Struct({
   replaces: Schema.optional(
     TrimmedNonEmptyString.annotate({
       description:
-        "A watch on this thread this one replaces. The new watch starts from a fresh first check; outside Full access the old one keeps running until the user allows the new one.",
+        "A watch on this thread this one replaces. The new watch starts from a fresh first check; outside Full access the old one keeps running until the user allows the new one. Changes the old one has not delivered move to the new one.",
     }),
   ),
 });

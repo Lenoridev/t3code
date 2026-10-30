@@ -84,7 +84,10 @@ export const ThreadCommandWatch = Schema.Struct({
   authority: Schema.NullOr(ThreadCommandWatchAuthority),
   status: ThreadCommandWatchStatus,
   pauseReason: Schema.optional(ThreadCommandWatchPauseReason),
-  /** A running watch this revision replaces once it is allowed. */
+  /**
+   * The watch this revision replaces: it keeps running while this one awaits approval, and its
+   * waiting changes move here when this one takes over.
+   */
   replacesWatchId: Schema.optional(TrimmedNonEmptyString),
   /** Failed checks in a row, counted separately for running the command and reading its output. */
   collectionFailures: NonNegativeInt,

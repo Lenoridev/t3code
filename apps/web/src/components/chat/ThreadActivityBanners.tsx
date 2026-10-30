@@ -145,7 +145,9 @@ export function backgroundWorkNowItem(input: {
     icon: rows.every(isCommand) ? <TerminalIcon /> : <CircleDashedIcon />,
     title: only ? (
       <>
-        {verb} <span className={cn(isCommand(only) && "font-mono")}>{only.task.label}</span>
+        {/* A monitor's label already says what it does, such as "Watching: CI". */}
+        {only.task.kind === "monitor" ? null : `${verb} `}
+        <span className={cn(only.task.kind === "command" && "font-mono")}>{only.task.label}</span>
       </>
     ) : (
       presentation.title

@@ -5,6 +5,11 @@ import {
   type ThreadCommandWatch,
   type ThreadId,
 } from "@t3tools/contracts";
+import {
+  COMMAND_WATCH_APPROVAL_WARNING,
+  commandWatchIntervalLabel,
+  commandWatchStatusLabel,
+} from "@t3tools/client-runtime/state/command-watches";
 import { EyeOffIcon, PlayIcon, TerminalIcon } from "lucide-react";
 
 import { cn } from "../../lib/utils";
@@ -22,30 +27,6 @@ import {
 } from "./threadDetailsPanelStyles";
 
 const EMPTY_WATCHES: ReadonlyArray<ThreadCommandWatch> = [];
-
-const intervalLabel = (everyMinutes: number) =>
-  everyMinutes % 60 === 0
-    ? `every ${everyMinutes / 60 === 1 ? "hour" : `${everyMinutes / 60} hours`}`
-    : `every ${everyMinutes === 1 ? "minute" : `${everyMinutes} min`}`;
-
-function statusLabel(watch: ThreadCommandWatch): string {
-  switch (watch.status) {
-    case "awaiting_approval":
-      return "Needs your approval";
-    case "baselining":
-      return "Starting";
-    case "paused":
-      return watch.pauseReason === "storage-limit"
-        ? "Paused: too many changes waiting"
-        : `Paused: ${watch.lastFailure ?? "the command kept failing"}`;
-    case "watching":
-      return watch.waitingChanges > 0
-        ? `Watching, ${watch.waitingChanges} ${watch.waitingChanges === 1 ? "change" : "changes"} waiting`
-        : watch.lastFailure === undefined
-          ? "Watching"
-          : `Watching, last check ${watch.lastFailure}`;
-  }
-}
 
 /**
  * Thread details section listing the commands the server runs for this thread's agent
@@ -97,13 +78,13 @@ export function ThreadDetailsCommandWatchRows(props: {
                       : "text-muted-foreground",
                   )}
                 >
-                  {statusLabel(watch)}
+                  {commandWatchStatusLabel(watch)}
                 </p>
                 <Tooltip>
                   <TooltipTrigger
                     render={
                       <p className="truncate font-mono text-2xs text-muted-foreground">
-                        {intervalLabel(watch.everyMinutes)} · {watch.command}
+                        {commandWatchIntervalLabel(watch.everyMinutes)} · {watch.command}
                       </p>
                     }
                   />
@@ -171,7 +152,7 @@ export function ThreadDetailsCommandWatchRows(props: {
   );
 }
 
-function CommandWatchApproval(props: {
+export function CommandWatchApproval(props: {
   readonly watch: ThreadCommandWatch;
   readonly disabled: boolean;
   readonly onDecide: (allow: boolean) => void;
@@ -180,8 +161,8 @@ function CommandWatchApproval(props: {
   return (
     <div className="mt-1.5 flex flex-col gap-1.5 text-2xs text-muted-foreground">
       <p>
-        This command runs {intervalLabel(watch.everyMinutes)} outside the agent's sandbox, with the
-        T3 server's account permissions, until the watch is stopped.
+        This command runs {commandWatchIntervalLabel(watch.everyMinutes)}{" "}
+        {COMMAND_WATCH_APPROVAL_WARNING}
       </p>
       <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-1.5 font-mono text-foreground/80">
         {watch.command}

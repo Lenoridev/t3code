@@ -351,6 +351,50 @@ export const make = Effect.gen(function* () {
     if (Object.keys(delivery.patch).length > 0 || delivery.wake !== undefined) {
       yield* record(thread.id, watch, delivery.patch, delivery.wake);
     }
+    // Half the limit, so a watch near it does not pause and resume on every check.
+    if (
+      watch.status === "paused" &&
+      watch.pauseReason === "storage-limit" &&
+      (yield* store.waitingBytes(watch.id)) <= COMMAND_WATCH_BACKLOG_LIMIT_BYTES / 2
+    ) {
+      yield* engine.dispatch({
+        type: "thread.command-watch.resume",
+        commandId: CommandId.make(
+          `server:command-watch:${watch.id}:${yield* crypto.randomUUIDv4()}`,
+        ),
+        threadId: thread.id,
+        watchId: watch.id,
+      });
+    }
+  });
+
+  /** Moves a replaced watch's waiting changes to the watch that took over, then delivers them. */
+  const adopt = Effect.fn("CommandWatchReactor.adopt")(function* (
+    thread: ProjectionStore.ProjectionThreadCommandWatches,
+    watch: ThreadCommandWatch,
+    replacedId: string,
+  ) {
+    const { runs: threadRuns } = yield* projections.getThreadRecords(thread.id, ["runs"]);
+    // An update of the replaced watch that started before the takeover already reached the agent.
+    const prefix = `message:command-watch:${replacedId}:`;
+    const deliveredThrough = Math.max(
+      0,
+      ...threadRuns.flatMap((run) =>
+        run.userMessageId.startsWith(prefix) &&
+        run.status !== "cancelled" &&
+        run.status !== "queued"
+          ? [throughOf(run.userMessageId)]
+          : [],
+      ),
+    );
+    yield* store.adopt({
+      fromWatchId: replacedId,
+      toWatchId: watch.id,
+      deliveredThrough,
+      now: DateTime.formatIso(yield* DateTime.now),
+    });
+    const delivery = yield* planDelivery(thread.id, watch);
+    yield* record(thread.id, watch, { ...delivery.patch, replacesWatchId: null }, delivery.wake);
   });
 
   const removeOrphans = Effect.fn("CommandWatchReactor.removeOrphans")(function* (
@@ -381,7 +425,14 @@ export const make = Effect.gen(function* () {
     watchesChanged = false;
     const threads = yield* projections.getThreadsWithCommandWatches();
     nextScanAt = now + (threads.length > 0 ? ACTIVE_SCAN_MS : IDLE_SCAN_MS);
-    const present = new Set(threads.flatMap((thread) => thread.commandWatches.map((w) => w.id)));
+    // A replaced watch's storage stays until its replacement adopted the waiting changes.
+    const present = new Set(
+      threads.flatMap((thread) =>
+        thread.commandWatches.flatMap((w) =>
+          w.replacesWatchId === undefined ? [w.id] : [w.id, w.replacesWatchId],
+        ),
+      ),
+    );
     const presentKeys = new Set(threads.flatMap((thread) => thread.commandWatches.map(watchKey)));
     for (const key of dueAt.keys()) if (!presentKeys.has(key)) dueAt.delete(key);
     yield* removeOrphans(present, now).pipe(
@@ -392,6 +443,27 @@ export const make = Effect.gen(function* () {
       for (const watch of thread.commandWatches) {
         const key = watchKey(watch);
         if (yield* FiberMap.has(runs, key)) continue;
+        const replacedId = watch.replacesWatchId;
+        if (
+          replacedId !== undefined &&
+          watch.status !== "awaiting_approval" &&
+          !thread.commandWatches.some((other) => other.id === replacedId)
+        ) {
+          yield* FiberMap.run(
+            runs,
+            key,
+            adopt(thread, watch, replacedId).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("command watch takeover failed", {
+                  threadId: thread.id,
+                  watchId: watch.id,
+                  cause,
+                }),
+              ),
+            ),
+          );
+          continue;
+        }
         const due = running(watch) && (dueAt.get(key) ?? 0) <= now;
         const delivering = watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
         if (!due && !delivering) continue;

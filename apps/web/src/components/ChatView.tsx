@@ -354,6 +354,7 @@ import { ChatTerminalDrawers } from "./chat/ChatTerminalDrawers";
 import { ChatRightPanel } from "./chat/ChatRightPanel";
 import { useDraftEnvironmentRouting } from "./chat/useDraftEnvironmentRouting";
 import { branchMismatchBannerItem } from "./chat/ThreadActivityBanners";
+import { commandWatchNowItem } from "./chat/CommandWatchNow";
 import { ThreadNow } from "./chat/ThreadNow";
 import type { ThreadStructure } from "@t3tools/client-runtime/state/shell";
 import { useDelayedStatus } from "../hooks/useDelayedStatus";
@@ -2992,8 +2993,17 @@ export default function ChatView(props: ChatViewProps) {
   };
   const onExpandTimelineImageStable = useStableCallback(onExpandTimelineImage);
   const shownThreadSyncPhase = activeEnvironmentUnavailable ? null : delayedThreadSyncPhase;
+  const commandWatchNow =
+    serverProjection === null
+      ? null
+      : commandWatchNowItem({
+          environmentId,
+          threadId: serverProjection.thread.id,
+          watches: serverProjection.thread.commandWatches,
+        });
   const hasThreadNow =
     childInputNow !== null ||
+    commandWatchNow !== null ||
     backgroundWorkNow !== null ||
     goalNow !== null ||
     shownThreadSyncPhase !== null;
@@ -3036,6 +3046,7 @@ export default function ChatView(props: ChatViewProps) {
         <ThreadNow
           key={routeThreadKey}
           attention={childInputNow}
+          watch={commandWatchNow}
           work={backgroundWorkNow}
           syncPhase={shownThreadSyncPhase}
           goal={goalNow}

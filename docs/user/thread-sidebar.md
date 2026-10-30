@@ -132,8 +132,8 @@ open.
 
 Threads that are working or waiting on work they will resume from move into a collapsed
 **Working** section below the active list.
-That includes subagents, watched pull requests, and background commands or monitors the agent
-says it is waiting on. A dev server or other process an agent leaves running does not keep a thread
+That includes subagents, watched pull requests, command watches, and background commands or
+monitors the agent says it is waiting on. A dev server or other process an agent leaves running does not keep a thread
 there. A thread returns to the top of the active list when it finishes, fails, or needs an approval or
 answer. The Working section lists the thread you last sent work to first. Pinned threads stay in
 the pinned section.
@@ -210,6 +210,27 @@ On web and desktop, right-click a pull request link in a thread and choose
 **Link to thread** to select a different PR. Use **Unlink from thread** on the
 same link to return to the branch PR, if one exists.
 The linked pull request participates in automatic settlement.
+
+## Let the agent watch for changes
+
+To wait on something that is not a pull request, such as a reply on an issue or discussion,
+another repository's CI, or a release, ask the agent to watch for it. The agent writes a read-only
+shell command, and the server runs it on an interval, 10 minutes unless the agent picks another,
+and sends the agent an update when the command's output changes. The first check only records the
+output, so a state that already holds does not wake the agent. Updates wait while the agent is
+busy and arrive one at a time; none are dropped.
+
+The command runs on the server machine with the server's account permissions, outside the agent's
+sandbox. In Full access a watch starts at once. In other modes it waits for you: the thread shows
+**Pending Approval**. Choose **Review** at the end of the conversation, or open the
+Background work sheet on mobile, to see the full command and choose **Allow this watch** or
+**Deny**. Your approval covers that exact command and the helper scripts it runs. If either
+changes, or you leave Full access for a watch Full access allowed, the watch asks again.
+
+After 8 failed checks in a row a watch pauses and the thread shows **Paused**. Choose **Resume**
+once the cause is fixed. To stop a watch, use **Watching** in the thread details on web and
+desktop, or the Background work sheet on mobile. Settling or archiving the thread ends its watches.
+Subagents cannot start watches.
 
 ## Find and reference work
 

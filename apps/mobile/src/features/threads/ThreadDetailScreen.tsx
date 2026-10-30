@@ -9,6 +9,7 @@ import {
 import { AsyncResult, Atom } from "effect/reactivity";
 import * as Dialog from "../../components/ui/Dialog";
 import { useAtomMount, useAtomValue } from "@effect/atom-react";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entities";
 import { createThreadVisitTracker } from "@t3tools/client-runtime/state/thread-visits";
 import { useChildThreadInputs, useThreadReportedModelSelection } from "../../state/entities";
@@ -139,6 +140,7 @@ import { ThreadBrowserFloat } from "../browser/ThreadBrowserFloat";
 import { useThreadServerBrowserTabs } from "../../state/preview";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
 import { scopedThreadKey } from "../../lib/scopedEntities";
+import { useQuietThreadStructure } from "../../state/use-thread-detail";
 import {
   finishThreadMessageJump,
   pendingThreadMessageJump,
@@ -165,6 +167,7 @@ import type {
   ThreadFeedLatestRun,
 } from "../../lib/threadActivity";
 import { PendingApprovalCard } from "./PendingApprovalCard";
+import { CommandWatchApprovalCard } from "./CommandWatchControls";
 import { ComposerErrorNotice } from "./ComposerErrorNotice";
 import { ComposerFeedback } from "./ComposerFeedback";
 import { ComposerUsageLimits } from "./ComposerUsageLimits";
@@ -609,6 +612,11 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
   const pendingBackgroundWork = presentPendingBackgroundWork(
     props.selectedThread.pendingBackgroundTasks,
   );
+  const watchAwaitingApproval =
+    useQuietThreadStructure(
+      scopeThreadRef(props.environmentId, props.selectedThread.id),
+    )?.projection.thread.commandWatches?.find((watch) => watch.status === "awaiting_approval") ??
+    null;
   const floatingStatus = ((): FloatingWorkingStatus | null => {
     const connectionStatus = connectionFloatingStatus({
       connectionError: props.connectionError,
@@ -1532,6 +1540,22 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
                           onDismiss={props.onDismissUserInput}
                         />
                       ) : null}
+                    </Animated.View>
+                  ) : null}
+                  {watchAwaitingApproval !== null &&
+                  !props.activePendingApproval &&
+                  !props.activePendingUserInput ? (
+                    <Animated.View
+                      className="shrink-0 px-4 pb-3"
+                      entering={FadeInDown.duration(220)}
+                      exiting={FadeOut.duration(140)}
+                    >
+                      <CommandWatchApprovalCard
+                        environmentId={props.environmentId}
+                        threadId={props.selectedThread.id}
+                        watch={watchAwaitingApproval}
+                        canOperateThread={props.canOperateThread}
+                      />
                     </Animated.View>
                   ) : null}
                 </View>

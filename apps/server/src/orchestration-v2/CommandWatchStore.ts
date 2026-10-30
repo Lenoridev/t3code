@@ -78,6 +78,16 @@ export class CommandWatchStore extends Context.Service<
       watchId: string,
       sequence: number,
     ) => Effect.Effect<CommandWatchChange | undefined, PersistenceSqlError>;
+    /**
+     * Moves the changes a replaced watch had not delivered after `deliveredThrough` to its
+     * replacement, in order, and removes the replaced watch's storage.
+     */
+    readonly adopt: (input: {
+      readonly fromWatchId: string;
+      readonly toWatchId: string;
+      readonly deliveredThrough: number;
+      readonly now: string;
+    }) => Effect.Effect<void, PersistenceSqlError>;
     readonly remove: (watchId: string) => Effect.Effect<void, PersistenceSqlError>;
     readonly watchIds: Effect.Effect<ReadonlyArray<string>, PersistenceSqlError>;
   }
@@ -106,7 +116,9 @@ const make = Effect.gen(function* () {
 
   const insertChanges = Effect.fn("CommandWatchStore.insertChanges")(function* (
     watchId: string,
-    changes: ReadonlyArray<Omit<CommandWatchChange, "sequence" | "detectedAt">>,
+    changes: ReadonlyArray<
+      Omit<CommandWatchChange, "sequence" | "detectedAt"> & { readonly detectedAt?: string }
+    >,
     now: string,
   ) {
     const [row] = yield* sql<{ readonly next_sequence: number }>`
@@ -117,7 +129,7 @@ const make = Effect.gen(function* () {
     for (const change of changes) {
       yield* sql`
           INSERT INTO command_watch_changes (watch_id, sequence, kind, summary, content, detected_at)
-          VALUES (${watchId}, ${sequence}, ${change.kind}, ${change.summary}, ${change.content}, ${now})
+          VALUES (${watchId}, ${sequence}, ${change.kind}, ${change.summary}, ${change.content}, ${change.detectedAt ?? now})
         `;
       sequence += 1;
     }
@@ -237,6 +249,31 @@ const make = Effect.gen(function* () {
         Effect.map(([row]) => (row === undefined ? undefined : toChange(row))),
         Effect.mapError(fail("readChange")),
       );
+    }),
+
+    adopt: Effect.fn("CommandWatchStore.adopt")(function* ({
+      fromWatchId,
+      toWatchId,
+      deliveredThrough,
+      now,
+    }) {
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<ChangeRow>`
+              SELECT c.sequence, c.kind, c.summary, c.content, c.detected_at
+              FROM command_watch_changes c
+              JOIN command_watch_storage s ON s.watch_id = c.watch_id
+              WHERE c.watch_id = ${fromWatchId}
+                AND c.sequence > MAX(s.delivered_through, ${deliveredThrough})
+              ORDER BY c.sequence ASC
+            `;
+            yield* insertChanges(toWatchId, rows.map(toChange), now);
+            yield* sql`DELETE FROM command_watch_changes WHERE watch_id = ${fromWatchId}`;
+            yield* sql`DELETE FROM command_watch_storage WHERE watch_id = ${fromWatchId}`;
+          }),
+        )
+        .pipe(Effect.mapError(fail("adopt")));
     }),
 
     remove: Effect.fn("CommandWatchStore.remove")(function* (watchId) {

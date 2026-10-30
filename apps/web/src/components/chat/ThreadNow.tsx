@@ -82,12 +82,15 @@ function ThreadSyncLine({ phase }: { readonly phase: ThreadSyncPhase }) {
  */
 export function ThreadNow({
   attention,
+  watch,
   work,
   syncPhase,
   goal,
 }: {
   /** Something that needs you elsewhere, such as a subagent's question. */
   readonly attention: ThreadNowItem | null;
+  /** A command watch waiting for approval or a resume. */
+  readonly watch: ThreadNowItem | null;
   readonly work: ThreadNowItem | null;
   readonly syncPhase: ThreadSyncPhase | null;
   readonly goal: ThreadNowItem | null;
@@ -95,6 +98,7 @@ export function ThreadNow({
   return (
     <>
       {attention ? <ThreadNowLine item={attention} announce /> : null}
+      {watch ? <ThreadNowLine item={watch} announce /> : null}
       {work ? <ThreadNowLine item={work} /> : null}
       {syncPhase ? <ThreadSyncLine phase={syncPhase} /> : null}
       {goal ? <ThreadNowLine item={goal} /> : null}
