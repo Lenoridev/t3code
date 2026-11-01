@@ -625,7 +625,6 @@ export const make = Effect.gen(function* () {
                 ),
               )
           : deliverOnly(thread, watch);
-        if (due) dueAt.set(key, Number.POSITIVE_INFINITY);
         yield* FiberMap.run(
           runs,
           key,
@@ -648,6 +647,8 @@ export const make = Effect.gen(function* () {
         );
       }
     }
+    // A scan on its own schedule would run each check up to a scan late.
+    for (const due of dueAt.values()) if (due > now) nextScanAt = Math.min(nextScanAt, due);
   }).pipe(
     Effect.catchCause((cause) => Effect.logWarning("command watch sweep failed", { cause })),
     Effect.withSpan("CommandWatchReactor.sweep"),
@@ -666,12 +667,13 @@ export const make = Effect.gen(function* () {
         watchesChanged = true;
       }
       if (event.type !== "thread.command-watches-updated") return Effect.void;
-      const live = new Set((event.payload.commandWatches ?? []).map(watchKey));
-      return Effect.forEach(
-        [...dueAt.keys()].filter((key) => !live.has(key) && key.startsWith("command-watch:")),
-        (key) => FiberMap.remove(runs, key),
-        { discard: true },
+      // A completed watch's own check recorded the end, and still has its work to finish.
+      const stopped = (event.payload.commandWatches ?? []).filter(
+        (watch) => watch.status === "ended" && watch.endReason !== "completed",
       );
+      return Effect.forEach(stopped, (watch) => FiberMap.remove(runs, watchKey(watch)), {
+        discard: true,
+      });
     });
 
   const start: CommandWatchReactor["Service"]["start"] = Effect.fn("CommandWatchReactor.start")(

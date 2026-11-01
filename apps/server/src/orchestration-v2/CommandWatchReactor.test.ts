@@ -17,9 +17,11 @@ import {
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -696,6 +698,494 @@ it.effect("limits watches per thread and ends them when the thread archives", ()
       commandId: CommandId.make("archive"),
       threadId,
     });
-    assert.deepEqual(yield* watchesOf(threadId), []);
+    const ended = (yield* orchestrator.getThreadProjection(threadId)).thread.commandWatches ?? [];
+    assert.lengthOf(ended, 5);
+    assert.isTrue(ended.every((watch) => watch.status === "ended" && watch.authority === null));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+const COMMENT_COMPARISON = `
+  function compare({ phase, previous, current, state }) {
+    if (phase === "baseline") return { state: null, changes: [] };
+    const seen = new Set(previous.comments.map((comment) => comment.id));
+    const changes = current.comments
+      .filter((comment) => !seen.has(comment.id) && comment.author !== current.viewer)
+      .map((comment) => ({
+        key: "comment:" + comment.id,
+        kind: "comment.added",
+        summary: "new comment",
+        details: comment,
+      }));
+    if (current.state === "BROKEN") throw new Error("Unexpected issue state");
+    return {
+      state: { checks: (state ? state.checks : 0) + 1 },
+      changes,
+      ...(current.state === "CLOSED" ? { complete: { reason: "issue closed" } } : {}),
+    };
+  }
+`;
+
+const issue = (state: string, ...comments: ReadonlyArray<readonly [string, string]>) =>
+  output({
+    stdout: JSON.stringify({
+      viewer: "me",
+      state,
+      comments: comments.map(([id, author]) => ({ id, author })),
+    }),
+  });
+
+it.effect("a custom comparison decides what is news, and a broken one keeps the baseline", () =>
+  Effect.gen(function* () {
+    const store = yield* CommandWatchStore.CommandWatchStore;
+    const threadId = ThreadId.make("thread:command-watch-custom");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api", {
+      format: "json",
+      comparisonSource: COMMENT_COMPARISON,
+    });
+    yield* finishRuns(threadId);
+
+    let next = issue("OPEN");
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      assert.strictEqual((yield* watchOf(threadId))?.status, "watching");
+      assert.lengthOf(yield* updatesOf(threadId), 0);
+
+      // The user's own comment changes the output, advances state, and wakes nobody.
+      next = issue("OPEN", ["c1", "me"]);
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.lengthOf(yield* updatesOf(threadId), 0);
+      const quiet = yield* store.get("command-watch:a");
+      assert.include(quiet?.observation ?? "", "c1");
+      assert.strictEqual(quiet?.comparisonState, '{"checks":1}');
+
+      next = issue("OPEN", ["c1", "me"], ["c2", "other"]);
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      const updates = yield* updatesOf(threadId);
+      assert.lengthOf(updates, 1);
+      assert.strictEqual(updates[0]?.notification?.summary, "label gh api: new comment");
+      assert.include(updates[0]?.text ?? "", 'kind "comment.added"');
+
+      // A throwing comparison keeps what was accepted, and a working command does not reset its
+      // failure count.
+      next = issue("BROKEN", ["c1", "me"], ["c2", "other"], ["c3", "other"]);
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      next = output({ code: 1 as ProcessRunner.ProcessRunOutput["code"] });
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      next = issue("BROKEN", ["c1", "me"], ["c2", "other"], ["c3", "other"]);
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      const failing = yield* watchOf(threadId);
+      assert.strictEqual(failing?.comparisonFailures, 2);
+      assert.strictEqual(failing?.collectionFailures, 0);
+      assert.include(failing?.lastFailure ?? "", "Unexpected issue state");
+      assert.notInclude((yield* store.get("command-watch:a"))?.observation ?? "", "c3");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a completing comparison ends the watch and still delivers what it found", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-complete");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api", {
+      format: "json",
+      comparisonSource: COMMENT_COMPARISON,
+      completionCondition: "the issue closes",
+    });
+    yield* finishRuns(threadId);
+
+    let next = issue("OPEN");
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      next = issue("CLOSED", ["c1", "other"]);
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+
+      const ended = yield* watchOf(threadId);
+      assert.strictEqual(ended?.status, "ended");
+      assert.strictEqual(ended?.endReason, "completed");
+      assert.strictEqual(ended?.endDetail, "issue closed");
+      const [update] = yield* updatesOf(threadId);
+      assert.strictEqual(update?.notification?.outcome, "completed");
+      assert.strictEqual(update?.notification?.summary, "label gh api: 2 changes");
+      assert.include(update?.text ?? "", "This watch has ended");
+
+      // It never runs again.
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.lengthOf(runner.calls, 2);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a comparison on an ongoing watch cannot complete it", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-no-complete");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api", {
+      format: "json",
+      comparisonSource: COMMENT_COMPARISON,
+    });
+    yield* finishRuns(threadId);
+
+    let next = issue("OPEN");
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      next = issue("CLOSED");
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      const watch = yield* watchOf(threadId);
+      assert.strictEqual(watch?.status, "watching");
+      assert.strictEqual(watch?.comparisonFailures, 1);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a grant from another environment does not run here, and keeps the saved state", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-copied");
+    yield* createThread(threadId, { runtimeMode: "approval-required" });
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api", {
+      environmentId: "environment:elsewhere",
+    });
+    yield* finishRuns(threadId);
+    const revisionHash = (yield* watchOf(threadId))?.revisionHash ?? "";
+    yield* orchestrator.dispatch({
+      type: "thread.command-watch.approve",
+      commandId: CommandId.make("approve:copied"),
+      threadId,
+      watchId: "command-watch:a",
+      revisionHash,
+      approve: true,
+    });
+
+    const runner = fakeRunner(() => output({ stdout: "open\n" }));
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      yield* reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      assert.lengthOf(runner.calls, 0);
+      const watch = yield* watchOf(threadId);
+      assert.strictEqual(watch?.status, "awaiting_approval");
+      assert.isNull(watch?.authority);
+      assert.notStrictEqual(watch?.revisionHash, revisionHash);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "stopping keeps the watch visible as ended, discards waiting changes and stays stopped",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const store = yield* CommandWatchStore.CommandWatchStore;
+      const threadId = ThreadId.make("thread:command-watch-stop-ended");
+      yield* createThread(threadId);
+      yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+      yield* finishRuns(threadId);
+
+      let next = output({ stdout: "one\n" });
+      const runner = fakeRunner(() => next);
+      yield* Effect.gen(function* () {
+        const reactor = yield* CommandWatchReactor.make;
+        const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+        yield* look;
+        next = output({ stdout: "two\n" });
+        yield* TestClock.adjust("10 minutes");
+        yield* look;
+        next = output({ stdout: "three\n" });
+        yield* TestClock.adjust("10 minutes");
+        yield* look;
+
+        const stop = (suffix: string) =>
+          orchestrator.dispatch({
+            type: "thread.command-watch.stop",
+            commandId: CommandId.make(`stop:${suffix}`),
+            threadId,
+            watchId: "command-watch:a",
+          });
+        yield* stop("first");
+        const ended = yield* watchOf(threadId);
+        assert.strictEqual(ended?.status, "ended");
+        assert.strictEqual(ended?.endReason, "stopped");
+        assert.strictEqual(ended?.waitingChanges, 0);
+        assert.isUndefined(ended?.pendingMessageId);
+        assert.lengthOf((yield* stop("again")).storedEvents, 0);
+
+        yield* TestClock.adjust("1 day");
+        yield* look;
+        assert.lengthOf(runner.calls, 3);
+        assert.lengthOf(yield* store.waiting("command-watch:a"), 0);
+      }).pipe(Effect.provide(runner.layer), Effect.scoped);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a failed check's delay survives a restart, and a paused watch frees its slot", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-due");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+
+    const runner = fakeRunner(() => output({ code: 1 as ProcessRunner.ProcessRunOutput["code"] }));
+    yield* Effect.gen(function* () {
+      const first = yield* CommandWatchReactor.make;
+      yield* first.sweep.pipe(Effect.andThen(first.awaitRuns));
+      assert.lengthOf(runner.calls, 1);
+      // A new reactor is what a restart builds, and it must not check again before the delay.
+      const second = yield* CommandWatchReactor.make;
+      yield* second.sweep.pipe(Effect.andThen(second.awaitRuns));
+      assert.lengthOf(runner.calls, 1);
+      yield* TestClock.adjust("10 minutes");
+      yield* second.sweep.pipe(Effect.andThen(second.awaitRuns));
+      assert.lengthOf(runner.calls, 2);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a stop interrupts only that watch's check, not other threads' checks", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const ids = ["a", "b", "c"].map((name) => ThreadId.make(`thread:command-watch-${name}`));
+    for (const [index, threadId] of ids.entries()) {
+      yield* createThread(threadId);
+      yield* startWatch(
+        threadId,
+        yield* startRun(threadId, "work"),
+        `command-watch:${index}`,
+        `cmd-${index}`,
+      );
+      yield* finishRuns(threadId);
+    }
+    let otherInterrupted = false;
+    const stoppedInterrupted = yield* Deferred.make<void>();
+    const blocked = yield* Deferred.make<void>();
+    const waiting = yield* Ref.make(0);
+    const layer = Layer.succeed(ProcessRunner.ProcessRunner, {
+      run: (input) => {
+        const command = input.args?.join(" ") ?? "";
+        if (command.includes("cmd-0")) return Effect.succeed(output({ stdout: "one\n" }));
+        return Ref.updateAndGet(waiting, (count) => count + 1).pipe(
+          Effect.tap((count) => (count === 2 ? Deferred.succeed(blocked, undefined) : Effect.void)),
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() =>
+            command.includes("cmd-2")
+              ? Deferred.succeed(stoppedInterrupted, undefined)
+              : Effect.sync(() => {
+                  otherInterrupted = true;
+                }),
+          ),
+        );
+      },
+    });
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      yield* reactor.start();
+      yield* Effect.yieldNow;
+      yield* reactor.sweep;
+      yield* Deferred.await(blocked);
+      yield* orchestrator.dispatch({
+        type: "thread.command-watch.stop",
+        commandId: CommandId.make("stop:other-thread"),
+        threadId: ids[0]!,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.command-watch.stop",
+        commandId: CommandId.make("stop:own-thread"),
+        threadId: ids[2]!,
+      });
+      // Events arrive in order, so the first stop was handled once the second one took effect.
+      yield* Deferred.await(stoppedInterrupted);
+      assert.isFalse(otherInterrupted);
+    }).pipe(Effect.provide(layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a check runs when its interval ends, not at the next scan after it", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-on-time");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+    const runner = fakeRunner(() => output({ stdout: "one\n" }));
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+      const everyMs = ((yield* watchOf(threadId))?.everyMinutes ?? 0) * 60_000;
+      // A scan between checks, so the next scan falls just after the check is due.
+      yield* TestClock.adjust(`${everyMs - 29_000} millis`);
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+      yield* TestClock.adjust("29 seconds");
+      yield* look;
+      assert.lengthOf(runner.calls, 2);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a paused watch stops checking and resume reports the gap as one change", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-agent-pause");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+
+    let next = output({ stdout: "one\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+
+      const pause = (suffix: string) =>
+        orchestrator.dispatch({
+          type: "thread.command-watch.pause",
+          commandId: CommandId.make(`pause:${suffix}`),
+          threadId,
+          watchId: "command-watch:a",
+          pausedBy: "agent",
+        });
+      yield* pause("first");
+      yield* pause("again");
+      const paused = yield* watchOf(threadId);
+      assert.strictEqual(paused?.status, "paused");
+      assert.strictEqual(paused?.pauseReason, "agent");
+
+      next = output({ stdout: "two\n" });
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+      // Only a storage-limit pause resumes by itself.
+      assert.strictEqual((yield* watchOf(threadId))?.status, "paused");
+
+      next = output({ stdout: "three\n" });
+      yield* orchestrator.dispatch({
+        type: "thread.command-watch.resume",
+        commandId: CommandId.make("resume:agent-pause"),
+        threadId,
+        watchId: "command-watch:a",
+      });
+      const resumed = yield* watchOf(threadId);
+      assert.strictEqual(resumed?.status, "watching");
+      assert.isUndefined(resumed?.pauseReason);
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.lengthOf(runner.calls, 2);
+      const updates = yield* updatesOf(threadId);
+      assert.lengthOf(updates, 1);
+      assert.include(updates[0]?.text ?? "", "+ three");
+
+      yield* orchestrator.dispatch({
+        type: "thread.command-watch.stop",
+        commandId: CommandId.make("stop:agent-pause"),
+        threadId,
+      });
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(pause("ended"))));
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a detected change ends a snooze, and a quiet check does not", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:command-watch-snooze");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+
+    let next = output({ stdout: "one\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+
+      const snoozedUntil = "2099-01-01T00:00:00.000Z";
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("snooze:watch"),
+        threadId,
+        snoozedUntil,
+      });
+      const snoozedUntilNow = projections
+        .getThread(threadId)
+        .pipe(Effect.map((thread) => thread.snoozedUntil));
+
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.lengthOf(runner.calls, 2);
+      assert.isNotNull(yield* snoozedUntilNow);
+
+      next = output({ stdout: "two\n" });
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.include((yield* updatesOf(threadId))[0]?.text ?? "", "+ two");
+      assert.isNull(yield* snoozedUntilNow);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("settling stops checks without ending the watch, and un-settling restarts them", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-settle");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+
+    let next = output({ stdout: "one\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+
+      yield* orchestrator.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("settle:watch"),
+        threadId,
+      });
+      const kept = yield* watchOf(threadId);
+      assert.strictEqual(kept?.status, "watching");
+      assert.isNotNull(kept?.authority);
+
+      next = output({ stdout: "two\n" });
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.lengthOf(runner.calls, 1);
+      assert.lengthOf(yield* updatesOf(threadId), 0);
+
+      yield* orchestrator.dispatch({
+        type: "thread.unsettle",
+        commandId: CommandId.make("unsettle:watch"),
+        threadId,
+        reason: "user",
+      });
+      // Past the scan backstop: this reactor is not subscribed to the event that shortens it.
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.lengthOf(runner.calls, 2);
+      assert.include((yield* updatesOf(threadId))[0]?.text ?? "", "+ two");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
   }).pipe(Effect.provide(layerTest)),
 );
