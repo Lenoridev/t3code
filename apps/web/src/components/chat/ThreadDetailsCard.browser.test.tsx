@@ -43,12 +43,14 @@ function Card({
   inline,
   fixture,
   rows = 1,
+  watchListHeight = 0,
 }: {
   threadRef: ScopedThreadRef;
   inline: boolean;
   fixture: ReturnType<typeof setup>;
   /** Rows of 100px shown at full density. Compact always takes 50px. */
   rows?: number;
+  watchListHeight?: number;
 }) {
   return (
     // The web root renders in StrictMode, which re-runs ref callbacks on every mount.
@@ -73,9 +75,13 @@ function Card({
           contentKey={String(rows)}
         >
           {(density) => (
-            <p style={{ height: density === "full" ? rows * 100 : 50 }}>
-              Details for {threadRef.threadId}
-            </p>
+            <>
+              <p style={{ height: density === "full" ? rows * 100 : 50 }}>
+                Details for {threadRef.threadId}
+              </p>
+              <p>Layout is {density}</p>
+              <div data-thread-details-watch-list style={{ height: watchListHeight }} />
+            </>
           )}
         </ThreadDetailsCard>
       </ChatCanvasContext>
@@ -157,4 +163,28 @@ it("returns to full density when hidden items make the content fit", async () =>
 
   await screen.rerender(<Card threadRef={threadB} inline fixture={fixture} rows={2} />);
   await expect.element(card).toHaveAttribute("data-density", "full");
+});
+
+it("keeps its full layout when an expanded watch is taller than the card", async () => {
+  using fixture = setup();
+  useRightPanelStore.getState().setThreadPanelOpen(threadA, "inline", true);
+  await using screen = await render(<Card threadRef={threadA} inline fixture={fixture} />);
+  await expect.element(page.getByText("Layout is full")).toBeVisible();
+
+  // Observed after the card's own observer, so this fires once the card has measured the growth.
+  const list = document.querySelector("[data-thread-details-watch-list]")!;
+  let observer: ResizeObserver | undefined;
+  const measured = new Promise<void>((resolve) => {
+    observer = new ResizeObserver(() => {
+      if (list.getBoundingClientRect().height > 0) resolve();
+    });
+    observer.observe(list);
+  });
+  await screen.rerender(
+    <Card threadRef={threadA} inline fixture={fixture} watchListHeight={1000} />,
+  );
+  await measured;
+  observer?.disconnect();
+  await act(() => {});
+  await expect.element(page.getByText("Layout is full")).toBeVisible();
 });

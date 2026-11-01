@@ -369,11 +369,7 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
   });
   // The interrupt path also accepts a completed run while its provider still
   // has background work.
-  // A watch waiting on the user has its own line with Review or Resume.
-  const activeBackgroundTasks =
-    !isWorking && activeThread
-      ? pendingBackgroundTasks.filter((task) => task.blockedOn === undefined)
-      : [];
+  const activeBackgroundTasks = !isWorking && activeThread ? pendingBackgroundTasks : [];
   const [stoppingBackgroundWorkKey, setStoppingBackgroundWorkKey] = useState<string | null>(null);
   const isStoppingBackgroundWork =
     stoppingBackgroundWorkKey === `${environmentId}:${activeThreadId}`;

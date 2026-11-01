@@ -1,13 +1,20 @@
 import {
   COMMAND_WATCH_APPROVAL_WARNING,
+  COMMAND_WATCH_LIMITS_LABEL,
+  commandWatchComparisonLabel,
   commandWatchIntervalLabel,
+  commandWatchPurposeLabel,
   commandWatchStatusLabel,
 } from "@t3tools/client-runtime/state/command-watches";
 import type { EnvironmentId, ThreadCommandWatch, ThreadId } from "@t3tools/contracts";
+import { useState } from "react";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
+import { useEnvironmentServerConfig } from "../../state/entities";
+import { orchestrationEnvironment } from "../../state/orchestration";
+import { useEnvironmentQuery } from "../../state/query";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -21,6 +28,7 @@ interface CommandWatchControlsProps {
 function useCommandWatchActions(props: CommandWatchControlsProps) {
   const approve = useAtomCommand(threadEnvironment.approveCommandWatch);
   const resume = useAtomCommand(threadEnvironment.resumeCommandWatch);
+  const pause = useAtomCommand(threadEnvironment.pauseCommandWatch);
   const stop = useAtomCommand(threadEnvironment.stopCommandWatch);
   const target = { threadId: props.threadId, watchId: props.watch.id };
   return {
@@ -30,11 +38,63 @@ function useCommandWatchActions(props: CommandWatchControlsProps) {
         input: { ...target, revisionHash: props.watch.revisionHash, approve: allow },
       }),
     resume: () => void resume({ environmentId: props.environmentId, input: target }),
+    pause: () => void pause({ environmentId: props.environmentId, input: target }),
     stop: () => void stop({ environmentId: props.environmentId, input: target }),
   };
 }
 
-function ApprovalDetails(props: { readonly watch: ThreadCommandWatch }) {
+function CodeBlock(props: { readonly text: string }) {
+  return (
+    <View className="rounded-xl bg-subtle p-2.5">
+      <Text selectable className="font-mono text-2xs leading-normal text-foreground">
+        {props.text}
+      </Text>
+    </View>
+  );
+}
+
+/** Everything the watch runs, which is what an approval covers. */
+function WatchDefinition(props: CommandWatchControlsProps) {
+  const { watch } = props;
+  const supportsDetails =
+    useEnvironmentServerConfig(props.environmentId)?.environment.capabilities
+      .commandWatchDetails === true;
+  const needsDetails = watch.comparison.kind === "custom-js-v1" || watch.helpers.length > 0;
+  const details = useEnvironmentQuery(
+    supportsDetails && needsDetails
+      ? orchestrationEnvironment.commandWatchDetails({
+          environmentId: props.environmentId,
+          input: { threadId: props.threadId, watchId: watch.id },
+        })
+      : null,
+  );
+  return (
+    <>
+      <CodeBlock text={watch.command} />
+      <Text className="font-mono text-2xs text-foreground-muted" numberOfLines={2}>
+        in {watch.cwd} with {watch.shell}
+      </Text>
+      <Text className="font-sans text-xs text-foreground-muted">
+        {commandWatchPurposeLabel(watch)} {commandWatchComparisonLabel(watch)}
+      </Text>
+      {details.data?.comparisonSource ? <CodeBlock text={details.data.comparisonSource} /> : null}
+      {watch.helpers.map((helper) => {
+        const stored = details.data?.helpers.find((candidate) => candidate.path === helper.path);
+        return (
+          <View key={helper.path} className="gap-1">
+            <Text className="font-mono text-2xs text-foreground-muted" numberOfLines={1}>
+              Stored copy of {helper.path}
+            </Text>
+            {stored === undefined ? null : <CodeBlock text={stored.content} />}
+          </View>
+        );
+      })}
+      <Text className="font-sans text-xs text-foreground-muted">{COMMAND_WATCH_LIMITS_LABEL}</Text>
+    </>
+  );
+}
+
+function ApprovalDetails(props: CommandWatchControlsProps) {
   const { watch } = props;
   return (
     <>
@@ -42,19 +102,7 @@ function ApprovalDetails(props: { readonly watch: ThreadCommandWatch }) {
         This command runs {commandWatchIntervalLabel(watch.everyMinutes)}{" "}
         {COMMAND_WATCH_APPROVAL_WARNING}
       </Text>
-      <View className="rounded-xl bg-subtle p-2.5">
-        <Text selectable className="font-mono text-2xs leading-normal text-foreground">
-          {watch.command}
-        </Text>
-      </View>
-      <Text className="font-mono text-2xs text-foreground-muted" numberOfLines={1}>
-        in {watch.cwd}
-      </Text>
-      {watch.helpers.length > 0 ? (
-        <Text className="font-sans text-xs text-foreground-muted">
-          Runs stored copies of {watch.helpers.map((helper) => helper.path).join(", ")}.
-        </Text>
-      ) : null}
+      <WatchDefinition {...props} />
       {watch.replacesWatchId === undefined ? null : (
         <Text className="font-sans text-xs text-foreground-muted">
           Replaces a running watch, which keeps running until you decide.
@@ -73,7 +121,7 @@ export function CommandWatchApprovalCard(props: CommandWatchControlsProps) {
         Allow this watch?
       </Text>
       <Text className="font-t3-bold text-lg text-foreground">{props.watch.label}</Text>
-      <ApprovalDetails watch={props.watch} />
+      <ApprovalDetails {...props} />
       <View className="flex-row flex-wrap gap-2.5">
         <Button
           label="Allow this watch"
@@ -98,10 +146,11 @@ export function CommandWatchApprovalCard(props: CommandWatchControlsProps) {
 }
 
 /** One watch in the background work sheet, with its way out. */
-export function CommandWatchRow(props: CommandWatchControlsProps) {
+export function CommandWatchRow(props: CommandWatchControlsProps & { readonly settled: boolean }) {
   const { watch } = props;
   const actions = useCommandWatchActions(props);
   const needsUser = watch.status === "awaiting_approval" || watch.status === "paused";
+  const [showDefinition, setShowDefinition] = useState(false);
   return (
     <View className="gap-2 border-b border-border py-3.5">
       <View className="min-w-0">
@@ -111,7 +160,7 @@ export function CommandWatchRow(props: CommandWatchControlsProps) {
             needsUser ? "text-xs text-warning-foreground" : "text-xs text-foreground-muted"
           }
         >
-          {commandWatchStatusLabel(watch)}
+          {commandWatchStatusLabel(watch, props.settled)}
         </Text>
         {watch.status === "awaiting_approval" ? null : (
           <Text className="font-mono text-2xs text-foreground-muted" numberOfLines={2}>
@@ -119,7 +168,17 @@ export function CommandWatchRow(props: CommandWatchControlsProps) {
           </Text>
         )}
       </View>
-      {watch.status === "awaiting_approval" ? <ApprovalDetails watch={watch} /> : null}
+      {watch.status === "awaiting_approval" ? (
+        <ApprovalDetails {...props} />
+      ) : (
+        <>
+          <Button
+            label={showDefinition ? "Hide details" : "Show details"}
+            onPress={() => setShowDefinition((shown) => !shown)}
+          />
+          {showDefinition ? <WatchDefinition {...props} /> : null}
+        </>
+      )}
       <View className="flex-row flex-wrap gap-2.5">
         {watch.status === "awaiting_approval" ? (
           <>
@@ -136,7 +195,7 @@ export function CommandWatchRow(props: CommandWatchControlsProps) {
               onPress={() => actions.decide(false)}
             />
           </>
-        ) : (
+        ) : watch.status === "ended" ? null : (
           <>
             {watch.status === "paused" ? (
               <Button
@@ -145,7 +204,9 @@ export function CommandWatchRow(props: CommandWatchControlsProps) {
                 disabled={!props.canOperateThread}
                 onPress={actions.resume}
               />
-            ) : null}
+            ) : (
+              <Button label="Pause" disabled={!props.canOperateThread} onPress={actions.pause} />
+            )}
             <Button
               label="Stop watching"
               disabled={!props.canOperateThread}

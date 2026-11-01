@@ -1,6 +1,9 @@
 import {
+  commandWatchesTitle,
+  commandWatchIntervalLabel,
   commandWatchNeedingUser,
   commandWatchStatusLabel,
+  isCommandWatchRunning,
 } from "@t3tools/client-runtime/state/command-watches";
 import {
   AuthOrchestrationOperateScope,
@@ -8,7 +11,7 @@ import {
   type ThreadCommandWatch,
   type ThreadId,
 } from "@t3tools/contracts";
-import { CirclePauseIcon, ShieldQuestionIcon } from "lucide-react";
+import { CirclePauseIcon, EyeIcon, ShieldQuestionIcon } from "lucide-react";
 import { useState } from "react";
 
 import { useEnvironmentScope } from "../../state/session";
@@ -45,6 +48,92 @@ export function commandWatchNowItem(input: {
       />
     ),
   };
+}
+
+function runningWatchDetail(watch: ThreadCommandWatch): string {
+  const waiting =
+    watch.waitingChanges > 0
+      ? `, ${watch.waitingChanges} ${watch.waitingChanges === 1 ? "change" : "changes"} waiting`
+      : "";
+  const failure = watch.lastFailure === undefined ? "" : `, last check ${watch.lastFailure}`;
+  return `${commandWatchIntervalLabel(watch.everyMinutes)}${waiting}${failure}`;
+}
+
+/** The watches running for this thread, which stay on screen while the agent works. */
+export function commandWatchRunningNowItem(input: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly watches: ReadonlyArray<ThreadCommandWatch> | undefined;
+  readonly settled: boolean;
+}): ThreadNowItem | null {
+  const running = (input.watches ?? []).filter(isCommandWatchRunning);
+  const [only] = running;
+  if (only === undefined) return null;
+  return {
+    id: `command-watches:${input.threadId}`,
+    icon: <EyeIcon />,
+    title: input.settled
+      ? `Paused while settled: ${running.map((watch) => watch.label).join(", ")}`
+      : commandWatchesTitle(running),
+    description: input.settled
+      ? "Checks restart when you un-settle this thread."
+      : running.length === 1
+        ? runningWatchDetail(only)
+        : running.map((watch) => watch.label).join(", "),
+    actions: (
+      <RunningWatchActions
+        environmentId={input.environmentId}
+        threadId={input.threadId}
+        watches={running}
+      />
+    ),
+  };
+}
+
+function RunningWatchActions(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly watches: ReadonlyArray<ThreadCommandWatch>;
+}) {
+  const stop = useAtomCommand(threadEnvironment.stopCommandWatch, { reportFailure: true });
+  const canOperate = useEnvironmentScope(props.environmentId, AuthOrchestrationOperateScope);
+  const stopButton = (watch: ThreadCommandWatch) => (
+    <InlineButton
+      tone="muted"
+      disabled={!canOperate}
+      aria-label={`Stop watching ${watch.label}`}
+      onClick={() =>
+        void stop({
+          environmentId: props.environmentId,
+          input: { threadId: props.threadId, watchId: watch.id },
+        })
+      }
+    >
+      Stop
+    </InlineButton>
+  );
+  const [only] = props.watches;
+  if (props.watches.length === 1 && only !== undefined) return stopButton(only);
+  return (
+    <Popover>
+      <PopoverTrigger render={<InlineButton tone="muted" />}>Manage</PopoverTrigger>
+      <PopoverPopup side="top" align="end" width="lg" aria-label="Running watches">
+        <ul className="flex flex-col gap-3">
+          {props.watches.map((watch) => (
+            <li key={watch.id} className="flex min-w-0 items-baseline gap-3 text-xs">
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-medium">{watch.label}</span>
+                <span className="block truncate text-muted-foreground">
+                  {runningWatchDetail(watch)}
+                </span>
+              </span>
+              {stopButton(watch)}
+            </li>
+          ))}
+        </ul>
+      </PopoverPopup>
+    </Popover>
+  );
 }
 
 function CommandWatchNowActions(props: {
@@ -87,6 +176,8 @@ function CommandWatchNowActions(props: {
       <PopoverTrigger render={<InlineButton disabled={!canOperate} />}>Review</PopoverTrigger>
       <PopoverPopup side="top" align="end" width="lg" aria-label={`Review watch ${watch.label}`}>
         <CommandWatchApproval
+          environmentId={props.environmentId}
+          threadId={props.threadId}
           watch={watch}
           disabled={!canOperate}
           onDecide={(allow) => {

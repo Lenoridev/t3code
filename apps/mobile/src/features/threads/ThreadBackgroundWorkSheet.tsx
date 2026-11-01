@@ -1,3 +1,5 @@
+import { commandWatchesLive } from "@t3tools/client-runtime/state/command-watches";
+import { commandWatchesSuspended } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { useAtomValue } from "@effect/atom-react";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -45,9 +47,12 @@ export function ThreadBackgroundWorkSheet({ route }: StaticScreenProps<Backgroun
   const threadRef = scopeThreadRef(target.environmentId, target.threadId);
   const thread = useAtomValue(environmentThreadShells.threadShellAtom(threadRef));
   // Watches come from the thread itself: the background task list is empty while a run is active.
-  const watches = useQuietThreadStructure(threadRef)?.projection.thread.commandWatches ?? [];
+  const threadProjection = useQuietThreadStructure(threadRef)?.projection.thread;
+  const allWatches = threadProjection?.commandWatches ?? [];
+  const watches = commandWatchesLive(allWatches);
+  const settled = threadProjection !== undefined && commandWatchesSuspended(threadProjection);
   const canOperateThread = useEnvironmentScope(target.environmentId, AuthOrchestrationOperateScope);
-  const watchIds = new Set(watches.map((watch) => watch.id));
+  const watchIds = new Set(allWatches.map((watch) => watch.id));
   const otherItems =
     presentPendingBackgroundWork(thread?.pendingBackgroundTasks ?? [])?.items.filter(
       (item) => !watchIds.has(item.taskId),
@@ -78,6 +83,7 @@ export function ThreadBackgroundWorkSheet({ route }: StaticScreenProps<Backgroun
           environmentId={target.environmentId}
           threadId={target.threadId}
           watch={watch}
+          settled={settled}
           canOperateThread={canOperateThread}
         />
       ))}

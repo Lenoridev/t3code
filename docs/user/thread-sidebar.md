@@ -220,16 +220,25 @@ and sends the agent an update when the command's output changes. The first check
 output, so a state that already holds does not wake the agent. Updates wait while the agent is
 busy and arrive one at a time; none are dropped.
 
+When only some changes are news, the agent can add a short comparison script, for example to skip
+your own comments or to report "new comment" instead of "2 lines changed". The script runs in a
+restricted interpreter with no access to files, the network, or other programs. It can also end the
+watch once a condition the agent declared is met, such as CI finishing.
+
 The command runs on the server machine with the server's account permissions, outside the agent's
 sandbox. In Full access a watch starts at once. In other modes it waits for you: the thread shows
 **Pending Approval**. Choose **Review** at the end of the conversation, or open the
 Background work sheet on mobile, to see the full command and choose **Allow this watch** or
-**Deny**. Your approval covers that exact command and the helper scripts it runs. If either
-changes, or you leave Full access for a watch Full access allowed, the watch asks again.
+**Deny**. Your approval covers that exact command, the helper scripts and comparison script it
+uses, and how often it runs. If any of them changes, or you leave Full access for a watch Full access allowed, the watch asks again.
 
 After 8 failed checks in a row a watch pauses and the thread shows **Paused**. Choose **Resume**
-once the cause is fixed. To stop a watch, use **Watching** in the thread details on web and
-desktop, or the Background work sheet on mobile. Settling or archiving the thread ends its watches.
+once the cause is fixed. You or the agent can also pause a watch for a while. The thread shows **Paused** until
+it is resumed, and only you can resume a watch you paused. To stop a watch, use **Watching** in the thread details on web and
+desktop, or the Background work sheet on mobile. Settling a thread pauses its running watches:
+they check once right away when you un-settle it, and report what changed in between as one change.
+Archiving a thread ends its watches. A snoozed thread keeps checking and stays hidden until a watch
+detects a change, pauses, or needs your approval, any of which brings the thread back.
 Subagents cannot start watches.
 
 ## Find and reference work
@@ -317,4 +326,5 @@ you confirm; one day means 24 hours. On web and desktop, you can also snooze
 several selected threads together. Choose **Wake thread** to bring a thread back early.
 A snoozed thread keeps working and stays hidden until its wake time, even while
 its agent wakes itself for background work. It comes back early only when it needs
-an approval or answer from you, when a run fails, or when you send it a message.
+an approval or answer from you, when a run fails, when a command watch detects a change, or when
+you send it a message.

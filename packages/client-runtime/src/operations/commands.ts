@@ -846,7 +846,7 @@ export const interruptThreadTurn = Effect.fn("EnvironmentCommands.interruptThrea
           watching: false,
         });
       }
-      if ((projection.thread.commandWatches ?? []).length > 0) {
+      if ((projection.thread.commandWatches ?? []).some((watch) => watch.status !== "ended")) {
         result = yield* dispatch({
           type: "thread.command-watch.stop",
           commandId: yield* allocateCommandId(result.sequence === 0 ? input : {}),

@@ -4,7 +4,10 @@ import {
   deriveThreadRuntime,
 } from "@t3tools/client-runtime/state/thread-execution";
 import { checkpointFileTotals } from "@t3tools/client-runtime/state/thread-checkpoints";
-import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import {
+  commandWatchesHoldingThread,
+  derivePendingBackgroundWork,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import {
   latestUnheldRun,
   usageLimitRunPresentedAsLatest,
@@ -1560,7 +1563,7 @@ export function deriveThreadPendingBackgroundTasks(projection: ThreadStructure |
       activeProviderThreadId: projection.thread.activeProviderThreadId,
       runs: projection.runs,
       pullRequests: projection.thread.pullRequests,
-      commandWatches: projection.thread.commandWatches,
+      commandWatches: commandWatchesHoldingThread(projection.thread),
     }),
   ];
 }

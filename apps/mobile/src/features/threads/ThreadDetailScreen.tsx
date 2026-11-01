@@ -9,6 +9,10 @@ import {
 import { AsyncResult, Atom } from "effect/reactivity";
 import * as Dialog from "../../components/ui/Dialog";
 import { useAtomMount, useAtomValue } from "@effect/atom-react";
+import {
+  commandWatchesLive,
+  commandWatchesTitle,
+} from "@t3tools/client-runtime/state/command-watches";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entities";
 import { createThreadVisitTracker } from "@t3tools/client-runtime/state/thread-visits";
@@ -609,14 +613,17 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
       );
     }
   };
-  const pendingBackgroundWork = presentPendingBackgroundWork(
-    props.selectedThread.pendingBackgroundTasks,
-  );
+  const commandWatches =
+    useQuietThreadStructure(scopeThreadRef(props.environmentId, props.selectedThread.id))
+      ?.projection.thread.commandWatches ?? [];
   const watchAwaitingApproval =
-    useQuietThreadStructure(
-      scopeThreadRef(props.environmentId, props.selectedThread.id),
-    )?.projection.thread.commandWatches?.find((watch) => watch.status === "awaiting_approval") ??
-    null;
+    commandWatches.find((watch) => watch.status === "awaiting_approval") ?? null;
+  // Watches have their own status: this one's Stop interrupts the thread's other work.
+  const pendingBackgroundWork = presentPendingBackgroundWork(
+    props.selectedThread.pendingBackgroundTasks.filter(
+      (task) => !commandWatches.some((watch) => watch.id === task.taskId),
+    ),
+  );
   const floatingStatus = ((): FloatingWorkingStatus | null => {
     const connectionStatus = connectionFloatingStatus({
       connectionError: props.connectionError,
@@ -708,6 +715,22 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
           accessibilityLabel: actionLabel,
           disabled: !props.canOperateThread || statusPending,
           onPress: () => void runStatusAction(snoozed ? "wake" : settled ? "unsettle" : "dismiss"),
+        },
+      };
+    }
+    const liveWatches = commandWatchesLive(commandWatches);
+    // While settled nothing runs, so the settled status says more than the watches.
+    if (liveWatches.length > 0 && !settled && contentPresentationKind === "ready") {
+      return {
+        kind: "watch",
+        label: commandWatchesTitle(liveWatches),
+        accessibilityLabel: `${commandWatchesTitle(liveWatches)}. Open background work.`,
+        onPress: () => {
+          Keyboard.dismiss();
+          navigation.navigate("ThreadBackgroundWork", {
+            environmentId: props.environmentId,
+            threadId: props.selectedThread.id,
+          });
         },
       };
     }

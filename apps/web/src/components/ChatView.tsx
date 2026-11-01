@@ -354,7 +354,8 @@ import { ChatTerminalDrawers } from "./chat/ChatTerminalDrawers";
 import { ChatRightPanel } from "./chat/ChatRightPanel";
 import { useDraftEnvironmentRouting } from "./chat/useDraftEnvironmentRouting";
 import { branchMismatchBannerItem } from "./chat/ThreadActivityBanners";
-import { commandWatchNowItem } from "./chat/CommandWatchNow";
+import { commandWatchesSuspended } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { commandWatchNowItem, commandWatchRunningNowItem } from "./chat/CommandWatchNow";
 import { ThreadNow } from "./chat/ThreadNow";
 import type { ThreadStructure } from "@t3tools/client-runtime/state/shell";
 import { useDelayedStatus } from "../hooks/useDelayedStatus";
@@ -1435,7 +1436,10 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadLiveTokenUsage,
     activeProviderThread,
   );
-  const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
+  // Watches have their own lines, with a Stop that ends only the watch.
+  const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection).filter(
+    (task) => !serverProjection?.thread.commandWatches?.some((watch) => watch.id === task.taskId),
+  );
   const activeWorkStartedAt =
     deriveActiveWorkStartedAt(activeActivityRun, activeRuntime, localDispatchStartedAt) ??
     runlessWorkStartedAt;
@@ -3001,9 +3005,19 @@ export default function ChatView(props: ChatViewProps) {
           threadId: serverProjection.thread.id,
           watches: serverProjection.thread.commandWatches,
         });
+  const commandWatchRunningNow =
+    serverProjection === null
+      ? null
+      : commandWatchRunningNowItem({
+          environmentId,
+          threadId: serverProjection.thread.id,
+          watches: serverProjection.thread.commandWatches,
+          settled: commandWatchesSuspended(serverProjection.thread),
+        });
   const hasThreadNow =
     childInputNow !== null ||
     commandWatchNow !== null ||
+    commandWatchRunningNow !== null ||
     backgroundWorkNow !== null ||
     goalNow !== null ||
     shownThreadSyncPhase !== null;
@@ -3049,6 +3063,7 @@ export default function ChatView(props: ChatViewProps) {
           watch={commandWatchNow}
           work={backgroundWorkNow}
           syncPhase={shownThreadSyncPhase}
+          watching={commandWatchRunningNow}
           goal={goalNow}
         />
         {threadStatusLine}

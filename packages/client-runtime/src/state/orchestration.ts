@@ -97,6 +97,13 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       tag: ORCHESTRATION_V2_WS_METHODS.getTurnDiff,
       ...onCheckpointDiffAnswer,
     }),
+    commandWatchDetails: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:command-watch-details",
+      tag: ORCHESTRATION_V2_WS_METHODS.getCommandWatchDetails,
+      // A revision never changes, so what was read stays right.
+      staleTimeMs: 300_000,
+      idleTtlMs: 300_000,
+    }),
     workflowScript: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:workflow-script",
       tag: ORCHESTRATION_V2_WS_METHODS.getWorkflowScript,

@@ -239,7 +239,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                 <ThreadServersPanel environmentId={props.environmentId} threadId={props.threadId} />
               ) : null}
 
-              {density === "full" && !props.draftId && visible.automations ? (
+              {/* At every density: a watch can need the user's approval here. */}
+              {!props.draftId && visible.automations ? (
                 <ThreadDetailsCommandWatchRows
                   environmentId={props.environmentId}
                   threadId={props.threadId}
