@@ -1142,6 +1142,21 @@ export const resumeThreadCommandWatch = Effect.fn("EnvironmentCommands.resumeThr
     });
   },
 );
+export type PauseThreadCommandWatchInput = Omit<
+  Extract<OrchestrationV2Command, { type: "thread.command-watch.pause" }>,
+  "type" | "commandId" | "pausedBy"
+> &
+  CommandMetadata;
+export const pauseThreadCommandWatch = Effect.fn("EnvironmentCommands.pauseThreadCommandWatch")(
+  function* (input: PauseThreadCommandWatchInput) {
+    return yield* dispatch({
+      ...input,
+      type: "thread.command-watch.pause",
+      pausedBy: "user",
+      commandId: yield* allocateCommandId(input),
+    });
+  },
+);
 export const unlinkThreadPullRequest = Effect.fn("EnvironmentCommands.unlinkThreadPullRequest")(
   function* (input: UnlinkThreadPullRequestInput) {
     return yield* dispatch({

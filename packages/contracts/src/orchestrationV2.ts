@@ -3088,6 +3088,14 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     watchId: TrimmedNonEmptyString,
   }),
+  /** Stops a running watch's checks until it is resumed. */
+  Schema.Struct({
+    type: Schema.Literal("thread.command-watch.pause"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    watchId: TrimmedNonEmptyString,
+    pausedBy: Schema.Literals(["user", "agent"]),
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request.sync"),
     commandId: CommandId,

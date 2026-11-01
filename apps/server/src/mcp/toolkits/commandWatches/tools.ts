@@ -115,6 +115,11 @@ export const UnwatchCommandInput = Schema.Struct({
 });
 export type UnwatchCommandInput = typeof UnwatchCommandInput.Type;
 
+export const PauseCommandWatchInput = Schema.Struct({
+  watchId: TrimmedNonEmptyString.annotate({ description: "The running watch to pause." }),
+});
+export type PauseCommandWatchInput = typeof PauseCommandWatchInput.Type;
+
 export const ResumeCommandWatchInput = Schema.Struct({
   watchId: TrimmedNonEmptyString.annotate({ description: "The paused watch to resume." }),
 });
@@ -229,9 +234,23 @@ const ListCommandWatchesTool = Tool.make("list_command_watches", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
+const PauseCommandWatchTool = Tool.make("pause_command_watch", {
+  description:
+    "Stop a command watch's checks until you call resume_command_watch; nothing resumes it for you, and the user sees it paused. Changes it already detected still arrive, and one check in progress may add another. Use it when you expect noise you will cause yourself; use unwatch_command when you no longer need the watch.",
+  parameters: PauseCommandWatchInput,
+  success: CommandWatchesResult,
+  failure: CommandWatchToolError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Pause command watch")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false);
+
 const ResumeCommandWatchTool = Tool.make("resume_command_watch", {
   description:
-    "Resume a paused command watch on this thread. It continues from the last accepted output, so it reports what changed while it was paused as one change.",
+    "Resume a paused command watch on this thread, unless the user paused it: that one is theirs to resume. It continues from the last accepted output, so it reports what changed while it was paused as one change.",
   parameters: ResumeCommandWatchInput,
   success: CommandWatchesResult,
   failure: CommandWatchToolError,
@@ -288,6 +307,7 @@ export const CommandWatchesToolkit = Toolkit.make(
   WatchCommandTool,
   UnwatchCommandTool,
   ListCommandWatchesTool,
+  PauseCommandWatchTool,
   ResumeCommandWatchTool,
   ReadCommandWatchChangeTool,
   ReadCommandWatchTool,

@@ -35,6 +35,7 @@ import {
   CommandWatchesToolkit,
   type ReadCommandWatchChangeInput,
   type ReadCommandWatchInput,
+  type PauseCommandWatchInput,
   type ResumeCommandWatchInput,
   type TestCommandWatchComparisonInput,
   type UnwatchCommandInput,
@@ -305,10 +306,33 @@ const make = Effect.gen(function* () {
         return { watches: yield* watchesOf(caller.id) };
       }),
     ),
+    pause_command_watch: McpToolAccess.actsAsCaller((input: PauseCommandWatchInput) =>
+      Effect.gen(function* () {
+        yield* requireOrchestration;
+        const caller = yield* requireCaller("pause its command watches");
+        const commandSuffix = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+        yield* engine
+          .dispatch({
+            type: "thread.command-watch.pause",
+            commandId: CommandId.make(`server:mcp-command-pause:${caller.id}:${commandSuffix}`),
+            threadId: caller.id,
+            watchId: input.watchId,
+            pausedBy: "agent",
+          })
+          .pipe(Effect.catchCause(refusal));
+        return { watches: yield* watchesOf(caller.id) };
+      }),
+    ),
     resume_command_watch: McpToolAccess.actsAsCaller((input: ResumeCommandWatchInput) =>
       Effect.gen(function* () {
         yield* requireOrchestration;
         const caller = yield* requireCaller("resume its command watches");
+        const watch = (yield* watchesOf(caller.id)).find(({ id }) => id === input.watchId);
+        if (watch?.pauseReason === "user") {
+          return yield* new CommandWatchFailedError({
+            reason: `The user paused watch ${input.watchId}. Only they can resume it.`,
+          });
+        }
         const commandSuffix = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
         yield* engine
           .dispatch({

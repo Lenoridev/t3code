@@ -78,7 +78,12 @@ export const ThreadCommandWatchStatus = Schema.Literals([
 ]);
 export type ThreadCommandWatchStatus = typeof ThreadCommandWatchStatus.Type;
 
-export const ThreadCommandWatchPauseReason = Schema.Literals(["failures", "storage-limit"]);
+export const ThreadCommandWatchPauseReason = Schema.Literals([
+  "failures",
+  "storage-limit",
+  "user",
+  "agent",
+]);
 export type ThreadCommandWatchPauseReason = typeof ThreadCommandWatchPauseReason.Type;
 
 export const ThreadCommandWatchEndReason = Schema.Literals(["stopped", "completed", "denied"]);

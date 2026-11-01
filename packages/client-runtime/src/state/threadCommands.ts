@@ -58,6 +58,7 @@ import {
   watchThreadPullRequest,
   stopThreadCommandWatch,
   approveThreadCommandWatch,
+  pauseThreadCommandWatch,
   resumeThreadCommandWatch,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -262,6 +263,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     resumeCommandWatch: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:resume-command-watch",
       execute: resumeThreadCommandWatch,
+      scheduler,
+      concurrency,
+    }),
+    pauseCommandWatch: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:pause-command-watch",
+      execute: pauseThreadCommandWatch,
       scheduler,
       concurrency,
     }),

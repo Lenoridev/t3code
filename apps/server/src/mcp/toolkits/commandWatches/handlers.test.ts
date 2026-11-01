@@ -60,6 +60,7 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
     readonly runtimeMode?: RuntimeMode;
     readonly subagent?: boolean;
     readonly reject?: string;
+    readonly watches?: ReadonlyArray<{ readonly id: string; readonly pauseReason: "user" }>;
   } = {},
 ) {
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
@@ -89,7 +90,7 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
         Effect.succeed({
           thread: {
             ...McpToolAccessTestkit.idleThreadProjection(shell).thread,
-            commandWatches: [],
+            commandWatches: options.watches ?? [],
           },
         }) as never,
     }),
@@ -304,6 +305,34 @@ describe("command watch toolkit handlers", () => {
       const [stop] = yield* Ref.get(harness.commands);
       expect(stop).toMatchObject({ type: "thread.command-watch.stop", threadId: THREAD_ID });
       expect(stop).not.toHaveProperty("watchId");
+    }),
+  );
+
+  it.effect("pauses the named watch on the calling thread", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* harness.call("pause_command_watch", { watchId: "command-watch:a" });
+      const [pause] = yield* Ref.get(harness.commands);
+      expect(pause).toMatchObject({
+        type: "thread.command-watch.pause",
+        threadId: THREAD_ID,
+        watchId: "command-watch:a",
+        pausedBy: "agent",
+      });
+    }),
+  );
+
+  it.effect("refuses to resume a watch the user paused", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        watches: [{ id: "command-watch:a", pauseReason: "user" }],
+      });
+      expect(
+        yield* harness
+          .call("resume_command_watch", { watchId: "command-watch:a" })
+          .pipe(Effect.flip),
+      ).toMatchObject({ reason: expect.stringContaining("Only they can resume it") });
+      expect(yield* Ref.get(harness.commands)).toEqual([]);
     }),
   );
 });

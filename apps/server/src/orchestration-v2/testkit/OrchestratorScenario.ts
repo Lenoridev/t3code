@@ -157,6 +157,7 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "thread.command-watch.stop":
     case "thread.command-watch.approve":
     case "thread.command-watch.resume":
+    case "thread.command-watch.pause":
     case "thread.pull-request.sync":
     case "thread.title.regeneration.complete":
     case "thread.runtime-mode.set":

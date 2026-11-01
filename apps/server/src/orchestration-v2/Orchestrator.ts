@@ -592,6 +592,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.command-watch.stop":
     case "thread.command-watch.approve":
     case "thread.command-watch.resume":
+    case "thread.command-watch.pause":
     case "thread.command-watch.sync":
     case "thread.pull-request.sync":
     case "thread.title.regeneration.complete":
@@ -2916,6 +2917,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           | "thread.command-watch.stop"
           | "thread.command-watch.approve"
           | "thread.command-watch.resume"
+          | "thread.command-watch.pause"
           | "thread.command-watch.sync";
       }
     >,
@@ -3104,6 +3106,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             comparisonFailures: 0,
           }),
         );
+        break;
+      }
+      case "thread.command-watch.pause": {
+        const watch = watches.find((candidate) => candidate.id === command.watchId);
+        if (watch === undefined || watch.status === "ended") {
+          return yield* refuse(`The watch ${command.watchId} ended.`);
+        }
+        if (watch.status === "paused") return;
+        if (watch.status === "awaiting_approval") {
+          return yield* refuse(`The watch ${command.watchId} has not been approved yet.`);
+        }
+        next = replaceWatch(watch.id, (candidate) => ({
+          ...candidate,
+          status: "paused",
+          pauseReason: command.pausedBy,
+        }));
         break;
       }
       case "thread.command-watch.sync": {
@@ -13032,6 +13050,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.command-watch.stop":
       case "thread.command-watch.approve":
       case "thread.command-watch.resume":
+      case "thread.command-watch.pause":
       case "thread.command-watch.sync":
         yield* dispatchCommandWatch(command, events, effects);
         break;
@@ -13372,7 +13391,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           // Watching a command already watched, or stopping a watch that already ended.
           command.type === "thread.command-watch.start" ||
           command.type === "thread.command-watch.stop" ||
-          command.type === "thread.command-watch.resume",
+          command.type === "thread.command-watch.resume" ||
+          command.type === "thread.command-watch.pause",
         (_planned) =>
           new OrchestratorDispatchError({
             commandId: command.commandId,
