@@ -23,6 +23,8 @@ import type { Tool } from "effect/ai";
 import type * as CommandWatchStore from "../../../orchestration-v2/CommandWatchStore.ts";
 import { CommandWatchStore as CommandWatchStoreService } from "../../../orchestration-v2/CommandWatchStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as CommandWatchComparison from "../../../orchestration-v2/CommandWatchComparison.ts";
+import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -110,6 +112,21 @@ const makeHarness = Effect.fn("makeCommandWatchesHarness")(function* (
       create: ({ helpers }) => Ref.update(stored, (recorded) => [...recorded, helpers]),
     }),
     Layer.mock(ProjectService.ProjectService)({}),
+    Layer.mock(CommandWatchComparison.CommandWatchComparison)({
+      compile: (source) =>
+        source.includes("function compare")
+          ? Effect.void
+          : Effect.fail(
+              new CommandWatchComparison.CommandWatchComparisonError({
+                reason: "The source must define a function named compare.",
+                unavailable: false,
+              }),
+            ),
+      compare: () => Effect.succeed('{"state":null,"changes":[]}'),
+    }),
+    Layer.mock(ServerEnvironment.ServerEnvironment)({
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("environment:test")),
+    }),
     NodeServices.layer,
   );
   const toolkit = yield* CommandWatchesToolkit.pipe(
@@ -141,6 +158,7 @@ describe("command watch toolkit handlers", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness();
       yield* harness.call("watch_command", {
+        requestId: "r1",
         command: 'sh "$T3_WATCH_HELPERS/check.sh"',
         label: "Reply",
         helpers: ["check.sh"],
@@ -164,10 +182,59 @@ describe("command watch toolkit handlers", () => {
     }),
   );
 
+  it.effect("stores comparison source under a hash and rejects source that does not compile", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* harness.call("watch_command", {
+        requestId: "r1",
+        command: "gh api",
+        label: "Reply",
+        format: "json",
+        comparisonSource: "function compare() { return { state: null, changes: [] }; }",
+        completionCondition: "the issue closes",
+      });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        {
+          comparison: { kind: "custom-js-v1" },
+          completion: { kind: "condition", description: "the issue closes" },
+          clientRequestId: "r1",
+        },
+      ]);
+
+      const broken = yield* makeHarness();
+      const error = yield* broken
+        .call("watch_command", {
+          requestId: "r2",
+          command: "gh api",
+          label: "Reply",
+          comparisonSource: "not javascript",
+        })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({ _tag: "CommandWatchFailedError" });
+      expect(yield* Ref.get(broken.commands)).toEqual([]);
+
+      const conditionOnly = yield* makeHarness();
+      expect(
+        yield* conditionOnly
+          .call("watch_command", {
+            requestId: "r3",
+            command: "gh api",
+            label: "Reply",
+            completionCondition: "done",
+          })
+          .pipe(Effect.flip),
+      ).toMatchObject({ _tag: "CommandWatchFailedError" });
+    }),
+  );
+
   it.effect("leaves approval to the server outside Full access", () =>
     Effect.gen(function* () {
       const supervised = yield* makeHarness({ runtimeMode: "approval-required" });
-      yield* supervised.call("watch_command", { command: "gh api", label: "Reply" });
+      yield* supervised.call("watch_command", {
+        requestId: "r1",
+        command: "gh api",
+        label: "Reply",
+      });
       expect(yield* Ref.get(supervised.commands)).toMatchObject([
         { type: "thread.command-watch.start" },
       ]);
@@ -179,7 +246,12 @@ describe("command watch toolkit handlers", () => {
       const escaping = yield* makeHarness();
       expect(
         yield* escaping
-          .call("watch_command", { command: "gh api", label: "Reply", helpers: ["../x.sh"] })
+          .call("watch_command", {
+            requestId: "r1",
+            command: "gh api",
+            label: "Reply",
+            helpers: ["../x.sh"],
+          })
           .pipe(Effect.flip),
       ).toMatchObject({ _tag: "CommandWatchFailedError" });
       expect(yield* Ref.get(escaping.commands)).toEqual([]);
@@ -187,7 +259,7 @@ describe("command watch toolkit handlers", () => {
       const subagent = yield* makeHarness({ subagent: true });
       expect(
         yield* subagent
-          .call("watch_command", { command: "gh api", label: "Reply" })
+          .call("watch_command", { requestId: "r1", command: "gh api", label: "Reply" })
           .pipe(Effect.flip),
       ).toMatchObject({ _tag: "CommandWatchFailedError" });
 
@@ -195,7 +267,7 @@ describe("command watch toolkit handlers", () => {
       const error = yield* outside
         .call(
           "watch_command",
-          { command: "gh api", label: "Reply" },
+          { requestId: "r1", command: "gh api", label: "Reply" },
           {
             ...threadCaller,
             thread: undefined,
@@ -216,7 +288,7 @@ describe("command watch toolkit handlers", () => {
       const harness = yield* makeHarness({ reject: "Thread already watches 5 commands." });
       expect(
         yield* harness
-          .call("watch_command", { command: "gh api", label: "Reply" })
+          .call("watch_command", { requestId: "r1", command: "gh api", label: "Reply" })
           .pipe(Effect.flip),
       ).toMatchObject({
         _tag: "CommandWatchFailedError",

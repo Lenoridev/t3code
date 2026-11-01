@@ -2,6 +2,7 @@ import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as CommandWatchComparison from "./CommandWatchComparison.ts";
 import * as CommandWatchReactor from "./CommandWatchReactor.ts";
 import * as CommandWatchStore from "./CommandWatchStore.ts";
 import * as Layer from "effect/Layer";
@@ -398,6 +399,7 @@ export const layerProduction = Layer.mergeAll(
         ProjectionStore.layer,
         CommandWatchStore.layer,
         ProcessRunner.layer,
+        CommandWatchComparison.layer.pipe(Layer.provide(ProcessRunner.layer)),
       ),
     ),
   ),

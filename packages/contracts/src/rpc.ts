@@ -218,6 +218,7 @@ import {
 } from "./relayClient.ts";
 import {
   ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2GetCommandWatchDetailsError,
   OrchestrationGetWorkflowScriptError,
   OrchestrationV2StopWorkflowError,
   OrchestrationV2DispatchCommandError,
@@ -1731,6 +1732,18 @@ const WsOrchestrationV2GetArchivedShellSnapshotRpc = Rpc.make(
   },
 );
 
+const WsOrchestrationV2GetCommandWatchDetailsRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.getCommandWatchDetails,
+  {
+    payload: OrchestrationV2RpcSchemas.getCommandWatchDetails.input,
+    success: OrchestrationV2RpcSchemas.getCommandWatchDetails.output,
+    error: Schema.Union([
+      OrchestrationV2GetCommandWatchDetailsError,
+      EnvironmentAuthorizationError,
+    ]),
+  },
+);
+
 const WsOrchestrationV2GetThreadFamilyRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.getThreadFamily, {
   payload: OrchestrationV2RpcSchemas.getThreadFamily.input,
   success: OrchestrationV2RpcSchemas.getThreadFamily.output,
@@ -2129,6 +2142,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SearchThreadRpc,
   WsOrchestrationV2SearchThreadStreamRpc,
   WsOrchestrationV2GetArchivedShellSnapshotRpc,
+  WsOrchestrationV2GetCommandWatchDetailsRpc,
   WsOrchestrationV2GetThreadFamilyRpc,
   WsOrchestrationV2GetWorktreeThreadIdsRpc,
   WsOrchestrationV2GetOlderSettledThreadsRpc,

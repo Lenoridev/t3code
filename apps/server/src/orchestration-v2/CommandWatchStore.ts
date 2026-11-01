@@ -18,7 +18,8 @@ const HelpersJson = Schema.fromJsonString(Schema.Array(CommandWatchHelperFile));
 const decodeHelpers = Schema.decodeUnknownSync(HelpersJson);
 const encodeHelpers = Schema.encodeSync(HelpersJson);
 
-export type CommandWatchChangeKind = "output.changed" | "initial-state" | "notice";
+/** `output.changed`, `initial-state`, `notice`, `completed`, or a custom comparison's own. */
+export type CommandWatchChangeKind = string;
 
 export interface CommandWatchChange {
   readonly sequence: number;
@@ -30,6 +31,13 @@ export interface CommandWatchChange {
 
 export interface CommandWatchStorage {
   readonly helpers: ReadonlyArray<CommandWatchHelperFile>;
+  readonly comparisonSource: string | null;
+  /** JSON a custom comparison keeps between checks. */
+  readonly comparisonState: string | null;
+  /** Set with the accepted result that completed the watch, so a crash cannot lose it. */
+  readonly completionReason: string | null;
+  /** When the next check may run, in epoch milliseconds, so a restart keeps its backoff. */
+  readonly nextCheckAt: number | null;
   /** The last accepted output, null until the first successful check. */
   readonly observation: string | null;
   /** Changes up to here reached the agent, or were cancelled with the update carrying them. */
@@ -47,6 +55,7 @@ export class CommandWatchStore extends Context.Service<
       readonly watchId: string;
       readonly threadId: string;
       readonly helpers: ReadonlyArray<CommandWatchHelperFile>;
+      readonly comparisonSource?: string | undefined;
       readonly now: string;
     }) => Effect.Effect<void, PersistenceSqlError>;
     readonly get: (
@@ -57,8 +66,16 @@ export class CommandWatchStore extends Context.Service<
       readonly watchId: string;
       readonly observation: string;
       readonly changes: ReadonlyArray<Omit<CommandWatchChange, "sequence" | "detectedAt">>;
+      readonly comparisonState?: string | null | undefined;
+      readonly completionReason?: string | undefined;
       readonly now: string;
     }) => Effect.Effect<void, PersistenceSqlError>;
+    readonly setNextCheckAt: (
+      watchId: string,
+      at: number,
+    ) => Effect.Effect<void, PersistenceSqlError>;
+    /** A deliberate stop wants nothing more from the watch, so its waiting changes go. */
+    readonly discardWaiting: (watchId: string) => Effect.Effect<void, PersistenceSqlError>;
     /** Adds a change without replacing the observation, such as a pause notice. */
     readonly note: (input: {
       readonly watchId: string;
@@ -141,11 +158,17 @@ const make = Effect.gen(function* () {
   });
 
   return CommandWatchStore.of({
-    create: Effect.fn("CommandWatchStore.create")(function* ({ watchId, threadId, helpers, now }) {
+    create: Effect.fn("CommandWatchStore.create")(function* ({
+      watchId,
+      threadId,
+      helpers,
+      comparisonSource,
+      now,
+    }) {
       return yield* sql`
         INSERT INTO command_watch_storage
-          (watch_id, thread_id, helpers_json, observation, next_sequence, delivered_through, updated_at)
-        VALUES (${watchId}, ${threadId}, ${encodeHelpers(helpers)}, NULL, 1, 0, ${now})
+          (watch_id, thread_id, helpers_json, comparison_source, observation, next_sequence, delivered_through, updated_at)
+        VALUES (${watchId}, ${threadId}, ${encodeHelpers(helpers)}, ${comparisonSource ?? null}, NULL, 1, 0, ${now})
         ON CONFLICT (watch_id) DO NOTHING
       `.pipe(Effect.asVoid, Effect.mapError(fail("create")));
     }),
@@ -153,10 +176,15 @@ const make = Effect.gen(function* () {
     get: Effect.fn("CommandWatchStore.get")(function* (watchId) {
       return yield* sql<{
         readonly helpers_json: string;
+        readonly comparison_source: string | null;
+        readonly comparison_state: string | null;
+        readonly completion_reason: string | null;
+        readonly next_check_at: number | null;
         readonly observation: string | null;
         readonly delivered_through: number;
       }>`
-        SELECT helpers_json, observation, delivered_through
+        SELECT helpers_json, comparison_source, comparison_state, completion_reason, next_check_at,
+          observation, delivered_through
         FROM command_watch_storage WHERE watch_id = ${watchId}
       `.pipe(
         Effect.map(([row]) =>
@@ -164,6 +192,10 @@ const make = Effect.gen(function* () {
             ? undefined
             : {
                 helpers: decodeHelpers(row.helpers_json),
+                comparisonSource: row.comparison_source,
+                comparisonState: row.comparison_state,
+                completionReason: row.completion_reason,
+                nextCheckAt: row.next_check_at,
                 observation: row.observation,
                 deliveredThrough: row.delivered_through,
               },
@@ -176,6 +208,8 @@ const make = Effect.gen(function* () {
       watchId,
       observation,
       changes,
+      comparisonState,
+      completionReason,
       now,
     }) {
       return yield* sql
@@ -183,12 +217,30 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             if (!(yield* insertChanges(watchId, changes, now))) return;
             yield* sql`
-              UPDATE command_watch_storage SET observation = ${observation}, updated_at = ${now}
+              UPDATE command_watch_storage
+              SET observation = ${observation},
+                comparison_state = ${comparisonState ?? null},
+                completion_reason = ${completionReason ?? null},
+                updated_at = ${now}
               WHERE watch_id = ${watchId}
             `;
           }),
         )
         .pipe(Effect.mapError(fail("accept")));
+    }),
+
+    setNextCheckAt: Effect.fn("CommandWatchStore.setNextCheckAt")(function* (watchId, at) {
+      return yield* sql`
+        UPDATE command_watch_storage SET next_check_at = ${at} WHERE watch_id = ${watchId}
+      `.pipe(Effect.asVoid, Effect.mapError(fail("setNextCheckAt")));
+    }),
+
+    discardWaiting: Effect.fn("CommandWatchStore.discardWaiting")(function* (watchId) {
+      return yield* sql`
+        UPDATE command_watch_storage
+        SET delivered_through = next_sequence - 1
+        WHERE watch_id = ${watchId} AND delivered_through < next_sequence - 1
+      `.pipe(Effect.asVoid, Effect.mapError(fail("discardWaiting")));
     }),
 
     note: Effect.fn("CommandWatchStore.note")(function* ({ watchId, change, now }) {
@@ -215,7 +267,8 @@ const make = Effect.gen(function* () {
         SELECT SUM(LENGTH(CAST(c.content AS BLOB))) AS bytes
         FROM command_watch_changes c
         JOIN command_watch_storage s ON s.watch_id = c.watch_id
-        WHERE c.watch_id = ${watchId} AND c.sequence > s.delivered_through AND c.kind != 'notice'
+        WHERE c.watch_id = ${watchId} AND c.sequence > s.delivered_through
+          AND c.kind NOT IN ('notice', 'completed')
       `.pipe(
         Effect.map(([row]) => row?.bytes ?? 0),
         Effect.mapError(fail("waitingBytes")),

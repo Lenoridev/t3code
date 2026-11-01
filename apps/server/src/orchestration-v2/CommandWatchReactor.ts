@@ -25,6 +25,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type * as Scope from "effect/Scope";
 
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -36,8 +37,13 @@ import {
   commandWatchPauseNotice,
   commandWatchRevisionText,
   commandWatchUpdate,
-  evaluateCommandWatchCheck,
+  compareCommandWatchOutput,
+  comparisonValue,
+  parseComparisonState,
+  readComparisonResult,
+  readCommandWatchRun,
 } from "./commandWatch.ts";
+import * as CommandWatchComparison from "./CommandWatchComparison.ts";
 import * as CommandWatchStore from "./CommandWatchStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -88,17 +94,19 @@ const throughOf = (messageId: string) => Number(messageId.slice(messageId.lastIn
  * The server's own shell, run non-interactively: the server already loaded the login PATH.
  * Resolved once, since finding the user's shell can read the account database.
  */
-const resolveShell = Effect.gen(function* () {
+export const resolveCommandWatchShell = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
   if (platform === "win32") {
-    return (command: string) => ({
-      command: "powershell.exe",
-      args: ["-NoProfile", "-NonInteractive", "-Command", command],
-    });
+    return {
+      program: "powershell.exe",
+      invocation: (command: string) => ["-NoProfile", "-NonInteractive", "-Command", command],
+    };
   }
   const environment = yield* HostProcess.Environment;
-  const shell = listLoginShellCandidates(platform, environment.SHELL)[0] ?? "/bin/sh";
-  return (command: string) => ({ command: shell, args: ["-c", command] });
+  return {
+    program: listLoginShellCandidates(platform, environment.SHELL)[0] ?? "/bin/sh",
+    invocation: (command: string) => ["-c", command],
+  };
 });
 
 /**
@@ -123,11 +131,13 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const store = yield* CommandWatchStore.CommandWatchStore;
   const processes = yield* ProcessRunner.ProcessRunner;
+  const comparison = yield* CommandWatchComparison.CommandWatchComparison;
+  const environment = yield* ServerEnvironment.ServerEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const permits = yield* Semaphore.make(CONCURRENT_RUNS);
-  const shellInvocation = yield* resolveShell;
+  const shell = yield* resolveCommandWatchShell;
   const runs = yield* FiberMap.make<string, void, never>();
   const dueAt = new Map<string, number>();
   let watchesChanged = true;
@@ -190,26 +200,35 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  /** Whether the watch's approval still covers what it would run. */
-  const authorized = Effect.fn("CommandWatchReactor.authorized")(function* (
+  /**
+   * The revision this server would actually run now. It covers this environment's id, so a
+   * database copied elsewhere carries no grants, and the stored helper and comparison copies.
+   */
+  const currentRevision = Effect.fn("CommandWatchReactor.currentRevision")(function* (
     thread: ProjectionStore.ProjectionThreadCommandWatches,
     watch: ThreadCommandWatch,
-    helpers: ReadonlyArray<CommandWatchStore.CommandWatchHelperFile>,
+    storage: CommandWatchStore.CommandWatchStorage,
   ) {
-    if (watch.authority === null) return false;
-    if (watch.authority.kind === "full-access") return thread.runtimeMode === "full-access";
-    const helperHashes = yield* Effect.forEach(helpers, (helper) =>
+    const helpers = yield* Effect.forEach(storage.helpers, (helper) =>
       sha256(helper.content).pipe(Effect.map((sha) => ({ path: helper.path, sha256: sha }))),
     );
-    const stored = yield* sha256(
+    const revisionHash = yield* sha256(
       commandWatchRevisionText({
+        environmentId: yield* environment.getEnvironmentId,
+        threadId: thread.id,
         command: watch.command,
         format: watch.format,
         cwd: watch.cwd,
-        helpers: helperHashes,
+        shell: shell.program,
+        comparisonSourceSha256:
+          storage.comparisonSource === null ? null : yield* sha256(storage.comparisonSource),
+        completion: watch.completion,
+        everyMinutes: watch.everyMinutes,
+        reportInitialState: watch.reportInitialState,
+        helpers,
       }),
     );
-    return stored === watch.revisionHash && watch.authority.revisionHash === watch.revisionHash;
+    return { revisionHash, helpers };
   });
 
   const execute = Effect.fn("CommandWatchReactor.execute")(function* (
@@ -235,11 +254,10 @@ export const make = Effect.gen(function* () {
         }),
       { discard: true },
     );
-    const shell = shellInvocation(watch.command);
     return yield* processes
       .run({
-        command: shell.command,
-        args: shell.args,
+        command: shell.program,
+        args: shell.invocation(watch.command),
         cwd: watch.cwd,
         env: { T3_WATCH_HELPERS: helperDirectory },
         timeout: `${RUN_TIMEOUT_SECONDS} seconds`,
@@ -270,28 +288,102 @@ export const make = Effect.gen(function* () {
       );
   }, Effect.scoped);
 
-  /** One check: run, compare, store what was accepted, then record and deliver in one command. */
-  const check = Effect.fn("CommandWatchReactor.check")(function* (
-    thread: ProjectionStore.ProjectionThreadCommandWatches,
+  /** Agent-written comparison, or the built-in one. Fails as a check, never by defect. */
+  const compare = Effect.fn("CommandWatchReactor.compare")(function* (
     watch: ThreadCommandWatch,
+    storage: CommandWatchStore.CommandWatchStorage,
+    run: CommandWatchRun,
   ) {
+    const observed = readCommandWatchRun({ format: watch.format, run });
+    if (observed.kind === "failed") return observed;
+    if (storage.comparisonSource === null) {
+      return compareCommandWatchOutput({
+        format: watch.format,
+        previous: storage.observation,
+        reportInitialState: watch.reportInitialState,
+        observed,
+      });
+    }
+    // Identical output skips comparison, so a quiet check spawns nothing.
+    if (observed.observation === storage.observation) return { kind: "unchanged" } as const;
+    const phase = storage.observation === null ? ("baseline" as const) : ("update" as const);
+    return yield* comparison
+      .compare(storage.comparisonSource, {
+        phase,
+        previous: comparisonValue(storage.observation, watch.format),
+        current: observed.value,
+        state: parseComparisonState(storage.comparisonState),
+      })
+      .pipe(
+        Effect.map((resultJson) =>
+          readComparisonResult({
+            resultJson,
+            observation: observed.observation,
+            phase,
+            reportInitialState: watch.reportInitialState,
+            completion: watch.completion,
+          }),
+        ),
+        Effect.catch((error) =>
+          Effect.succeed({
+            kind: "failed" as const,
+            stage: "comparison" as const,
+            reason: `comparison ${error.reason}`,
+          }),
+        ),
+      );
+  });
+
+  /** One check: run, compare, store what was accepted, then record and deliver in one command. */
+  const check = Effect.fn("CommandWatchReactor.check")(function* (threadId: ThreadId, key: string) {
+    // Rechecked after waiting for a permit: the watch may have stopped or lost its authority.
+    const [thread] = yield* projections.getThreadsWithCommandWatches(threadId);
+    const watch = thread?.commandWatches.find((candidate) => watchKey(candidate) === key);
+    if (thread === undefined || watch === undefined || !running(watch) || !mayRun(thread)) return;
     const now = DateTime.formatIso(yield* DateTime.now);
     let storage = yield* store.get(watch.id);
     if (storage === undefined) {
       yield* store.create({ watchId: watch.id, threadId: thread.id, helpers: [], now });
-      storage = { helpers: [], observation: null, deliveredThrough: 0 };
+      storage = yield* store.get(watch.id);
+      if (storage === undefined) return;
     }
-    if (!(yield* authorized(thread, watch, storage.helpers))) {
-      // A changed definition or helper never runs under an approval given for another one.
-      yield* record(thread.id, watch, { status: "awaiting_approval" });
+    if (watch.authority === null) return;
+    if (watch.authority.kind === "full-access") {
+      // Leaving Full access already sent this watch back for approval; this check lost a race.
+      if (thread.runtimeMode !== "full-access") return;
+    } else {
+      const revision = yield* currentRevision(thread, watch, storage);
+      const allowed = watch.authority.revisionHash;
+      if (revision.revisionHash !== allowed || allowed !== watch.revisionHash) {
+        // A changed definition, shell or helper never runs under an approval given for another.
+        // The user reviews what would run now; the watch keeps its accepted state.
+        yield* record(thread.id, watch, {
+          status: "awaiting_approval",
+          revisionHash: revision.revisionHash,
+          shell: shell.program,
+          helpers: revision.helpers,
+        });
+        return;
+      }
+    }
+    // A result that completed the watch is already stored, so a crash before this recorded it
+    // must not be lost to the next check finding the output identical.
+    if (storage.completionReason !== null) {
+      const delivery = yield* planDelivery(thread.id, watch);
+      yield* record(
+        thread.id,
+        watch,
+        {
+          ...delivery.patch,
+          status: "ended",
+          endReason: "completed",
+          endDetail: storage.completionReason,
+        },
+        delivery.wake,
+      );
       return;
     }
-    const outcome = evaluateCommandWatchCheck({
-      format: watch.format,
-      previous: storage.observation,
-      reportInitialState: watch.reportInitialState,
-      run: yield* execute(watch, storage.helpers),
-    });
+    const outcome = yield* compare(watch, storage, yield* execute(watch, storage.helpers));
     const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
     let failures = 0;
     if (outcome.kind === "failed") {
@@ -317,10 +409,20 @@ export const make = Effect.gen(function* () {
           watchId: watch.id,
           observation: outcome.observation,
           changes: outcome.changes,
+          comparisonState: outcome.state,
+          completionReason: outcome.completionReason,
           now,
         });
+        if (outcome.completionReason !== undefined) {
+          patch.status = "ended";
+          patch.endReason = "completed";
+          patch.endDetail = outcome.completionReason;
+        }
         if (outcome.changes.length > 0) patch.lastChangeAt = now;
-        if ((yield* store.waitingBytes(watch.id)) > COMMAND_WATCH_BACKLOG_LIMIT_BYTES) {
+        if (
+          patch.status === undefined &&
+          (yield* store.waitingBytes(watch.id)) > COMMAND_WATCH_BACKLOG_LIMIT_BYTES
+        ) {
           yield* store.note({
             watchId: watch.id,
             change: commandWatchPauseNotice("storage-limit", "", now),
@@ -335,7 +437,11 @@ export const make = Effect.gen(function* () {
       if (watch.comparisonFailures !== 0) patch.comparisonFailures = 0;
       if (watch.lastFailure !== undefined) patch.lastFailure = null;
     }
-    const delivery = yield* planDelivery(thread.id, watch);
+    // The update's own wording follows what this check decided, such as that the watch ended.
+    const delivery = yield* planDelivery(thread.id, {
+      ...watch,
+      ...(patch.status === "ended" ? { status: "ended" as const } : {}),
+    });
     const merged = { ...patch, ...delivery.patch };
     if (Object.keys(merged).length > 0 || delivery.wake !== undefined) {
       yield* record(thread.id, watch, merged, delivery.wake);
@@ -416,6 +522,7 @@ export const make = Effect.gen(function* () {
     }
   });
   const orphanSeenAt = new Map<string, number>();
+  const discarded = new Set<string>();
 
   const sweep = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
@@ -424,7 +531,15 @@ export const make = Effect.gen(function* () {
     if (!watchesChanged && now < nextScanAt) return;
     watchesChanged = false;
     const threads = yield* projections.getThreadsWithCommandWatches();
-    nextScanAt = now + (threads.length > 0 ? ACTIVE_SCAN_MS : IDLE_SCAN_MS);
+    // Ended watches stay listed but need no looking at, so they leave an idle server idle.
+    const anyLive = threads.some(
+      (thread) =>
+        mayRun(thread) &&
+        thread.commandWatches.some(
+          (watch) => watch.status !== "ended" || watch.waitingChanges > 0 || watch.pendingMessageId,
+        ),
+    );
+    nextScanAt = now + (anyLive ? ACTIVE_SCAN_MS : IDLE_SCAN_MS);
     // A replaced watch's storage stays until its replacement adopted the waiting changes.
     const present = new Set(
       threads.flatMap((thread) =>
@@ -439,6 +554,22 @@ export const make = Effect.gen(function* () {
       Effect.catchCause((cause) => Effect.logWarning("command watch cleanup failed", { cause })),
     );
     for (const thread of threads) {
+      for (const watch of thread.commandWatches) {
+        // A deliberate stop wants nothing more from the watch; a completed one still delivers.
+        if (
+          watch.status === "ended" &&
+          watch.endReason !== "completed" &&
+          !discarded.has(watch.id)
+        ) {
+          discarded.add(watch.id);
+          yield* store.discardWaiting(watch.id).pipe(
+            Effect.catchCause((cause) => {
+              discarded.delete(watch.id);
+              return Effect.logWarning("command watch discard failed", { cause });
+            }),
+          );
+        }
+      }
       if (!mayRun(thread)) continue;
       for (const watch of thread.commandWatches) {
         const key = watchKey(watch);
@@ -447,7 +578,9 @@ export const make = Effect.gen(function* () {
         if (
           replacedId !== undefined &&
           watch.status !== "awaiting_approval" &&
-          !thread.commandWatches.some((other) => other.id === replacedId)
+          !thread.commandWatches.some(
+            (other) => other.id === replacedId && other.status !== "ended",
+          )
         ) {
           yield* FiberMap.run(
             runs,
@@ -464,24 +597,31 @@ export const make = Effect.gen(function* () {
           );
           continue;
         }
+        // Backoff survives a restart; missed intervals are never caught up, only the next one runs.
+        if (running(watch) && !dueAt.has(key)) {
+          const storage = yield* store.get(watch.id);
+          dueAt.set(key, storage?.nextCheckAt ?? 0);
+        }
         const due = running(watch) && (dueAt.get(key) ?? 0) <= now;
         const delivering = watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
         if (!due && !delivering) continue;
         const work = due
           ? permits
-              .withPermits(1)(check(thread, watch))
+              .withPermits(1)(check(thread.id, key))
               .pipe(
                 Effect.tap((failures) =>
-                  Clock.currentTimeMillis.pipe(
-                    Effect.map((finished) => {
-                      // The interval starts when a check ends, so checks of one watch never overlap.
-                      const intervals =
-                        failures === undefined || failures === 0
-                          ? 1
-                          : Math.min(2 ** (failures - 1), MAX_BACKOFF_INTERVALS);
-                      dueAt.set(key, finished + watch.everyMinutes * 60_000 * intervals);
-                    }),
-                  ),
+                  Effect.gen(function* () {
+                    const finished = yield* Clock.currentTimeMillis;
+                    // The interval starts when a check ends, so checks of one watch never overlap.
+                    const intervals =
+                      failures === undefined || failures === 0
+                        ? 1
+                        : Math.min(2 ** (failures - 1), MAX_BACKOFF_INTERVALS);
+                    const next = finished + watch.everyMinutes * 60_000 * intervals;
+                    dueAt.set(key, next);
+                    nextScanAt = Math.min(nextScanAt, next);
+                    yield* store.setNextCheckAt(watch.id, next);
+                  }),
                 ),
               )
           : deliverOnly(thread, watch);

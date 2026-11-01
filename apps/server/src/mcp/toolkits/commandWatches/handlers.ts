@@ -14,7 +14,14 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { commandWatchRevisionText } from "../../../orchestration-v2/commandWatch.ts";
+import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
+import {
+  commandWatchRevisionText,
+  parseComparisonState,
+  readComparisonResult,
+} from "../../../orchestration-v2/commandWatch.ts";
+import * as CommandWatchComparison from "../../../orchestration-v2/CommandWatchComparison.ts";
+import { resolveCommandWatchShell } from "../../../orchestration-v2/CommandWatchReactor.ts";
 import * as CommandWatchStore from "../../../orchestration-v2/CommandWatchStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -27,7 +34,9 @@ import {
   CommandWatchFailedError,
   CommandWatchesToolkit,
   type ReadCommandWatchChangeInput,
+  type ReadCommandWatchInput,
   type ResumeCommandWatchInput,
+  type TestCommandWatchComparisonInput,
   type UnwatchCommandInput,
   type WatchCommandInput,
 } from "./tools.ts";
@@ -65,6 +74,9 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const projects = yield* ProjectService.ProjectService;
+  const comparison = yield* CommandWatchComparison.CommandWatchComparison;
+  const environment = yield* ServerEnvironment.ServerEnvironment;
+  const shell = yield* resolveCommandWatchShell;
 
   const sha256 = (text: string) =>
     crypto
@@ -160,14 +172,64 @@ const make = Effect.gen(function* () {
           });
         }
         const format = input.format ?? "text";
+        if (input.completionCondition !== undefined && input.comparisonSource === undefined) {
+          return yield* new CommandWatchFailedError({
+            reason:
+              "Only a comparison can end a watch, so completionCondition needs comparisonSource.",
+          });
+        }
+        const existing = (yield* watchesOf(caller.id)).find(
+          (watch) => watch.clientRequestId === input.requestId,
+        );
+        const source = input.comparisonSource;
+        if (source !== undefined) {
+          // No fallback: without the restricted runtime, custom comparison is unavailable.
+          yield* comparison.compile(source).pipe(
+            Effect.mapError(
+              (error) =>
+                new CommandWatchFailedError({
+                  reason: error.unavailable
+                    ? `Custom comparison is unavailable on this server: ${error.reason}. Omit comparisonSource to compare output exactly.`
+                    : `The comparison source does not compile: ${error.reason}`,
+                }),
+            ),
+          );
+        }
         const helpers = yield* readHelpers(cwd, input.helpers ?? []);
         const helperRefs = helpers.map(({ path: helperPath, sha256: hash }) => ({
           path: helperPath,
           sha256: hash,
         }));
+        const everyMinutes = input.everyMinutes ?? DEFAULT_EVERY_MINUTES;
+        const reportInitialState = input.reportInitialState ?? false;
+        const completion =
+          input.completionCondition === undefined
+            ? ({ kind: "ongoing" } as const)
+            : ({ kind: "condition", description: input.completionCondition } as const);
+        const sourceHash = source === undefined ? null : yield* sha256(source);
         const revisionHash = yield* sha256(
-          commandWatchRevisionText({ command: input.command, format, cwd, helpers: helperRefs }),
+          commandWatchRevisionText({
+            environmentId: yield* environment.getEnvironmentId,
+            threadId: caller.id,
+            command: input.command,
+            format,
+            cwd,
+            shell: shell.program,
+            comparisonSourceSha256: sourceHash,
+            completion,
+            everyMinutes,
+            reportInitialState,
+            helpers: helperRefs,
+          }),
         );
+        if (existing !== undefined) {
+          if (existing.revisionHash === revisionHash && existing.label === input.label) {
+            return { watchId: existing.id, watches: yield* watchesOf(caller.id) };
+          }
+          return yield* new CommandWatchFailedError({
+            reason: `The request id ${input.requestId} already created a different watch. Use a new id for a new watch.`,
+          });
+        }
         const watchId = `${THREAD_COMMAND_WATCH_ID_PREFIX}${yield* crypto.randomUUIDv4().pipe(Effect.orDie)}`;
         // Stored before the watch exists, so its first check finds the helper copies.
         yield* store
@@ -178,6 +240,7 @@ const make = Effect.gen(function* () {
               path: helperPath,
               content,
             })),
+            comparisonSource: source,
             now: DateTime.formatIso(yield* DateTime.now),
           })
           .pipe(
@@ -194,20 +257,25 @@ const make = Effect.gen(function* () {
             watchId,
             command: input.command,
             label: input.label,
-            everyMinutes: input.everyMinutes ?? DEFAULT_EVERY_MINUTES,
+            everyMinutes,
             format,
             helpers: helperRefs,
-            reportInitialState: input.reportInitialState ?? false,
+            reportInitialState,
             cwd,
+            shell: shell.program,
+            comparison:
+              sourceHash !== null
+                ? { kind: "custom-js-v1", sha256: sourceHash }
+                : { kind: format === "json" ? "json-v1" : "text-v1" },
+            completion,
+            clientRequestId: input.requestId,
             revisionHash,
             ...(input.replaces === undefined ? {} : { replacesWatchId: input.replaces }),
           })
           .pipe(Effect.catchCause(refusal));
         const watches = yield* watchesOf(caller.id);
-        // An identical definition keeps the watch it already had.
-        const started = watches.find(
-          (watch) => watch.revisionHash === revisionHash && watch.label === input.label,
-        );
+        // A retry that lost a race keeps the watch the first call created.
+        const started = watches.find((watch) => watch.clientRequestId === input.requestId);
         return {
           ...(started === undefined ? {} : { watchId: started.id }),
           watches,
@@ -252,6 +320,68 @@ const make = Effect.gen(function* () {
           .pipe(Effect.catchCause(refusal));
         return { watches: yield* watchesOf(caller.id) };
       }),
+    ),
+    read_command_watch: McpToolAccess.actsAsCaller((input: ReadCommandWatchInput) =>
+      Effect.gen(function* () {
+        yield* requireOrchestration;
+        const caller = yield* requireCaller("read its command watches");
+        const missing = new CommandWatchFailedError({
+          reason: `No watch ${input.watchId} on this thread.`,
+        });
+        const watch = (yield* watchesOf(caller.id)).find(({ id }) => id === input.watchId);
+        if (watch === undefined) return yield* missing;
+        const storage = yield* store.get(watch.id).pipe(Effect.mapError(() => missing));
+        return {
+          watch,
+          comparisonSource: storage?.comparisonSource ?? null,
+          helpers: storage?.helpers ?? [],
+          acceptedOutput: storage?.observation ?? null,
+          comparisonState: storage?.comparisonState ?? null,
+        };
+      }),
+    ),
+    test_command_watch_comparison: McpToolAccess.actsAsCaller(
+      (input: TestCommandWatchComparisonInput) =>
+        Effect.gen(function* () {
+          yield* requireOrchestration;
+          const phase = input.phase ?? (input.previous === undefined ? "baseline" : "update");
+          return yield* comparison
+            .compare(input.source, {
+              phase,
+              previous: input.previous ?? null,
+              current: input.current,
+              state: input.state ?? null,
+            })
+            .pipe(
+              Effect.map((resultJson) => {
+                const outcome = readComparisonResult({
+                  resultJson,
+                  observation: "",
+                  phase,
+                  // A test shows what the comparison reported, even on a baseline.
+                  reportInitialState: true,
+                  completion:
+                    input.completionCondition === true
+                      ? { kind: "condition", description: "test" }
+                      : { kind: "ongoing" },
+                });
+                if (outcome.kind === "failed") return { ok: false, error: outcome.reason };
+                return {
+                  ok: true,
+                  state: parseComparisonState(outcome.state ?? null),
+                  changes: outcome.changes
+                    .filter((change) => change.kind !== "completed")
+                    .map(({ kind, summary, content }) => ({ kind, summary, details: content })),
+                  ...(outcome.completionReason === undefined
+                    ? {}
+                    : { completionReason: outcome.completionReason }),
+                };
+              }),
+              Effect.catch((error) =>
+                Effect.succeed({ ok: false, error: `comparison ${error.reason}` }),
+              ),
+            );
+        }),
     ),
     read_command_watch_change: McpToolAccess.actsAsCaller((input: ReadCommandWatchChangeInput) =>
       Effect.gen(function* () {

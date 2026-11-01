@@ -67,11 +67,16 @@ import {
 import {
   ThreadCommandWatch,
   ThreadCommandWatchCommand,
+  ThreadCommandWatchComparison,
+  ThreadCommandWatchCompletion,
+  ThreadCommandWatchDetails,
+  ThreadCommandWatchEndReason,
   ThreadCommandWatchEveryMinutes,
   ThreadCommandWatchFormat,
   ThreadCommandWatchHelper,
   ThreadCommandWatchLabel,
   ThreadCommandWatchPauseReason,
+  ThreadCommandWatchRequestId,
 } from "./threadCommandWatch.ts";
 import {
   ProviderApprovalDecision,
@@ -3404,6 +3409,10 @@ const OrchestrationV2InternalCommand = Schema.Union([
     helpers: Schema.Array(ThreadCommandWatchHelper),
     reportInitialState: Schema.Boolean,
     cwd: TrimmedNonEmptyString,
+    shell: TrimmedNonEmptyString,
+    comparison: ThreadCommandWatchComparison,
+    completion: ThreadCommandWatchCompletion,
+    clientRequestId: ThreadCommandWatchRequestId,
     revisionHash: TrimmedNonEmptyString,
     replacesWatchId: Schema.optional(TrimmedNonEmptyString),
   }),
@@ -3421,8 +3430,16 @@ const OrchestrationV2InternalCommand = Schema.Union([
     startedAt: IsoDateTime,
     patch: Schema.Struct({
       /** `awaiting_approval` also drops the watch's authority. */
-      status: Schema.optional(Schema.Literals(["watching", "paused", "awaiting_approval"])),
+      status: Schema.optional(
+        Schema.Literals(["watching", "paused", "awaiting_approval", "ended"]),
+      ),
       pauseReason: Schema.optional(ThreadCommandWatchPauseReason),
+      endReason: Schema.optional(ThreadCommandWatchEndReason),
+      endDetail: Schema.optional(Schema.String),
+      /** What a mismatch found, so the user approves what would actually run. */
+      revisionHash: Schema.optional(TrimmedNonEmptyString),
+      shell: Schema.optional(TrimmedNonEmptyString),
+      helpers: Schema.optional(Schema.Array(ThreadCommandWatchHelper)),
       collectionFailures: Schema.optional(NonNegativeInt),
       comparisonFailures: Schema.optional(NonNegativeInt),
       lastFailure: Schema.optional(Schema.NullOr(Schema.String)),
@@ -3602,6 +3619,18 @@ export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalComma
 
 export type OrchestrationV2ServerCommand = OrchestrationV2Command | OrchestrationV2InternalCommand;
 
+export const OrchestrationV2GetCommandWatchDetailsInput = Schema.Struct({
+  threadId: ThreadId,
+  watchId: TrimmedNonEmptyString,
+});
+export type OrchestrationV2GetCommandWatchDetailsInput =
+  typeof OrchestrationV2GetCommandWatchDetailsInput.Type;
+
+export class OrchestrationV2GetCommandWatchDetailsError extends Schema.TaggedError<OrchestrationV2GetCommandWatchDetailsError>()(
+  "OrchestrationV2GetCommandWatchDetailsError",
+  { message: Schema.String },
+) {}
+
 export const ORCHESTRATION_V2_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",
@@ -3612,6 +3641,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   getThreadFamily: "orchestration.getThreadFamily",
   getWorktreeThreadIds: "orchestration.getWorktreeThreadIds",
+  getCommandWatchDetails: "orchestration.getCommandWatchDetails",
   getOlderSettledThreads: "orchestration.getOlderSettledThreads",
   getThreadProjection: "orchestration.getThreadProjection",
   getWorkflowScript: "orchestration.getWorkflowScript",
@@ -4176,6 +4206,10 @@ export const OrchestrationV2RpcSchemas = {
   getWorktreeThreadIds: {
     input: OrchestrationV2GetWorktreeThreadIdsInput,
     output: OrchestrationV2WorktreeThreadIds,
+  },
+  getCommandWatchDetails: {
+    input: OrchestrationV2GetCommandWatchDetailsInput,
+    output: ThreadCommandWatchDetails,
   },
   getOlderSettledThreads: {
     input: OrchestrationV2GetOlderSettledThreadsInput,

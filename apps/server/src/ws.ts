@@ -56,6 +56,7 @@ import {
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION,
   OrchestrationV2DispatchCommandError,
+  OrchestrationV2GetCommandWatchDetailsError,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2ThreadLaunchError,
@@ -112,6 +113,7 @@ import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as CommandWatchStore from "./orchestration-v2/CommandWatchStore.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
 import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
@@ -1222,6 +1224,7 @@ export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
+  commandWatchStore: CommandWatchStore.CommandWatchStore["Service"],
 ) =>
   Layer.effectContext(
     Effect.gen(function* () {
@@ -1993,6 +1996,26 @@ export const layerWsRpc = (
                 }),
             ),
           ),
+        [ORCHESTRATION_V2_WS_METHODS.getCommandWatchDetails]: Effect.fn(
+          "ws.getCommandWatchDetails",
+        )(
+          function* (input) {
+            const { thread } = yield* threadManagement.getThreadRecords(input.threadId, []);
+            // Only a watch of the thread named, so a client reads no other thread's scripts.
+            const owned = (thread.commandWatches ?? []).some(({ id }) => id === input.watchId);
+            const storage = owned ? yield* commandWatchStore.get(input.watchId) : undefined;
+            return {
+              comparisonSource: storage?.comparisonSource ?? null,
+              helpers: storage?.helpers ?? [],
+            };
+          },
+          Effect.mapError(
+            () =>
+              new OrchestrationV2GetCommandWatchDetailsError({
+                message: "Failed to read the command watch",
+              }),
+          ),
+        ),
         [ORCHESTRATION_V2_WS_METHODS.getWorktreeThreadIds]: (input) =>
           readOmittableShellRows(
             { worktreePath: input.worktreePath },
@@ -3261,6 +3284,7 @@ export const WS_RPC_SERVER_OPTIONS = {
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
+    const commandWatchStore = yield* CommandWatchStore.CommandWatchStore;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -3328,7 +3352,7 @@ export const layer = Layer.unwrap(
           return httpEffect;
         }).pipe(
           Effect.provide(
-            layerWsRpc(session, clientAnalyticsProps, serverBrowser).pipe(
+            layerWsRpc(session, clientAnalyticsProps, serverBrowser, commandWatchStore).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Handler-context reporters see only request defects, not server-wide defects.
               Layer.provide(DefectReporter.layer),

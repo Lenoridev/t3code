@@ -5,6 +5,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
   EventId,
   MessageId,
   ProjectId,
@@ -14,6 +15,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -21,7 +23,9 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as CommandWatchComparison from "./CommandWatchComparison.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
@@ -36,6 +40,9 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+
+const TEST_ENVIRONMENT = "environment:test";
+const TEST_SHELL = "/bin/sh";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "gpt-5.1-codex" };
@@ -66,6 +73,31 @@ const layerTest = ThreadManagementService.layer.pipe(
   Layer.provideMerge(ServerSettings.layerTest()),
   Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
   Layer.provideMerge(CommandWatchStore.layer.pipe(Layer.provide(layerDatabase))),
+  Layer.provideMerge(
+    // The interpreter has its own tests; here a comparison only has to run on its input.
+    Layer.succeed(CommandWatchComparison.CommandWatchComparison, {
+      compile: () => Effect.void,
+      compare: (source, input) =>
+        Effect.try({
+          try: () =>
+            JSON.stringify(
+              (new Function(`${source}; return compare;`)() as (i: unknown) => unknown)(input),
+            ),
+          catch: (cause) =>
+            new CommandWatchComparison.CommandWatchComparisonError({
+              reason: `threw: ${String(cause)}`,
+              unavailable: false,
+            }),
+        }),
+    }),
+  ),
+  Layer.provideMerge(
+    Layer.succeed(ServerEnvironment.ServerEnvironment, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make(TEST_ENVIRONMENT)),
+    } as never),
+  ),
+  Layer.provideMerge(Layer.succeed(HostProcess.Environment, { SHELL: "/bin/sh" })),
+  Layer.provideMerge(Layer.succeed(HostProcess.Platform, "linux")),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -177,6 +209,11 @@ const startWatch = (
   command: string,
   options: {
     readonly format?: "text" | "json";
+    readonly requestId?: string;
+    readonly comparisonSource?: string;
+    readonly completionCondition?: string;
+    /** The environment the watch was approved in, when it differs from this one. */
+    readonly environmentId?: string;
     readonly helpers?: ReadonlyArray<{ readonly path: string; readonly content: string }>;
     /** What storage holds, when it differs from what was hashed. */
     readonly storedHelpers?: ReadonlyArray<{ readonly path: string; readonly content: string }>;
@@ -196,8 +233,15 @@ const startWatch = (
       watchId,
       threadId,
       helpers: options.storedHelpers ?? options.helpers ?? [],
+      comparisonSource: options.comparisonSource,
       now: "2026-10-30T00:00:00.000Z",
     });
+    const sourceHash =
+      options.comparisonSource === undefined ? null : sha256(options.comparisonSource);
+    const completion =
+      options.completionCondition === undefined
+        ? ({ kind: "ongoing" } as const)
+        : ({ kind: "condition", description: options.completionCondition } as const);
     return yield* orchestrator.dispatch({
       type: "thread.command-watch.start",
       commandId: CommandId.make(`watch:${threadId}:${watchId}:${command}`),
@@ -211,7 +255,28 @@ const startWatch = (
       helpers,
       reportInitialState: false,
       cwd,
-      revisionHash: sha256(commandWatchRevisionText({ command, format, cwd, helpers })),
+      shell: TEST_SHELL,
+      comparison:
+        sourceHash === null
+          ? { kind: format === "json" ? "json-v1" : "text-v1" }
+          : { kind: "custom-js-v1", sha256: sourceHash },
+      completion,
+      clientRequestId: options.requestId ?? `request:${watchId}`,
+      revisionHash: sha256(
+        commandWatchRevisionText({
+          environmentId: options.environmentId ?? TEST_ENVIRONMENT,
+          threadId,
+          command,
+          format,
+          cwd,
+          shell: TEST_SHELL,
+          comparisonSourceSha256: sourceHash,
+          completion,
+          everyMinutes: 10,
+          reportInitialState: false,
+          helpers,
+        }),
+      ),
       ...(options.replaces === undefined ? {} : { replacesWatchId: options.replaces }),
     });
   });
@@ -526,7 +591,7 @@ it.effect("Stop cancels the update the agent has not started on", () =>
         threadId,
         watchId: "command-watch:a",
       });
-      assert.deepEqual(yield* watchesOf(threadId), []);
+      assert.strictEqual((yield* watchOf(threadId))?.endReason, "stopped");
       const cancelled = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
         (run) => run.id === queued?.id,
       );
@@ -577,7 +642,7 @@ it.effect("leaving Full access, or a changed helper copy, sends a watch back for
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("limits watches per thread and ends them when the thread settles or archives", () =>
+it.effect("limits watches per thread and ends them when the thread archives", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const threadId = ThreadId.make("thread:command-watch-limit");
@@ -586,10 +651,28 @@ it.effect("limits watches per thread and ends them when the thread settles or ar
     for (const name of ["a", "b", "c", "d", "e"]) {
       yield* startWatch(threadId, runId, `command-watch:${name}`, `echo ${name}`);
     }
-    // An identical definition is the existing watch, not a sixth one.
+    // A retry of a request is the existing watch, not a sixth one.
     assert.lengthOf(
-      (yield* startWatch(threadId, runId, "command-watch:dup", "echo a")).storedEvents,
+      (yield* startWatch(threadId, runId, "command-watch:retry", "echo a", {
+        requestId: "request:command-watch:a",
+      })).storedEvents,
       0,
+    );
+    // The same text under a new request is a new watch, so this one is over the limit.
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(startWatch(threadId, runId, "command-watch:again", "echo a")),
+      ),
+    );
+    // The same request id for something else is a mistake.
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          startWatch(threadId, runId, "command-watch:conflict", "echo other", {
+            requestId: "request:command-watch:a",
+          }),
+        ),
+      ),
     );
     assert.isTrue(
       Exit.isFailure(yield* Effect.exit(startWatch(threadId, runId, "command-watch:f", "echo f"))),

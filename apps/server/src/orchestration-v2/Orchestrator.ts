@@ -480,11 +480,59 @@ export function threadHasUnfinishedWork(records: {
   );
 }
 
+/** Ended watches a thread keeps showing, so a stop or a completion can be seen afterwards. */
+const COMMAND_WATCH_ENDED_KEPT = 5;
+
+const commandWatchEnded = (
+  watch: ThreadCommandWatch,
+  endReason: "stopped" | "denied",
+  endedAt: string,
+): ThreadCommandWatch => {
+  const {
+    pauseReason: _reason,
+    pendingMessageId: _pending,
+    replacesWatchId: _replaced,
+    lastFailure: _failure,
+    ...rest
+  } = watch;
+  return { ...rest, status: "ended", endReason, endedAt, authority: null, waitingChanges: 0 };
+};
+
+/** Paused and ended watches do not count toward a thread's limit. */
+const commandWatchIsActive = (watch: ThreadCommandWatch) =>
+  watch.status !== "paused" && watch.status !== "ended";
+
+const commandWatchHasWork = (watch: ThreadCommandWatch) =>
+  watch.status !== "ended" || watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
+
+/** Drops the oldest ended watches beyond what a thread keeps; running watches always stay. */
+const withEndedWatchesTrimmed = (
+  watches: ReadonlyArray<ThreadCommandWatch>,
+): ReadonlyArray<ThreadCommandWatch> => {
+  const finished = watches.filter((watch) => !commandWatchHasWork(watch));
+  if (finished.length <= COMMAND_WATCH_ENDED_KEPT) return watches;
+  const dropped = new Set(
+    finished
+      .toSorted((left, right) => (left.endedAt ?? "").localeCompare(right.endedAt ?? ""))
+      .slice(0, finished.length - COMMAND_WATCH_ENDED_KEPT),
+  );
+  return watches.filter((watch) => !dropped.has(watch));
+};
+
 /** Ends a thread's command watches, leaving a thread that never had any untouched. */
 const withoutCommandWatches = (
   thread: OrchestrationV2AppThread,
+  endedAt: string,
 ): Pick<OrchestrationV2AppThread, "commandWatches"> =>
-  thread.commandWatches === undefined ? {} : { commandWatches: [] };
+  thread.commandWatches === undefined
+    ? {}
+    : {
+        commandWatches: withEndedWatchesTrimmed(
+          thread.commandWatches.map((watch) =>
+            commandWatchHasWork(watch) ? commandWatchEnded(watch, "stopped", endedAt) : watch,
+          ),
+        ),
+      };
 
 /**
  * Full access lets a watch run without a prompt. Leaving it sends those watches back for the
@@ -499,6 +547,7 @@ const withCommandWatchRuntimeMode = (
     ? {}
     : {
         commandWatches: thread.commandWatches.map((watch): ThreadCommandWatch => {
+          if (watch.status === "ended") return watch;
           if (runtimeMode === "full-access") {
             return watch.status === "awaiting_approval"
               ? { ...watch, authority: { kind: "full-access" }, status: "baselining" }
@@ -2928,17 +2977,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ) {
           return yield* refuse(`The run that asked for this watch on ${command.threadId} ended.`);
         }
-        if (
-          watches.some(
-            (watch) => watch.revisionHash === command.revisionHash && watch.label === command.label,
-          )
-        ) {
-          return;
+        // A retry of this request is the same watch. Reusing its id for something else is a
+        // mistake; no definition is ever deduplicated by its text alone.
+        const retried = watches.find((watch) => watch.clientRequestId === command.clientRequestId);
+        if (retried !== undefined) {
+          if (retried.revisionHash === command.revisionHash && retried.label === command.label) {
+            return;
+          }
+          return yield* refuse(
+            `The request id ${command.clientRequestId} already created a different watch. Use a new id for a new watch.`,
+          );
         }
         const replaced =
           command.replacesWatchId === undefined
             ? undefined
-            : watches.find((watch) => watch.id === command.replacesWatchId);
+            : watches.find(
+                (watch) => watch.id === command.replacesWatchId && watch.status !== "ended",
+              );
         if (command.replacesWatchId !== undefined && replaced === undefined) {
           return yield* refuse(
             `Thread ${command.threadId} has no watch ${command.replacesWatchId}.`,
@@ -2951,7 +3006,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           fullAccess && replaced !== undefined
             ? watches.filter((watch) => watch.id !== replaced.id)
             : watches;
-        const counted = kept.filter((watch) => watch.id !== command.replacesWatchId);
+        const counted = kept.filter(
+          (watch) => watch.id !== command.replacesWatchId && commandWatchIsActive(watch),
+        );
         if (counted.length >= THREAD_COMMAND_WATCH_LIMIT) {
           return yield* refuse(
             `Thread ${command.threadId} already watches ${THREAD_COMMAND_WATCH_LIMIT} commands.`,
@@ -2970,6 +3027,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             helpers: command.helpers,
             reportInitialState: command.reportInitialState,
             cwd: command.cwd,
+            shell: command.shell,
+            comparison: command.comparison,
+            completion: command.completion,
+            clientRequestId: command.clientRequestId,
             startedAt: DateTime.formatIso(now),
             revisionHash: command.revisionHash,
             authority: fullAccess ? { kind: "full-access" } : null,
@@ -2982,13 +3043,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ];
         break;
       }
-      case "thread.command-watch.stop":
-        next = watches.filter(
-          (watch) => command.watchId !== undefined && watch.id !== command.watchId,
+      case "thread.command-watch.stop": {
+        const stopping = watches.filter(
+          (watch) =>
+            commandWatchHasWork(watch) &&
+            (command.watchId === undefined || watch.id === command.watchId),
         );
-        if (next.length === watches.length) return;
-        cancelled = watches.filter((watch) => !next.includes(watch));
+        if (stopping.length === 0) return;
+        cancelled = stopping;
+        next = watches.map((watch) =>
+          stopping.includes(watch)
+            ? commandWatchEnded(watch, "stopped", DateTime.formatIso(now))
+            : watch,
+        );
         break;
+      }
       case "thread.command-watch.approve": {
         const watch = watches.find((candidate) => candidate.id === command.watchId);
         if (watch === undefined) return yield* refuse(`The watch ${command.watchId} ended.`);
@@ -2996,7 +3065,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return yield* refuse(`The watch ${command.watchId} no longer waits for this approval.`);
         }
         if (!command.approve) {
-          next = watches.filter((candidate) => candidate.id !== watch.id);
+          next = replaceWatch(watch.id, (candidate) =>
+            commandWatchEnded(candidate, "denied", DateTime.formatIso(now)),
+          );
           break;
         }
         cancelled = watches.filter((candidate) => candidate.id === watch.replacesWatchId);
@@ -3019,6 +3090,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const watch = watches.find((candidate) => candidate.id === command.watchId);
         if (watch === undefined) return yield* refuse(`The watch ${command.watchId} ended.`);
         if (watch.status !== "paused") return;
+        if (watches.filter(commandWatchIsActive).length >= THREAD_COMMAND_WATCH_LIMIT) {
+          return yield* refuse(
+            `Thread ${command.threadId} already watches ${THREAD_COMMAND_WATCH_LIMIT} commands. Stop one before resuming this one.`,
+          );
+        }
         next = replaceWatch(
           watch.id,
           ({ pauseReason: _reason, lastFailure: _failure, ...rest }) => ({
@@ -3053,6 +3129,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ? existing.pendingMessageId
             : (patch.pendingMessageId ?? undefined);
         const status = running && patch.status !== undefined ? patch.status : existing.status;
+        const ending = status === "ended" && existing.status !== "ended";
         const pauseReason =
           status !== "paused"
             ? undefined
@@ -3061,8 +3138,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               : existing.pauseReason;
         next = replaceWatch(existing.id, () => ({
           ...base,
-          ...(status === "awaiting_approval" ? { authority: null } : {}),
+          ...(status === "awaiting_approval" || ending ? { authority: null } : {}),
           status,
+          ...(ending
+            ? {
+                ...(patch.endReason === undefined ? {} : { endReason: patch.endReason }),
+                ...(patch.endDetail === undefined ? {} : { endDetail: patch.endDetail }),
+                endedAt: DateTime.formatIso(now),
+              }
+            : {}),
+          ...(patch.revisionHash === undefined ? {} : { revisionHash: patch.revisionHash }),
+          ...(patch.shell === undefined ? {} : { shell: patch.shell }),
+          ...(patch.helpers === undefined ? {} : { helpers: patch.helpers }),
           ...(pauseReason === undefined ? {} : { pauseReason }),
           ...(lastFailure === undefined ? {} : { lastFailure }),
           ...(pendingMessageId === undefined ? {} : { pendingMessageId }),
@@ -3089,7 +3176,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       occurredAt: now,
       payload: {
         ...thread,
-        commandWatches: next,
+        commandWatches: withEndedWatchesTrimmed(next),
         // Starting or stopping is activity; what a check recorded is not.
         updatedAt: command.type === "thread.command-watch.sync" ? thread.updatedAt : now,
       },
@@ -3580,7 +3667,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             titleRegeneration: null,
             guestShare: null,
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-            ...withoutCommandWatches(thread),
+            ...withoutCommandWatches(thread, DateTime.formatIso(now)),
             updatedAt: now,
           };
         case "thread.unarchive":
@@ -10725,7 +10812,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // snapshot would bring back whichever watches the first one cleared.
     if (
       pullRequests.some((link) => link.watch !== undefined) ||
-      (thread.commandWatches ?? []).length > 0
+      (thread.commandWatches ?? []).some(commandWatchHasWork)
     ) {
       yield* emitEvent({
         type: "thread.pull-request-synced",
@@ -10735,7 +10822,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: {
           ...thread,
           pullRequests: pullRequests.map((link) => withPullRequestWatch(link, undefined)),
-          ...withoutCommandWatches(thread),
+          ...withoutCommandWatches(thread, DateTime.formatIso(input.now)),
         },
       });
     }
