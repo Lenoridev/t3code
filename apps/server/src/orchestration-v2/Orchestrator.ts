@@ -3204,6 +3204,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     }
     if (command.type !== "thread.command-watch.sync" || command.wake === undefined) return;
+    // The user asked to hear about these changes, unlike the background wakes dispatchMessage
+    // lets a snooze sleep through.
+    if (
+      thread.snoozedUntil != null &&
+      DateTime.toEpochMillis(thread.snoozedUntil) > DateTime.toEpochMillis(now)
+    ) {
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.unsnoozed",
+        threadId: command.threadId,
+        providerInstanceId: thread.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...thread,
+          commandWatches: withEndedWatchesTrimmed(next),
+          snoozedUntil: null,
+          snoozedAt: null,
+          lastSnoozeWakeAt: now,
+          updatedAt: now,
+        },
+      });
+    }
     yield* dispatchMessage(
       {
         type: "message.dispatch",
@@ -3615,6 +3639,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Thread ${command.threadId} has a pending approval or user-input request and cannot be snoozed.`,
         });
       }
+      if (
+        (projection.thread.commandWatches ?? []).some(
+          (watch) => watch.status === "awaiting_approval" || watch.status === "paused",
+        )
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} has a command watch that needs approval or a resume and cannot be snoozed.`,
+        });
+      }
       const queuedRuns = projection.runs.filter((run) => run.status === "queued");
       const queuedMessages =
         queuedRuns.length === 0
@@ -3681,7 +3716,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             settledOverride: "settled",
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-            ...withoutCommandWatches(thread),
             unsettledAt: null,
             pinnedAt: null,
             pinOrderKey: null,

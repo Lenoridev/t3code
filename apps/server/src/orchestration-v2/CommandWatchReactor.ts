@@ -658,6 +658,8 @@ export const make = Effect.gen(function* () {
     Effect.suspend(() => {
       if (
         event.type === "thread.command-watches-updated" ||
+        event.type === "thread.settled" ||
+        event.type === "thread.unsettled" ||
         event.type === "run.created" ||
         event.type === "run.updated"
       ) {

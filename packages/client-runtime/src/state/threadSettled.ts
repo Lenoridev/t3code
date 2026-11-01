@@ -1,4 +1,5 @@
 // @effect-diagnostics globalDate:off -- UI snooze presets use local calendar boundaries and Intl labels.
+import { backgroundWorkBlockedOn } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as DateTime from "effect/DateTime";
 import { DEFAULT_SNOOZE_PRESETS, type SnoozePresetSetting } from "@t3tools/contracts/settings";
 
@@ -76,10 +77,13 @@ export interface ThreadSnoozeShell extends QueuedThreadShell {
   readonly hasPendingUserInput: boolean;
   readonly pendingSubagentRequest?: PendingSubagentRequest | null;
   readonly pendingGuestMessageCount?: number;
+  readonly pendingBackgroundTasks?: ReadonlyArray<{
+    readonly blockedOn?: "approval" | "resume" | undefined;
+  }>;
 }
 
 /**
- * Only a request for the user or a fresh failure ends a snooze early. Completed runs never do:
+ * Only a request for the user, a paused watch or a fresh failure ends a snooze early. Completed runs never do:
  * a snoozed long-running thread keeps waking itself for background work and stays hidden
  * until its timer.
  */
@@ -88,6 +92,8 @@ export function threadRaisedHandWhileSnoozed(shell: ThreadSnoozeShell): boolean 
   if (shell.source?.pendingRuntimeRequest != null) return true;
   if (shell.pendingSubagentRequest != null) return true;
   if ((shell.pendingGuestMessageCount ?? 0) > 0) return true;
+  // Nothing else says a watch stopped checking, so it must not stay hidden on the shelf.
+  if (backgroundWorkBlockedOn(shell.pendingBackgroundTasks ?? [], "resume")) return true;
   const failedAt = failureEdgeAt(shell);
   return (
     failedAt !== undefined &&
@@ -115,6 +121,7 @@ export function canSnooze(
     | "hasPendingUserInput"
     | "pendingSubagentRequest"
     | "pendingGuestMessageCount"
+    | "pendingBackgroundTasks"
     | "latestUserMessageAt"
     | "latestTurn"
     | "latestRun"
@@ -130,6 +137,8 @@ export function canSnooze(
   if (shell.pendingSubagentRequest != null) return false;
   // A waiting guest message would wake it at once.
   if ((shell.pendingGuestMessageCount ?? 0) > 0) return false;
+  // A paused watch would wake it at once too.
+  if (backgroundWorkBlockedOn(shell.pendingBackgroundTasks ?? [], "resume")) return false;
   if (hasQueuedTurnStart(shell, options)) return false;
   return true;
 }

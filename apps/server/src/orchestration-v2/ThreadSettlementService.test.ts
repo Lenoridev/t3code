@@ -1430,6 +1430,19 @@ describe("ThreadSettlementServiceV2 terminals", () => {
 
 describe("isSnoozed", () => {
   const snoozed = { snoozedAt: at(-2 * DAY_MS), snoozedUntil: at(DAY_MS) };
+  it("ends for a watch that paused or needs approval, as the client shows it", () => {
+    const task = { taskId: "command-watch:a", kind: "monitor" as const, awaited: true as const };
+    const withTask = (extra: object) =>
+      shell({ ...snoozed, pendingBackgroundTasks: [{ ...task, ...extra }] });
+    expect(ThreadSettlementService.isSnoozed(withTask({}), NOW_MS)).toBe(true);
+    expect(ThreadSettlementService.isSnoozed(withTask({ blockedOn: "resume" }), NOW_MS)).toBe(
+      false,
+    );
+    expect(ThreadSettlementService.isSnoozed(withTask({ blockedOn: "approval" }), NOW_MS)).toBe(
+      false,
+    );
+  });
+
   it("keeps a run requested and completed after snoozing parked until the timer", () => {
     const thread = shell({
       ...snoozed,

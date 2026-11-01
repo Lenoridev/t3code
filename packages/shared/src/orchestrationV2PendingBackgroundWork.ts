@@ -127,6 +127,30 @@ type PendingBackgroundWorkPullRequest = Pick<
 
 type PendingBackgroundWorkCommandWatch = Pick<ThreadCommandWatch, "id" | "label" | "status">;
 
+interface CommandWatchThread<Watch> {
+  readonly commandWatches?: ReadonlyArray<Watch> | undefined;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly settledAt: unknown;
+}
+
+/** A settled thread keeps its watches but runs none of them until it is un-settled. */
+export const commandWatchesSuspended = (
+  thread: Pick<CommandWatchThread<never>, "settledOverride" | "settledAt">,
+) => thread.settledOverride === "settled" || thread.settledAt !== null;
+
+/**
+ * What a thread's watches hold it for. A settled thread's running watches are idle, but one
+ * awaiting approval or a resume still waits for someone.
+ */
+export const commandWatchesHoldingThread = <Watch extends Pick<ThreadCommandWatch, "status">>(
+  thread: CommandWatchThread<Watch>,
+): ReadonlyArray<Watch> | undefined =>
+  commandWatchesSuspended(thread)
+    ? thread.commandWatches?.filter(
+        (watch) => watch.status !== "watching" && watch.status !== "baselining",
+      )
+    : thread.commandWatches;
+
 type PendingBackgroundWorkProviderThread = Pick<
   OrchestrationV2ProviderThread,
   "id" | "pendingBackgroundTasks"
@@ -331,14 +355,16 @@ function commandWatchTasks(
   watches: ReadonlyArray<PendingBackgroundWorkCommandWatch> | undefined,
 ): Array<PendingBackgroundWorkTask> {
   // Every watch holds the thread, so automatic settling never ends a paused or unapproved one.
-  return (watches ?? []).map((watch) => ({
-    taskId: watch.id,
-    kind: "monitor" as const,
-    awaited: true as const,
-    ...(watch.status === "awaiting_approval"
-      ? { description: `Waiting for approval: ${watch.label}`, blockedOn: "approval" as const }
-      : watch.status === "paused"
-        ? { description: `Paused: ${watch.label}`, blockedOn: "resume" as const }
-        : { description: `Watching: ${watch.label}` }),
-  }));
+  return (watches ?? [])
+    .filter((watch) => watch.status !== "ended")
+    .map((watch) => ({
+      taskId: watch.id,
+      kind: "monitor" as const,
+      awaited: true as const,
+      ...(watch.status === "awaiting_approval"
+        ? { description: `Waiting for approval: ${watch.label}`, blockedOn: "approval" as const }
+        : watch.status === "paused"
+          ? { description: `Paused: ${watch.label}`, blockedOn: "resume" as const }
+          : { description: `Watching: ${watch.label}` }),
+    }));
 }

@@ -460,6 +460,19 @@ it.effect("pauses after repeated failures with a notice and resumes from the acc
       assert.strictEqual(paused?.status, "paused");
       assert.strictEqual(paused?.pauseReason, "failures");
       assert.include((yield* updatesOf(threadId)).at(-1)?.text ?? "", "paused this watch");
+      // A pause ends a snooze, so snoozing now could only wake the thread straight away.
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            orchestrator.dispatch({
+              type: "thread.snooze",
+              commandId: CommandId.make("snooze:paused"),
+              threadId,
+              snoozedUntil: "2099-01-01T00:00:00.000Z",
+            }),
+          ),
+        ),
+      );
       yield* TestClock.adjust("1 day");
       yield* look;
       assert.lengthOf(runner.calls, 9);

@@ -71,6 +71,33 @@ function makeQueuedTurnShell(overrides: Partial<QueuedTurnShell> = {}): QueuedTu
   return { latestUserMessageAt: null, latestTurn: null, session: null, ...overrides };
 }
 
+describe("a command watch that needs someone", () => {
+  const blocked = (blockedOn: "approval" | "resume") => ({
+    ...makeShell({ snoozedUntil: FUTURE_WAKE }),
+    pendingBackgroundTasks: [{ blockedOn }],
+  });
+
+  it("ends the snooze when it pauses, without clearing the timer", () => {
+    const paused = blocked("resume");
+    expect(threadRaisedHandWhileSnoozed(paused)).toBe(true);
+    expect(effectiveSnoozed(paused, { now: NOW })).toBe(false);
+    expect(paused.snoozedUntil).toBe(FUTURE_WAKE);
+  });
+
+  it("cannot be snoozed while paused, since that would wake it at once", () => {
+    expect(canSnooze(blocked("resume"), { now: NOW })).toBe(false);
+  });
+
+  it("stays snoozed while the watch is merely running", () => {
+    const running = {
+      ...makeShell({ snoozedUntil: FUTURE_WAKE }),
+      pendingBackgroundTasks: [{}],
+    };
+    expect(effectiveSnoozed(running, { now: NOW })).toBe(true);
+    expect(canSnooze(running, { now: NOW })).toBe(true);
+  });
+});
+
 describe("effectiveSnoozed", () => {
   it("never hides on malformed wake data", () => {
     expect(effectiveSnoozed(makeShell({ snoozedUntil: "not-a-date" }), { now: NOW })).toBe(false);

@@ -1,4 +1,5 @@
 import {
+  backgroundWorkBlockedOn,
   backgroundWorkHoldsCompletion,
   turnItemUpdateCanEndBackgroundWork,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -168,12 +169,17 @@ export function isSnoozed(
     | "status"
     | "pendingRuntimeRequest"
     | "pendingGuestMessageCount"
+    | "pendingBackgroundTasks"
   >,
   nowMs: number,
 ): boolean {
   const snoozedUntilMs = toMillis(thread.snoozedUntil);
   if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return false;
   if (thread.pendingRuntimeRequest !== null) return false;
+  const tasks = thread.pendingBackgroundTasks ?? [];
+  if (backgroundWorkBlockedOn(tasks, "approval") || backgroundWorkBlockedOn(tasks, "resume")) {
+    return false;
+  }
   // Same as the client: a waiting guest message wakes the thread, and the snooze stays stored.
   if ((thread.pendingGuestMessageCount ?? 0) > 0) return false;
   const snoozedAtMs = toMillis(thread.snoozedAt);

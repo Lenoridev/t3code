@@ -19,6 +19,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import {
+  commandWatchesHoldingThread,
   backgroundWorkHoldsCompletion,
   derivePendingBackgroundWork,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -240,7 +241,7 @@ export function deriveThreadStructureRuntime(
       activeProviderThreadId: projection.thread.activeProviderThreadId,
       runs: projection.runs,
       pullRequests: projection.thread.pullRequests,
-      commandWatches: projection.thread.commandWatches,
+      commandWatches: commandWatchesHoldingThread(projection.thread),
     }),
   );
   // A pull request watch can hold a thread that never ran.

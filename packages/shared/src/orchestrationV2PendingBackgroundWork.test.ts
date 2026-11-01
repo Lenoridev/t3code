@@ -3,7 +3,28 @@ import { ProviderInstanceId, ProviderThreadId } from "@t3tools/contracts";
 import {
   backgroundWorkHoldsCompletion,
   derivePendingBackgroundWork,
+  commandWatchesHoldingThread,
 } from "./orchestrationV2PendingBackgroundWork.ts";
+
+describe("commandWatchesHoldingThread", () => {
+  const watches = [
+    { id: "a", label: "A", status: "watching" },
+    { id: "b", label: "B", status: "baselining" },
+    { id: "c", label: "C", status: "paused" },
+    { id: "d", label: "D", status: "awaiting_approval" },
+  ] as const;
+  const ids = (thread: {
+    readonly settledOverride: "settled" | "active" | null;
+    readonly settledAt: null | object;
+  }) =>
+    commandWatchesHoldingThread({ commandWatches: watches, ...thread })?.map((watch) => watch.id);
+
+  it("lets a settled thread's running watches go, but not one that needs someone", () => {
+    expect(ids({ settledOverride: null, settledAt: null })).toEqual(["a", "b", "c", "d"]);
+    expect(ids({ settledOverride: "settled", settledAt: null })).toEqual(["c", "d"]);
+    expect(ids({ settledOverride: null, settledAt: {} })).toEqual(["c", "d"]);
+  });
+});
 
 describe("backgroundWorkHoldsCompletion", () => {
   it.each([
