@@ -1455,3 +1455,30 @@ it.effect("a custom comparison may read more output than exact comparison keeps"
     }).pipe(Effect.provide(runner.layer), Effect.scoped);
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect("tells the agent when a watch keeps waking the thread, without stopping it", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("thread:command-watch-frequent");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "date");
+    yield* finishRuns(threadId);
+    let count = 0;
+    const runner = fakeRunner(() => output({ stdout: `${(count += 1)}\n` }));
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      for (let update = 1; update <= 20; update += 1) {
+        yield* TestClock.adjust("10 minutes");
+        yield* look;
+        yield* takeQueued(threadId);
+        yield* finishRuns(threadId);
+      }
+      const updates = yield* updatesOf(threadId);
+      assert.lengthOf(updates, 20);
+      assert.notInclude(updates[18]?.text ?? "", "woken this thread");
+      assert.include(updates[19]?.text ?? "", "woken this thread 20 times");
+      assert.strictEqual((yield* watchOf(threadId))?.status, "watching");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);

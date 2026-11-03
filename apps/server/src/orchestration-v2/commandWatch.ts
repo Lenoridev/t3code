@@ -26,6 +26,8 @@ const COMMAND_WATCH_OUTPUT_LIMIT_BYTES = 4 * 1024;
 const COMMAND_WATCH_COMPARISON_OUTPUT_LIMIT_BYTES = 64 * 1024;
 export const commandWatchOutputLimitBytes = (hasComparison: boolean) =>
   hasComparison ? COMMAND_WATCH_COMPARISON_OUTPUT_LIMIT_BYTES : COMMAND_WATCH_OUTPUT_LIMIT_BYTES;
+/** Updates from one watch in 24 hours before its updates point out how often it wakes the thread. */
+const COMMAND_WATCH_FREQUENT_UPDATES = 20;
 /** What one update to the agent carries. Changes beyond it wait for the next update. */
 export const COMMAND_WATCH_UPDATE_MAX_CHANGES = 10;
 export const COMMAND_WATCH_UPDATE_MAX_BYTES = 8 * 1024;
@@ -546,6 +548,8 @@ export interface CommandWatchUpdate {
 export function commandWatchUpdate(
   watch: Pick<ThreadCommandWatch, "id" | "label" | "status">,
   waiting: ReadonlyArray<CommandWatchChange>,
+  /** Updates this watch sent in the last 24 hours, this one included. */
+  recentUpdates = 1,
 ): CommandWatchUpdate | undefined {
   if (waiting.length === 0) return undefined;
   const taken: Array<{ readonly change: CommandWatchChange; readonly shortened: boolean }> = [];
@@ -572,7 +576,7 @@ export function commandWatchUpdate(
       fence,
       ...(shortened
         ? [
-            `This change was shortened. Call read_command_watch_change with watchId "${watch.id}" and sequence ${change.sequence} for all of it.`,
+            `This change was shortened. Call read_command_watches with watchId "${watch.id}" and sequence ${change.sequence} for all of it.`,
           ]
         : []),
       "",
@@ -592,6 +596,12 @@ export function commandWatchUpdate(
       ...(remaining > 0
         ? [
             `${remaining} more ${remaining === 1 ? "change is" : "changes are"} waiting and arrive in the next update.`,
+            "",
+          ]
+        : []),
+      ...(recentUpdates >= COMMAND_WATCH_FREQUENT_UPDATES && watch.status !== "ended"
+        ? [
+            `This watch has woken this thread ${recentUpdates} times in the last 24 hours. If these changes are not all news, narrow the check (pass replaces to watch_command), raise everyMinutes, or stop the watch. If they are, carry on.`,
             "",
           ]
         : []),
@@ -627,7 +637,7 @@ export function commandWatchPauseNotice(
     ? {
         kind: "notice",
         summary: "paused, the command kept failing",
-        content: `T3 Code paused this watch after ${COMMAND_WATCH_FAILURE_LIMIT} failed checks in a row. The last one ${detail}. Fix the cause, then call resume_command_watch: it continues from the last accepted output.`,
+        content: `T3 Code paused this watch after ${COMMAND_WATCH_FAILURE_LIMIT} failed checks in a row. The last one ${detail}. Fix the cause, then call set_command_watch_paused with paused false: it continues from the last accepted output.`,
       }
     : {
         kind: "notice",

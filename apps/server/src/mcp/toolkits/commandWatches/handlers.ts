@@ -33,10 +33,8 @@ import { loadCaller } from "../../threadAccess.ts";
 import {
   CommandWatchFailedError,
   CommandWatchesToolkit,
-  type ReadCommandWatchChangeInput,
-  type ReadCommandWatchInput,
-  type PauseCommandWatchInput,
-  type ResumeCommandWatchInput,
+  type ReadCommandWatchesInput,
+  type SetCommandWatchPausedInput,
   type TestCommandWatchComparisonInput,
   type UnwatchCommandInput,
   type WatchCommandInput,
@@ -299,69 +297,69 @@ const make = Effect.gen(function* () {
         return { watches: yield* watchesOf(caller.id) };
       }),
     ),
-    list_command_watches: McpToolAccess.actsAsCaller(() =>
-      Effect.gen(function* () {
-        yield* requireOrchestration;
-        const caller = yield* requireCaller("list its command watches");
-        return { watches: yield* watchesOf(caller.id) };
-      }),
-    ),
-    pause_command_watch: McpToolAccess.actsAsCaller((input: PauseCommandWatchInput) =>
-      Effect.gen(function* () {
-        yield* requireOrchestration;
-        const caller = yield* requireCaller("pause its command watches");
-        const commandSuffix = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
-        yield* engine
-          .dispatch({
-            type: "thread.command-watch.pause",
-            commandId: CommandId.make(`server:mcp-command-pause:${caller.id}:${commandSuffix}`),
-            threadId: caller.id,
-            watchId: input.watchId,
-            pausedBy: "agent",
-          })
-          .pipe(Effect.catchCause(refusal));
-        return { watches: yield* watchesOf(caller.id) };
-      }),
-    ),
-    resume_command_watch: McpToolAccess.actsAsCaller((input: ResumeCommandWatchInput) =>
-      Effect.gen(function* () {
-        yield* requireOrchestration;
-        const caller = yield* requireCaller("resume its command watches");
-        const watch = (yield* watchesOf(caller.id)).find(({ id }) => id === input.watchId);
-        if (watch?.pauseReason === "user") {
-          return yield* new CommandWatchFailedError({
-            reason: `The user paused watch ${input.watchId}. Only they can resume it.`,
-          });
-        }
-        const commandSuffix = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
-        yield* engine
-          .dispatch({
-            type: "thread.command-watch.resume",
-            commandId: CommandId.make(`server:mcp-command-resume:${caller.id}:${commandSuffix}`),
-            threadId: caller.id,
-            watchId: input.watchId,
-          })
-          .pipe(Effect.catchCause(refusal));
-        return { watches: yield* watchesOf(caller.id) };
-      }),
-    ),
-    read_command_watch: McpToolAccess.actsAsCaller((input: ReadCommandWatchInput) =>
+    read_command_watches: McpToolAccess.actsAsCaller((input: ReadCommandWatchesInput) =>
       Effect.gen(function* () {
         yield* requireOrchestration;
         const caller = yield* requireCaller("read its command watches");
+        const watches = yield* watchesOf(caller.id);
+        if (input.watchId === undefined) {
+          if (input.sequence !== undefined) {
+            return yield* new CommandWatchFailedError({ reason: "sequence needs watchId." });
+          }
+          return { watches };
+        }
+        // Only the calling thread's own watches.
+        const watch = watches.find(({ id }) => id === input.watchId);
         const missing = new CommandWatchFailedError({
           reason: `No watch ${input.watchId} on this thread.`,
         });
-        const watch = (yield* watchesOf(caller.id)).find(({ id }) => id === input.watchId);
         if (watch === undefined) return yield* missing;
+        if (input.sequence !== undefined) {
+          const absent = new CommandWatchFailedError({
+            reason: `No stored change ${input.sequence} for watch ${watch.id}.`,
+          });
+          const change = yield* store
+            .readChange(watch.id, input.sequence)
+            .pipe(Effect.mapError(() => absent));
+          if (change === undefined) return yield* absent;
+          const { sequence, summary, detectedAt, content } = change;
+          return { watches: [watch], change: { sequence, summary, detectedAt, content } };
+        }
         const storage = yield* store.get(watch.id).pipe(Effect.mapError(() => missing));
         return {
-          watch,
-          comparisonSource: storage?.comparisonSource ?? null,
-          helpers: storage?.helpers ?? [],
-          acceptedOutput: storage?.observation ?? null,
-          comparisonState: storage?.comparisonState ?? null,
+          watches: [watch],
+          details: {
+            comparisonSource: storage?.comparisonSource ?? null,
+            helpers: storage?.helpers ?? [],
+            acceptedOutput: storage?.observation ?? null,
+            comparisonState: storage?.comparisonState ?? null,
+          },
         };
+      }),
+    ),
+    set_command_watch_paused: McpToolAccess.actsAsCaller((input: SetCommandWatchPausedInput) =>
+      Effect.gen(function* () {
+        yield* requireOrchestration;
+        const caller = yield* requireCaller("pause or resume its command watches");
+        if (!input.paused) {
+          const watch = (yield* watchesOf(caller.id)).find(({ id }) => id === input.watchId);
+          if (watch?.pauseReason === "user") {
+            return yield* new CommandWatchFailedError({
+              reason: `The user paused watch ${input.watchId}. Only they can resume it.`,
+            });
+          }
+        }
+        const suffix = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+        const commandId = CommandId.make(`server:mcp-command-pause:${caller.id}:${suffix}`);
+        const target = { commandId, threadId: caller.id, watchId: input.watchId };
+        yield* engine
+          .dispatch(
+            input.paused
+              ? { type: "thread.command-watch.pause", ...target, pausedBy: "agent" }
+              : { type: "thread.command-watch.resume", ...target },
+          )
+          .pipe(Effect.catchCause(refusal));
+        return { watches: yield* watchesOf(caller.id) };
       }),
     ),
     test_command_watch_comparison: McpToolAccess.actsAsCaller(
@@ -406,28 +404,6 @@ const make = Effect.gen(function* () {
               ),
             );
         }),
-    ),
-    read_command_watch_change: McpToolAccess.actsAsCaller((input: ReadCommandWatchChangeInput) =>
-      Effect.gen(function* () {
-        yield* requireOrchestration;
-        const caller = yield* requireCaller("read its command watch changes");
-        // Only the calling thread's own watches.
-        const watches = yield* watchesOf(caller.id);
-        const missing = new CommandWatchFailedError({
-          reason: `No stored change ${input.sequence} for watch ${input.watchId} on this thread.`,
-        });
-        if (!watches.some((watch) => watch.id === input.watchId)) return yield* missing;
-        const change = yield* store
-          .readChange(input.watchId, input.sequence)
-          .pipe(Effect.mapError(() => missing));
-        if (change === undefined) return yield* missing;
-        return {
-          sequence: change.sequence,
-          summary: change.summary,
-          detectedAt: change.detectedAt,
-          content: change.content,
-        };
-      }),
     ),
   };
 });

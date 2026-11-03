@@ -47,97 +47,65 @@ const ComparisonSource = Schema.String.check(
 );
 
 const COMPARISON_CONTRACT =
-  "Define one synchronous `function compare({ phase, previous, current, state })` in plain JavaScript. phase is baseline on the first check, when previous and state are null, then update. previous and current are the output: a string with format text, a value with format json. Return { state, changes, complete? }: state is JSON you keep for the next run (null for none, at most 8 KB); changes is a list of { key, kind, summary, details }, where key is unique in this result, kind names the category such as comment.added, summary is plain text of at most 120 characters, and details is JSON evidence; an empty list wakes nobody. It runs in a restricted interpreter with no imports, require, filesystem, network, timers, async, current time, or randomness, within 250 ms and 32 MB. Date accepts explicit values only, in UTC. Throwing fails the check without replacing the last accepted output.";
+  "Define one synchronous `function compare({ phase, previous, current, state })` in plain JavaScript. phase is baseline on the first check (previous and state are null), then update. previous and current are the output: a string with format text, a value with format json. Return { state, changes, complete? }: state is JSON kept for the next run (null for none, at most 8 KB); changes is a list of { key, kind, summary, details }, with key unique in this result, kind a category such as comment.added, summary plain text of at most 120 characters, and details JSON evidence; an empty list wakes nobody. complete: { reason } ends a watch that has a completionCondition. No imports, filesystem, network, timers, async, current time, or randomness; 250 ms and 32 MB. Date takes explicit values only, in UTC. Throwing fails the check and keeps the last accepted output.";
 
 export const WatchCommandInput = Schema.Struct({
-  requestId: ThreadCommandWatchRequestId.annotate({
-    description:
-      "An id you make up for this request. Retrying with the same id and definition returns the same watch, and the same id with a different definition is refused, so use a new id for each new watch.",
-  }),
-  command: ThreadCommandWatchCommand.annotate({
-    description:
-      "Shell command to run, for example a gh or curl query filtered with jq. It runs in this thread's workspace with the T3 server's environment. Refer to a declared helper script as \"$T3_WATCH_HELPERS/<its path>\".",
-  }),
-  label: ThreadCommandWatchLabel.annotate({
-    description: "Short name the user sees for this watch, for example 'Maintainer reply on #123'.",
-  }),
+  requestId: ThreadCommandWatchRequestId,
+  command: ThreadCommandWatchCommand,
+  label: ThreadCommandWatchLabel,
   everyMinutes: Schema.optional(
     ThreadCommandWatchEveryMinutes.annotate({
-      description:
-        "Minutes from the end of one check to the start of the next, 1 to 1440. Defaults to 10.",
+      description: "Minutes between checks, 1 to 1440. Defaults to 10.",
     }),
   ),
   format: Schema.optional(
     ThreadCommandWatchFormat.annotate({
       description:
-        "How output is compared. text (default) compares it exactly, whitespace included. json parses one JSON value and ignores formatting and object key order, but not array order.",
+        "text (default) compares output exactly. json parses one JSON value and ignores formatting and key order, but not array order.",
     }),
   ),
   helpers: Schema.optional(
     Schema.Array(ThreadCommandWatchHelperPath)
       .check(Schema.isMaxLength(THREAD_COMMAND_WATCH_HELPER_LIMIT))
       .annotate({
-        description: `Workspace-relative paths of scripts the command runs, at most ${THREAD_COMMAND_WATCH_HELPER_LIMIT}. T3 Code stores a copy now and runs that copy, so later edits to the files do not change the watch. Files the command only reads as data are not helpers.`,
+        description: `Workspace-relative paths of scripts the command runs, at most ${THREAD_COMMAND_WATCH_HELPER_LIMIT}. T3 Code runs a copy stored now, so later edits do not change the watch. Refer to one as "$T3_WATCH_HELPERS/<its path>".`,
       }),
   ),
   reportInitialState: Schema.optional(
     Schema.Boolean.annotate({
-      description:
-        "Report what the first check prints instead of only recording it. Defaults to false.",
+      description: "Report what the first check prints instead of only recording it.",
     }),
   ),
   comparisonSource: Schema.optional(
     ComparisonSource.annotate({
-      description: `JavaScript that decides which changes matter, for when any output change is not news, such as ignoring your own comments or naming what happened. Test it first with test_command_watch_comparison, whose description gives the contract. Omit it to compare output exactly.`,
+      description: `JavaScript that decides which changes are news. Test it first with test_command_watch_comparison, whose description gives the contract.`,
     }),
   ),
-  completionCondition: Schema.optional(
-    ThreadCommandWatchCondition.annotate({
-      description:
-        "When this watch should end on its own, for example 'CI on main finished'. Only with comparisonSource: it ends the watch by returning complete: { reason }. Omit it for ongoing monitoring, which runs until stopped.",
-    }),
-  ),
-  replaces: Schema.optional(
-    TrimmedNonEmptyString.annotate({
-      description:
-        "A watch on this thread this one replaces. The new watch starts from a fresh first check; outside Full access the old one keeps running until the user allows the new one. Changes the old one has not delivered move to the new one.",
-    }),
-  ),
+  completionCondition: Schema.optional(ThreadCommandWatchCondition),
+  replaces: Schema.optional(TrimmedNonEmptyString),
 });
 export type WatchCommandInput = typeof WatchCommandInput.Type;
 
 export const UnwatchCommandInput = Schema.Struct({
-  watchId: Schema.optional(
-    TrimmedNonEmptyString.annotate({
-      description: "Watch to stop. Omit to stop every command watch on this thread.",
-    }),
-  ),
+  watchId: Schema.optional(TrimmedNonEmptyString),
 });
 export type UnwatchCommandInput = typeof UnwatchCommandInput.Type;
 
-export const PauseCommandWatchInput = Schema.Struct({
-  watchId: TrimmedNonEmptyString.annotate({ description: "The running watch to pause." }),
-});
-export type PauseCommandWatchInput = typeof PauseCommandWatchInput.Type;
-
-export const ResumeCommandWatchInput = Schema.Struct({
-  watchId: TrimmedNonEmptyString.annotate({ description: "The paused watch to resume." }),
-});
-export type ResumeCommandWatchInput = typeof ResumeCommandWatchInput.Type;
-
-export const ReadCommandWatchChangeInput = Schema.Struct({
+export const SetCommandWatchPausedInput = Schema.Struct({
   watchId: TrimmedNonEmptyString,
-  sequence: Schema.Int.annotate({ description: "The change number an update named." }),
+  paused: Schema.Boolean,
 });
-export type ReadCommandWatchChangeInput = typeof ReadCommandWatchChangeInput.Type;
+export type SetCommandWatchPausedInput = typeof SetCommandWatchPausedInput.Type;
 
-export const ReadCommandWatchInput = Schema.Struct({
-  watchId: TrimmedNonEmptyString,
+export const ReadCommandWatchesInput = Schema.Struct({
+  watchId: Schema.optional(TrimmedNonEmptyString),
+  sequence: Schema.optional(
+    Schema.Int.annotate({ description: "A change number an update named. Needs watchId." }),
+  ),
 });
-export type ReadCommandWatchInput = typeof ReadCommandWatchInput.Type;
+export type ReadCommandWatchesInput = typeof ReadCommandWatchesInput.Type;
 
 export const CommandWatchDetailsResult = Schema.Struct({
-  watch: ThreadCommandWatch,
   ...ThreadCommandWatchDetails.fields,
   /** The last accepted output, null until a check succeeds. */
   acceptedOutput: Schema.NullOr(Schema.String),
@@ -152,15 +120,11 @@ export const TestCommandWatchComparisonInput = Schema.Struct({
       description: "Defaults to update, or baseline when previous is omitted.",
     }),
   ),
-  previous: Schema.optional(
-    Schema.Unknown.annotate({ description: "Sample previous output: a string, or a JSON value." }),
-  ),
-  current: Schema.Unknown.annotate({ description: "Sample current output." }),
-  state: Schema.optional(Schema.Unknown.annotate({ description: "Sample saved state." })),
+  previous: Schema.optional(Schema.Unknown),
+  current: Schema.Unknown,
+  state: Schema.optional(Schema.Unknown),
   completionCondition: Schema.optional(
-    Schema.Boolean.annotate({
-      description: "Whether the watch would declare a completion condition. Defaults to false.",
-    }),
+    Schema.Boolean.annotate({ description: "Whether the watch would declare one." }),
   ),
 });
 export type TestCommandWatchComparisonInput = typeof TestCommandWatchComparisonInput.Type;
@@ -192,9 +156,17 @@ export const CommandWatchChangeResult = Schema.Struct({
   content: Schema.String,
 });
 
+export const ReadCommandWatchesResult = Schema.Struct({
+  watches: Schema.Array(ThreadCommandWatch),
+  /** With watchId: its stored definition and last accepted output. */
+  details: Schema.optional(CommandWatchDetailsResult),
+  /** With watchId and sequence: that change in full. */
+  change: Schema.optional(CommandWatchChangeResult),
+});
+
 const WatchCommandTool = Tool.make("watch_command", {
   description:
-    "Have T3 Code run a shell command for this thread on an interval and send you an update when its output changes. Use it to wait on anything that is not a pull request (a discussion or issue reply, another repository's CI, a deploy, a release) instead of polling or sleeping. Write a read-only check whose output changes only when there is news, for example the item's state plus recent comments from other accounts. Leave out your own and the user's comments in the command itself (for example `jq --arg me \"$(gh api user --jq .login)\" 'map(select(.user.login != $me))'`), so your own replies do not come back to you. The first check only records the output, so a state that already holds never wakes you, unless reportInitialState is set. Any nonzero exit is a failed check, so turn an expected empty result into successful output (`grep ... || true`). Failed checks retry with growing delays; 8 in a row pause the watch until you or the user resume it. Output over 4 KB is a failed check, so keep the output small. A check runs while you are busy; updates wait in the queue and arrive one at a time, never dropped. In Full access the watch starts at once. Otherwise the user must allow it first: the status is awaiting_approval until they do. It runs with the T3 server's environment, not yours: rely on tools already logged in on the server, and keep secrets out of the command, since the user sees it. While the watch runs, the thread stays in the user's Working list. If the user settles the thread, checks wait until it is un-settled; archiving ends the watch. Call unwatch_command when you no longer need it, before handing the work back. A subagent cannot watch: its parent thread does. To change a running watch, pass replaces with its id. A check that fails to compare keeps the last accepted output. Pass comparisonSource when only some output changes are news.",
+    "Have T3 Code run a shell command in this thread's workspace on an interval and send you an update when its output changes. Use it to wait on anything that is not a pull request (a discussion or issue reply, another repository's CI, a deploy, a release) instead of polling or sleeping. Write a read-only check whose output changes only when there is news, and leave out your own and the user's comments, for example `jq --arg me \"$(gh api user --jq .login)\" 'map(select(.user.login != $me))'`. Use a new requestId for each new watch; retrying with the same one returns the same watch. The first check only records the output. A nonzero exit is a failed check, so turn an expected empty result into success (`grep ... || true`). Output over 4 KB, or 64 KB with comparisonSource, also fails. Failures retry with growing delays; you hear after 3 in a row, and 8 pause the watch. Updates queue while you are busy and are never dropped. In Full access the watch starts at once; otherwise its status is awaiting_approval until the user allows it. It runs with the T3 server's environment: rely on tools logged in there, and keep secrets out of the command. Checks wait while the thread is settled, and archiving ends the watch. Call unwatch_command before handing the work back. A subagent cannot watch. To change a watch, pass replaces with its id: the new one starts from a fresh first check and takes over undelivered changes, and outside Full access the old one runs until the user allows the new one. completionCondition (needs comparisonSource) says when the watch ends on its own; without it, the watch runs until stopped.",
   parameters: WatchCommandInput,
   success: CommandWatchesResult,
   failure: CommandWatchToolError,
@@ -208,7 +180,7 @@ const WatchCommandTool = Tool.make("watch_command", {
 
 const UnwatchCommandTool = Tool.make("unwatch_command", {
   description:
-    "Stop a command watch on this thread, or every command watch when watchId is omitted. A stopped watch delivers nothing more: an update it queued that you have not started on is removed, and changes still waiting are discarded. Stopping a watch that already ended changes nothing.",
+    "Stop a command watch on this thread, or all of them when watchId is omitted. It delivers nothing more: a queued update and waiting changes are discarded.",
   parameters: UnwatchCommandInput,
   success: CommandWatchesResult,
   failure: CommandWatchToolError,
@@ -220,78 +192,36 @@ const UnwatchCommandTool = Tool.make("unwatch_command", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
-const ListCommandWatchesTool = Tool.make("list_command_watches", {
+const ReadCommandWatchesTool = Tool.make("read_command_watches", {
   description:
-    "List this thread's command watches with their status: awaiting_approval, baselining, watching, paused with a reason, or ended with a reason. Recently ended watches stay listed.",
-  parameters: Tool.EmptyParams,
-  success: CommandWatchesResult,
+    "List this thread's command watches with their status: awaiting_approval, baselining, watching, paused, or ended, with a reason. With watchId, also its stored helpers, comparison source and state, and last accepted output. With watchId and sequence, a change in full, for an update that shortened it.",
+  parameters: ReadCommandWatchesInput,
+  success: ReadCommandWatchesResult,
   failure: CommandWatchToolError,
   dependencies,
 })
-  .annotate(Tool.Title, "List command watches")
+  .annotate(Tool.Title, "Read command watches")
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
-const PauseCommandWatchTool = Tool.make("pause_command_watch", {
+const SetCommandWatchPausedTool = Tool.make("set_command_watch_paused", {
   description:
-    "Stop a command watch's checks until you call resume_command_watch; nothing resumes it for you, and the user sees it paused. Changes it already detected still arrive, and one check in progress may add another. Use it when you expect noise you will cause yourself; use unwatch_command when you no longer need the watch.",
-  parameters: PauseCommandWatchInput,
+    "Pause or resume a command watch. A pause stops its checks until you resume it: nothing resumes it for you, the user sees it paused, and changes already detected still arrive. Use it around noise you will cause yourself. A watch the user paused is theirs to resume. Resuming reports what changed meanwhile as one change.",
+  parameters: SetCommandWatchPausedInput,
   success: CommandWatchesResult,
   failure: CommandWatchToolError,
   dependencies,
 })
-  .annotate(Tool.Title, "Pause command watch")
+  .annotate(Tool.Title, "Pause or resume command watch")
   .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
-
-const ResumeCommandWatchTool = Tool.make("resume_command_watch", {
-  description:
-    "Resume a paused command watch on this thread, unless the user paused it: that one is theirs to resume. It continues from the last accepted output, so it reports what changed while it was paused as one change.",
-  parameters: ResumeCommandWatchInput,
-  success: CommandWatchesResult,
-  failure: CommandWatchToolError,
-  dependencies,
-})
-  .annotate(Tool.Title, "Resume command watch")
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
-
-const ReadCommandWatchChangeTool = Tool.make("read_command_watch_change", {
-  description:
-    "Read the full text of a change a command watch update shortened. The update names the watch and change number.",
-  parameters: ReadCommandWatchChangeInput,
-  success: CommandWatchChangeResult,
-  failure: CommandWatchToolError,
-  dependencies,
-})
-  .annotate(Tool.Title, "Read command watch change")
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
-
-const ReadCommandWatchTool = Tool.make("read_command_watch", {
-  description:
-    "Read one of this thread's command watches in full: its definition, stored helper scripts, comparison source and saved state, the last accepted output, and its failures.",
-  parameters: ReadCommandWatchInput,
-  success: CommandWatchDetailsResult,
-  failure: CommandWatchToolError,
-  dependencies,
-})
-  .annotate(Tool.Title, "Read command watch")
-  .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
 const TestCommandWatchComparisonTool = Tool.make("test_command_watch_comparison", {
-  description: `Try comparison source on sample output before using it in watch_command. It runs the same restricted interpreter and result checks as a live check, runs no command, and sends nothing. ${COMPARISON_CONTRACT}`,
+  description: `Try comparison source on sample output, with the same checks as a live run. ${COMPARISON_CONTRACT}`,
   parameters: TestCommandWatchComparisonInput,
   success: TestCommandWatchComparisonResult,
   failure: CommandWatchToolError,
@@ -306,10 +236,7 @@ const TestCommandWatchComparisonTool = Tool.make("test_command_watch_comparison"
 export const CommandWatchesToolkit = Toolkit.make(
   WatchCommandTool,
   UnwatchCommandTool,
-  ListCommandWatchesTool,
-  PauseCommandWatchTool,
-  ResumeCommandWatchTool,
-  ReadCommandWatchChangeTool,
-  ReadCommandWatchTool,
+  ReadCommandWatchesTool,
+  SetCommandWatchPausedTool,
   TestCommandWatchComparisonTool,
 );

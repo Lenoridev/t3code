@@ -201,7 +201,7 @@ describe("commandWatchUpdate", () => {
       change(2, "next"),
     ])!;
     assert.strictEqual(update.through, 1);
-    assert.include(update.text, "read_command_watch_change");
+    assert.include(update.text, "read_command_watches");
     assert.include(update.text, "sequence 1");
   });
 

@@ -223,7 +223,13 @@ export const make = Effect.gen(function* () {
       if (watch.waitingChanges !== waiting.length) patch.waitingChanges = waiting.length;
       return { patch, wake: undefined };
     }
-    const update = commandWatchUpdate(watch, waiting);
+    const prefix = `message:command-watch:${watch.id}:`;
+    const recentUpdates = (yield* readRuns).filter(
+      (run) =>
+        run.userMessageId.startsWith(prefix) &&
+        DateTime.toEpochMillis(run.requestedAt) > now - 24 * 60 * 60_000,
+    ).length;
+    const update = commandWatchUpdate(watch, waiting, recentUpdates + 1);
     if (update === undefined) return { patch, wake: undefined };
     const messageId = updateMessageId(watch, yield* crypto.randomUUIDv4(), update.through);
     patch.pendingMessageId = messageId;

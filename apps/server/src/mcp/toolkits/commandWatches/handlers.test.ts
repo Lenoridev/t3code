@@ -311,7 +311,10 @@ describe("command watch toolkit handlers", () => {
   it.effect("pauses the named watch on the calling thread", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
-      yield* harness.call("pause_command_watch", { watchId: "command-watch:a" });
+      yield* harness.call("set_command_watch_paused", {
+        watchId: "command-watch:a",
+        paused: true,
+      });
       const [pause] = yield* Ref.get(harness.commands);
       expect(pause).toMatchObject({
         type: "thread.command-watch.pause",
@@ -329,7 +332,7 @@ describe("command watch toolkit handlers", () => {
       });
       expect(
         yield* harness
-          .call("resume_command_watch", { watchId: "command-watch:a" })
+          .call("set_command_watch_paused", { watchId: "command-watch:a", paused: false })
           .pipe(Effect.flip),
       ).toMatchObject({ reason: expect.stringContaining("Only they can resume it") });
       expect(yield* Ref.get(harness.commands)).toEqual([]);
