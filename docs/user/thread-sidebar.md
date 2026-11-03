@@ -232,7 +232,7 @@ Background work sheet on mobile, to see the full command and choose **Allow this
 **Deny**. Your approval covers that exact command, the helper scripts and comparison script it
 uses, and how often it runs. If any of them changes, or you leave Full access for a watch Full access allowed, the watch asks again.
 
-After 8 failed checks in a row a watch pauses and the thread shows **Paused**. Choose **Resume**
+The agent hears after 3 failed checks in a row. After 8, a watch pauses and the thread shows **Paused**. Choose **Resume**
 once the cause is fixed. You or the agent can also pause a watch for a while. The thread shows **Paused** until
 it is resumed, and only you can resume a watch you paused. To stop a watch, use **Watching** in the thread details on web and
 desktop, or the Background work sheet on mobile. Settling a thread pauses its running watches:

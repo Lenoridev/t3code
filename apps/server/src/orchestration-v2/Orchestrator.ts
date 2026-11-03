@@ -537,27 +537,50 @@ const withoutCommandWatches = (
 /**
  * Full access lets a watch run without a prompt. Leaving it sends those watches back for the
  * user's approval instead of letting them keep authority the thread no longer has; entering it
- * lets watches that were waiting for approval run.
+ * lets watches that were waiting for approval run, which is an approval of any replacement too.
+ * A paused watch stays paused either way, and only its authority follows the mode.
  */
 const withCommandWatchRuntimeMode = (
   thread: OrchestrationV2AppThread,
   runtimeMode: OrchestrationV2AppThread["runtimeMode"],
-): Pick<OrchestrationV2AppThread, "commandWatches"> =>
-  thread.commandWatches === undefined
-    ? {}
-    : {
-        commandWatches: thread.commandWatches.map((watch): ThreadCommandWatch => {
-          if (watch.status === "ended") return watch;
-          if (runtimeMode === "full-access") {
-            return watch.status === "awaiting_approval"
-              ? { ...watch, authority: { kind: "full-access" }, status: "baselining" }
-              : watch;
-          }
-          if (watch.authority?.kind !== "full-access") return watch;
-          const { pauseReason: _reason, ...rest } = watch;
-          return { ...rest, authority: null, status: "awaiting_approval" };
-        }),
-      };
+): Pick<OrchestrationV2AppThread, "commandWatches"> => {
+  if (thread.commandWatches === undefined) return {};
+  const replaced = commandWatchesReplacedOnFullAccess(thread, runtimeMode);
+  return {
+    commandWatches: thread.commandWatches.flatMap((watch): ReadonlyArray<ThreadCommandWatch> => {
+      if (replaced.includes(watch)) return [];
+      if (watch.status === "ended") return [watch];
+      if (runtimeMode === "full-access") {
+        if (watch.status === "awaiting_approval") {
+          return [{ ...watch, authority: { kind: "full-access" }, status: "baselining" }];
+        }
+        return watch.status === "paused" && watch.authority === null
+          ? [{ ...watch, authority: { kind: "full-access" } }]
+          : [watch];
+      }
+      if (watch.authority?.kind !== "full-access") return [watch];
+      if (watch.status === "paused") return [{ ...watch, authority: null }];
+      return [{ ...watch, authority: null, status: "awaiting_approval" }];
+    }),
+  };
+};
+
+/** The watches a change to Full access removes, because their replacement may now run. */
+const commandWatchesReplacedOnFullAccess = (
+  thread: OrchestrationV2AppThread,
+  runtimeMode: OrchestrationV2AppThread["runtimeMode"],
+): ReadonlyArray<ThreadCommandWatch> => {
+  if (runtimeMode !== "full-access") return [];
+  const watches = thread.commandWatches ?? [];
+  const replacedIds = new Set(
+    watches.flatMap((watch) =>
+      watch.status === "awaiting_approval" && watch.replacesWatchId !== undefined
+        ? [watch.replacesWatchId]
+        : [],
+    ),
+  );
+  return watches.filter((watch) => replacedIds.has(watch.id));
+};
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
   switch (command.type) {
@@ -2903,6 +2926,49 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return decided.success;
   });
 
+  /** Removes the queued, unstarted updates of watches that deliver nothing more. */
+  const cancelCommandWatchUpdates = Effect.fn("orchestrationV2.cancelCommandWatchUpdates")(
+    function* (
+      command: Extract<
+        OrchestrationV2ServerCommand,
+        {
+          readonly type:
+            | "thread.command-watch.start"
+            | "thread.command-watch.stop"
+            | "thread.command-watch.approve"
+            | "thread.command-watch.resume"
+            | "thread.command-watch.pause"
+            | "thread.command-watch.sync"
+            | "thread.runtime-mode.set";
+        }
+      >,
+      watches: ReadonlyArray<ThreadCommandWatch>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const pending = new Set(
+        watches.flatMap((watch) =>
+          watch.pendingMessageId === undefined ? [] : [watch.pendingMessageId],
+        ),
+      );
+      if (pending.size === 0) return;
+      const { runs } = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs"])
+        .pipe(mapDispatchError(command));
+      for (const run of runs) {
+        if (run.status !== "queued" || !pending.has(run.userMessageId)) continue;
+        yield* dispatchQueuedRunCancel(
+          {
+            type: "queued-run.cancel",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            runId: run.id,
+          },
+          events,
+        );
+      }
+    },
+  );
+
   /**
    * Starts, approves, resumes, stops and records command watches (`watch_command`). Each change
    * emits the whole thread so every projection applies it, and an update for the agent is queued
@@ -3099,12 +3165,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
         next = replaceWatch(
           watch.id,
-          ({ pauseReason: _reason, lastFailure: _failure, ...rest }) => ({
-            ...rest,
-            status: "watching",
-            collectionFailures: 0,
-            comparisonFailures: 0,
-          }),
+          ({
+            pauseReason: _reason,
+            lastFailure: _failure,
+            deliveryFailures: _deliveryFailures,
+            ...rest
+          }) => {
+            const authority =
+              rest.authority ??
+              (thread.runtimeMode === "full-access" ? { kind: "full-access" as const } : null);
+            return {
+              ...rest,
+              authority,
+              // A pause that outlasted Full access has no authority left to resume with.
+              status: authority === null ? "awaiting_approval" : "watching",
+              collectionFailures: 0,
+              comparisonFailures: 0,
+            };
+          },
         );
         break;
       }
@@ -3178,6 +3256,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(patch.comparisonFailures === undefined
             ? {}
             : { comparisonFailures: patch.comparisonFailures }),
+          ...(patch.deliveryFailures === undefined
+            ? {}
+            : { deliveryFailures: patch.deliveryFailures }),
           ...(patch.waitingChanges === undefined ? {} : { waitingChanges: patch.waitingChanges }),
           ...(patch.lastChangeAt === undefined ? {} : { lastChangeAt: patch.lastChangeAt }),
         }));
@@ -3199,28 +3280,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         updatedAt: command.type === "thread.command-watch.sync" ? thread.updatedAt : now,
       },
     });
-    const pending = new Set(
-      cancelled.flatMap((watch) =>
-        watch.pendingMessageId === undefined ? [] : [watch.pendingMessageId],
-      ),
-    );
-    if (pending.size > 0) {
-      const { runs } = yield* projectionStore
-        .getThreadRecords(command.threadId, ["runs"])
-        .pipe(mapDispatchError(command));
-      for (const run of runs) {
-        if (run.status !== "queued" || !pending.has(run.userMessageId)) continue;
-        yield* dispatchQueuedRunCancel(
-          {
-            type: "queued-run.cancel",
-            commandId: command.commandId,
-            threadId: command.threadId,
-            runId: run.id,
-          },
-          events,
-        );
-      }
-    }
+    yield* cancelCommandWatchUpdates(command, cancelled, events);
     if (command.type !== "thread.command-watch.sync" || command.wake === undefined) return;
     // The user asked to hear about these changes, unlike the background wakes dispatchMessage
     // lets a snooze sleep through.
@@ -4420,6 +4480,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
           }),
         { concurrency: 1, discard: true },
+      );
+    }
+
+    if (command.type === "thread.runtime-mode.set") {
+      yield* cancelCommandWatchUpdates(
+        command,
+        commandWatchesReplacedOnFullAccess(thread, command.runtimeMode),
+        events,
       );
     }
 

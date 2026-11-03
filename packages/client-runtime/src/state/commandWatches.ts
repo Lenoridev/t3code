@@ -32,12 +32,14 @@ export function commandWatchStatusLabel(watch: ThreadCommandWatch, settled = fal
         default:
           return `Paused: ${watch.lastFailure ?? "the command kept failing"}`;
       }
-    case "watching":
-      return watch.waitingChanges > 0
-        ? `Watching, ${watch.waitingChanges} ${watch.waitingChanges === 1 ? "change" : "changes"} waiting`
-        : watch.lastFailure === undefined
-          ? "Watching"
-          : `Watching, last check ${watch.lastFailure}`;
+    case "watching": {
+      const waiting =
+        watch.waitingChanges > 0
+          ? `, ${watch.waitingChanges} ${watch.waitingChanges === 1 ? "change" : "changes"} waiting`
+          : "";
+      const failure = watch.lastFailure === undefined ? "" : `, last check ${watch.lastFailure}`;
+      return `Watching${waiting}${failure}`;
+    }
   }
 }
 

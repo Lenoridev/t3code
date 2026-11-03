@@ -3450,6 +3450,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
       helpers: Schema.optional(Schema.Array(ThreadCommandWatchHelper)),
       collectionFailures: Schema.optional(NonNegativeInt),
       comparisonFailures: Schema.optional(NonNegativeInt),
+      deliveryFailures: Schema.optional(NonNegativeInt),
       lastFailure: Schema.optional(Schema.NullOr(Schema.String)),
       waitingChanges: Schema.optional(NonNegativeInt),
       pendingMessageId: Schema.optional(Schema.NullOr(MessageId)),

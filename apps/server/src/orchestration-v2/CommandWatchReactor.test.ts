@@ -311,7 +311,9 @@ const takeQueued = (threadId: ThreadId) =>
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const now = yield* DateTime.now;
     for (const run of (yield* orchestrator.getThreadProjection(threadId)).runs) {
-      if (run.status !== "queued" && run.status !== "preparing") continue;
+      if (run.status !== "queued" && run.status !== "preparing" && run.status !== "starting") {
+        continue;
+      }
       yield* projections.apply({
         id: EventId.make(`event:${threadId}:${run.id}:taken`),
         type: "run.updated",
@@ -454,10 +456,23 @@ it.effect("pauses after repeated failures with a notice and resumes from the acc
 
       // Exit 1 without stderr is a failure too, not a quiet check.
       next = output({ code: 1 as ProcessRunner.ProcessRunOutput["code"] });
-      for (let attempt = 0; attempt < 8; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         yield* TestClock.adjust("1 day");
         yield* look;
       }
+      // The agent hears well before the pause, while the watch keeps retrying.
+      assert.strictEqual((yield* watchOf(threadId))?.status, "watching");
+      assert.include((yield* updatesOf(threadId)).at(-1)?.text ?? "", "3 checks in a row failed");
+      yield* takeQueued(threadId);
+      yield* finishRuns(threadId);
+      for (let attempt = 3; attempt < 8; attempt++) {
+        yield* TestClock.adjust("1 day");
+        yield* look;
+      }
+      assert.lengthOf(
+        (yield* updatesOf(threadId)).filter(({ text }) => text.includes("in a row failed")),
+        1,
+      );
       const paused = yield* watchOf(threadId);
       assert.strictEqual(paused?.status, "paused");
       assert.strictEqual(paused?.pauseReason, "failures");
@@ -1186,6 +1201,257 @@ it.effect("settling stops checks without ending the watch, and un-settling resta
       yield* look;
       assert.lengthOf(runner.calls, 2);
       assert.include((yield* updatesOf(threadId))[0]?.text ?? "", "+ two");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+const failUnstartedRuns = (threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    for (const run of (yield* orchestrator.getThreadProjection(threadId)).runs) {
+      if (run.status !== "starting" && run.status !== "preparing" && run.status !== "queued") {
+        continue;
+      }
+      yield* projections.apply({
+        id: EventId.make(`event:${threadId}:${run.id}:failed`),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: "failed", startedAt: null, completedAt: now },
+      });
+    }
+  });
+
+it.effect("a change found while the thread settles still arrives after un-settling", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-settle-race");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+    let checks = 0;
+    const layer = Layer.succeed(ProcessRunner.ProcessRunner, {
+      run: () =>
+        Effect.gen(function* () {
+          checks += 1;
+          if (checks === 1) return output({ stdout: "one\n" });
+          if (checks === 2) {
+            yield* orchestrator
+              .dispatch({
+                type: "thread.settle",
+                commandId: CommandId.make("settle:race"),
+                threadId,
+              })
+              .pipe(Effect.orDie);
+          }
+          return output({ stdout: "two\n" });
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.lengthOf(yield* updatesOf(threadId), 0);
+      yield* orchestrator.dispatch({
+        type: "thread.unsettle",
+        commandId: CommandId.make("unsettle:race"),
+        threadId,
+        reason: "user",
+      });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.include((yield* updatesOf(threadId))[0]?.text ?? "", "+ two");
+    }).pipe(Effect.provide(layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a pause survives leaving Full access, and resuming there asks for approval", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-pause-mode");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "echo a");
+    const setMode = (runtimeMode: "full-access" | "approval-required", step: string) =>
+      orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make(`mode:${step}`),
+        threadId,
+        runtimeMode,
+      });
+    yield* orchestrator.dispatch({
+      type: "thread.command-watch.pause",
+      commandId: CommandId.make("pause:mode"),
+      threadId,
+      watchId: "command-watch:a",
+      pausedBy: "user",
+    });
+
+    yield* setMode("approval-required", "leave");
+    const left = yield* watchOf(threadId);
+    assert.strictEqual(left?.status, "paused");
+    assert.strictEqual(left?.pauseReason, "user");
+    assert.isNull(left?.authority);
+
+    yield* setMode("full-access", "enter");
+    const entered = yield* watchOf(threadId);
+    assert.strictEqual(entered?.status, "paused");
+    assert.strictEqual(entered?.pauseReason, "user");
+    assert.deepEqual(entered?.authority, { kind: "full-access" });
+
+    yield* setMode("approval-required", "leave-again");
+    yield* orchestrator.dispatch({
+      type: "thread.command-watch.resume",
+      commandId: CommandId.make("resume:mode"),
+      threadId,
+      watchId: "command-watch:a",
+    });
+    const resumed = yield* watchOf(threadId);
+    assert.strictEqual(resumed?.status, "awaiting_approval");
+    assert.isUndefined(resumed?.pauseReason);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("entering Full access lets a waiting replacement take over from the old watch", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:command-watch-replace-mode");
+    yield* createThread(threadId, { runtimeMode: "approval-required" });
+    // The agent stays busy, so the old watch's update waits in the queue.
+    const runId = yield* startRun(threadId, "work");
+    yield* startWatch(threadId, runId, "command-watch:old", "cmd-old");
+    const old = (yield* watchOf(threadId))!;
+    yield* orchestrator.dispatch({
+      type: "thread.command-watch.approve",
+      commandId: CommandId.make("approve:old"),
+      threadId,
+      watchId: old.id,
+      revisionHash: old.revisionHash,
+      approve: true,
+    });
+    let next = output({ stdout: "a\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      next = output({ stdout: "a\nb\n" });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.isDefined((yield* watchOf(threadId))?.pendingMessageId);
+
+      yield* startWatch(threadId, runId, "command-watch:new", "cmd-new", { replaces: old.id });
+      yield* orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("mode:enter-full"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.deepEqual(yield* watchesOf(threadId), ["command-watch:new"]);
+      const { runs } = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(
+        runs.filter(({ status }) => status === "queued"),
+        0,
+      );
+
+      runner.calls.length = 0;
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      assert.deepEqual(
+        runner.calls.map((call) => call.args?.join(" ")),
+        ["-c cmd-new"],
+      );
+      assert.include((yield* updatesOf(threadId)).at(-1)?.text ?? "", "+ b");
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("an update that never reached the agent is sent again, then pauses the watch", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const store = yield* CommandWatchStore.CommandWatchStore;
+    const threadId = ThreadId.make("thread:command-watch-undelivered");
+    yield* createThread(threadId);
+    yield* startWatch(threadId, yield* startRun(threadId, "work"), "command-watch:a", "gh api");
+    yield* finishRuns(threadId);
+    let next = output({ stdout: "one\n" });
+    const runner = fakeRunner(() => next);
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      const look = reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      yield* look;
+      next = output({ stdout: "two\n" });
+      yield* TestClock.adjust("10 minutes");
+      yield* look;
+      assert.lengthOf(yield* updatesOf(threadId), 1);
+
+      // Still starting: it has not reached the agent yet, so it is not delivered yet.
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      assert.strictEqual((yield* store.get("command-watch:a"))?.deliveredThrough, 0);
+
+      for (const attempt of [1, 2]) {
+        yield* failUnstartedRuns(threadId);
+        yield* TestClock.adjust("1 minute");
+        yield* look;
+        assert.strictEqual((yield* store.get("command-watch:a"))?.deliveredThrough, 0);
+        // Not sent again before the watch's interval passes.
+        assert.lengthOf(yield* updatesOf(threadId), attempt);
+        yield* TestClock.adjust("10 minutes");
+        yield* look;
+        assert.lengthOf(yield* updatesOf(threadId), attempt + 1);
+      }
+      yield* failUnstartedRuns(threadId);
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      const paused = yield* watchOf(threadId);
+      assert.strictEqual(paused?.status, "paused");
+      assert.strictEqual(paused?.pauseReason, "failures");
+      assert.strictEqual(paused?.waitingChanges, 1);
+      yield* TestClock.adjust("1 day");
+      yield* look;
+      assert.lengthOf(yield* updatesOf(threadId), 3);
+
+      yield* orchestrator.dispatch({
+        type: "thread.command-watch.resume",
+        commandId: CommandId.make("resume:undelivered"),
+        threadId,
+        watchId: "command-watch:a",
+      });
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      assert.lengthOf(yield* updatesOf(threadId), 4);
+      yield* takeQueued(threadId);
+      yield* TestClock.adjust("1 minute");
+      yield* look;
+      assert.strictEqual((yield* store.get("command-watch:a"))?.deliveredThrough, 1);
+    }).pipe(Effect.provide(runner.layer), Effect.scoped);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a custom comparison may read more output than exact comparison keeps", () =>
+  Effect.gen(function* () {
+    const big = `${"x".repeat(5 * 1024)}\n`;
+    const exact = ThreadId.make("thread:command-watch-limit-exact");
+    const custom = ThreadId.make("thread:command-watch-limit-custom");
+    yield* createThread(exact);
+    yield* createThread(custom);
+    yield* startWatch(exact, yield* startRun(exact, "work"), "command-watch:exact", "big");
+    yield* startWatch(custom, yield* startRun(custom, "work"), "command-watch:custom", "big", {
+      comparisonSource: "function compare() { return { state: null, changes: [] }; }",
+    });
+    const runner = fakeRunner(() => output({ stdout: big }));
+    yield* Effect.gen(function* () {
+      const reactor = yield* CommandWatchReactor.make;
+      yield* reactor.sweep.pipe(Effect.andThen(reactor.awaitRuns));
+      assert.include((yield* watchOf(exact))?.lastFailure ?? "", "more than 4 KB");
+      assert.strictEqual((yield* watchOf(custom))?.status, "watching");
     }).pipe(Effect.provide(runner.layer), Effect.scoped);
   }).pipe(Effect.provide(layerTest)),
 );

@@ -4,6 +4,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Notification,
+  type OrchestrationV2Run,
   type OrchestrationV2ServerCommand,
   type ThreadCommandWatch,
   type ThreadId,
@@ -31,9 +32,12 @@ import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
 import {
   COMMAND_WATCH_BACKLOG_LIMIT_BYTES,
+  COMMAND_WATCH_DELIVERY_FAILURE_LIMIT,
   COMMAND_WATCH_FAILURE_LIMIT,
-  COMMAND_WATCH_OUTPUT_LIMIT_BYTES,
+  COMMAND_WATCH_FAILURE_NOTICE_AT,
   type CommandWatchRun,
+  commandWatchFailingNotice,
+  commandWatchOutputLimitBytes,
   commandWatchPauseNotice,
   commandWatchRevisionText,
   commandWatchUpdate,
@@ -54,8 +58,6 @@ const RUN_TIMEOUT_SECONDS = 60;
 /** How often watched threads are looked up while any exist, and when none do. */
 const ACTIVE_SCAN_MS = 30_000;
 const IDLE_SCAN_MS = 5 * 60_000;
-/** Captured beyond the output limit so an over-long result reads as too long, not as cut. */
-const CAPTURE_LIMIT_BYTES = COMMAND_WATCH_OUTPUT_LIMIT_BYTES * 2;
 /** Storage the agent tool wrote just before starting its watch is not an orphan yet. */
 const ORPHAN_GRACE_MS = 10 * 60_000;
 /** Retry delays grow with failures in a row, up to this many intervals. */
@@ -85,9 +87,13 @@ const mayRun = (
   thread.settledOverride !== "settled" &&
   thread.settledAt === null;
 
-/** The update message carries the last change it covers, so a restart can tell what it held. */
-const updateMessageId = (watch: ThreadCommandWatch, through: number) =>
-  MessageId.make(`message:command-watch:${watch.id}:${through}`);
+/** The agent never saw this run's message: the run failed before it started working. */
+const neverReachedAgent = (run: Pick<OrchestrationV2Run, "status" | "startedAt">) =>
+  run.status === "failed" && run.startedAt === null;
+
+/** The update message ends with the last change it covers, so a restart can tell what it held. */
+const updateMessageId = (watch: ThreadCommandWatch, attempt: string, through: number) =>
+  MessageId.make(`message:command-watch:${watch.id}:${attempt}:${through}`);
 const throughOf = (messageId: string) => Number(messageId.slice(messageId.lastIndexOf(":") + 1));
 
 /**
@@ -140,6 +146,8 @@ export const make = Effect.gen(function* () {
   const shell = yield* resolveCommandWatchShell;
   const runs = yield* FiberMap.make<string, void, never>();
   const dueAt = new Map<string, number>();
+  /** When an update that failed to reach the agent may go again. A restart may retry sooner. */
+  const deliveryRetryAt = new Map<string, number>();
   let watchesChanged = true;
   let nextScanAt = 0;
 
@@ -152,11 +160,11 @@ export const make = Effect.gen(function* () {
     patch: SyncPatch,
     wake?: Wake,
   ) {
-    const suffix = wake === undefined ? yield* crypto.randomUUIDv4() : `update:${wake.messageId}`;
+    // Never derived from what it carries: a refused command id stays refused, so an update refused
+    // while the thread settled could never go out. Its pending marker prevents a second queueing.
     yield* engine.dispatch({
       type: "thread.command-watch.sync",
-      // An update's command id follows its message, so a retry after a crash is not queued twice.
-      commandId: CommandId.make(`server:command-watch:${watch.id}:${suffix}`),
+      commandId: CommandId.make(`server:command-watch:${watch.id}:${yield* crypto.randomUUIDv4()}`),
       threadId,
       watchId: watch.id,
       startedAt: watch.startedAt,
@@ -166,32 +174,58 @@ export const make = Effect.gen(function* () {
   });
 
   /**
-   * Notices when the agent took the queued update, then queues the next one from waiting changes.
-   * Returns the patch and update to record; changes count as delivered once their update starts.
+   * Notices what became of the queued update, then queues the next one from waiting changes.
+   * Returns the patch and update to record; changes count as delivered once their update reached
+   * the agent, or the user removed it from the queue.
    */
   const planDelivery = Effect.fn("CommandWatchReactor.planDelivery")(function* (
     threadId: ThreadId,
     watch: ThreadCommandWatch,
   ) {
     const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
+    const now = yield* Clock.currentTimeMillis;
+    const readRuns = projections
+      .getThreadRecords(threadId, ["runs"])
+      .pipe(Effect.map(({ runs: threadRuns }) => threadRuns));
+    let deliveryFailures = watch.deliveryFailures ?? 0;
     if (watch.pendingMessageId !== undefined) {
-      const { runs: threadRuns } = yield* projections.getThreadRecords(threadId, ["runs"]);
-      const run = threadRuns.find(
+      const run = (yield* readRuns).find(
         (candidate) => candidate.userMessageId === watch.pendingMessageId,
       );
-      if (run !== undefined && (run.status === "queued" || run.status === "preparing")) {
+      if (
+        run !== undefined &&
+        (run.status === "queued" || run.status === "preparing" || run.status === "starting")
+      ) {
         return { patch, wake: undefined };
       }
-      // Started, finished, or removed from the queue by the user: either way it left the queue.
-      yield* store.markDelivered(watch.id, throughOf(watch.pendingMessageId));
       patch.pendingMessageId = null;
+      if (run !== undefined && neverReachedAgent(run)) {
+        deliveryFailures += 1;
+        patch.deliveryFailures = deliveryFailures;
+        patch.lastFailure = "could not start the agent on an update";
+        deliveryRetryAt.set(watch.id, now + watch.everyMinutes * 60_000);
+        if (deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT && running(watch)) {
+          patch.status = "paused";
+          patch.pauseReason = "failures";
+        }
+      } else {
+        yield* store.markDelivered(watch.id, throughOf(watch.pendingMessageId));
+        if (deliveryFailures !== 0) patch.deliveryFailures = 0;
+        deliveryFailures = 0;
+      }
     }
-    const update = commandWatchUpdate(watch, yield* store.waiting(watch.id));
-    if (update === undefined) {
-      if (watch.waitingChanges !== 0) patch.waitingChanges = 0;
+    const waiting = yield* store.waiting(watch.id);
+    if (
+      waiting.length === 0 ||
+      deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT ||
+      (deliveryRetryAt.get(watch.id) ?? 0) > now
+    ) {
+      if (watch.waitingChanges !== waiting.length) patch.waitingChanges = waiting.length;
       return { patch, wake: undefined };
     }
-    const messageId = updateMessageId(watch, update.through);
+    const update = commandWatchUpdate(watch, waiting);
+    if (update === undefined) return { patch, wake: undefined };
+    const messageId = updateMessageId(watch, yield* crypto.randomUUIDv4(), update.through);
     patch.pendingMessageId = messageId;
     patch.waitingChanges = update.remaining;
     return {
@@ -234,6 +268,7 @@ export const make = Effect.gen(function* () {
   const execute = Effect.fn("CommandWatchReactor.execute")(function* (
     watch: ThreadCommandWatch,
     helpers: ReadonlyArray<CommandWatchStore.CommandWatchHelperFile>,
+    hasComparison: boolean,
   ) {
     if (!(yield* fileSystem.exists(watch.cwd).pipe(Effect.orElseSucceed(() => false)))) {
       return {
@@ -262,7 +297,8 @@ export const make = Effect.gen(function* () {
         env: { T3_WATCH_HELPERS: helperDirectory },
         timeout: `${RUN_TIMEOUT_SECONDS} seconds`,
         timeoutBehavior: "timedOutResult",
-        maxOutputBytes: CAPTURE_LIMIT_BYTES,
+        // Beyond the limit, so an over-long result reads as too long, not as cut.
+        maxOutputBytes: commandWatchOutputLimitBytes(hasComparison) * 2,
         outputMode: "truncate",
       })
       .pipe(
@@ -294,7 +330,11 @@ export const make = Effect.gen(function* () {
     storage: CommandWatchStore.CommandWatchStorage,
     run: CommandWatchRun,
   ) {
-    const observed = readCommandWatchRun({ format: watch.format, run });
+    const observed = readCommandWatchRun({
+      format: watch.format,
+      run,
+      hasComparison: storage.comparisonSource !== null,
+    });
     if (observed.kind === "failed") return observed;
     if (storage.comparisonSource === null) {
       return compareCommandWatchOutput({
@@ -383,7 +423,11 @@ export const make = Effect.gen(function* () {
       );
       return;
     }
-    const outcome = yield* compare(watch, storage, yield* execute(watch, storage.helpers));
+    const outcome = yield* compare(
+      watch,
+      storage,
+      yield* execute(watch, storage.helpers, storage.comparisonSource !== null),
+    );
     const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
     let failures = 0;
     if (outcome.kind === "failed") {
@@ -402,6 +446,16 @@ export const make = Effect.gen(function* () {
         });
         patch.status = "paused";
         patch.pauseReason = "failures";
+      } else {
+        // Per stage: a comparison streak standing still must not repeat this on collection failures.
+        const inARow = outcome.stage === "collection" ? collectionFailures : comparisonFailures;
+        if (inARow === COMMAND_WATCH_FAILURE_NOTICE_AT) {
+          yield* store.note({
+            watchId: watch.id,
+            change: commandWatchFailingNotice(inARow, outcome.reason),
+            now,
+          });
+        }
       }
     } else {
       if (outcome.kind === "accepted") {
@@ -488,7 +542,8 @@ export const make = Effect.gen(function* () {
       ...threadRuns.flatMap((run) =>
         run.userMessageId.startsWith(prefix) &&
         run.status !== "cancelled" &&
-        run.status !== "queued"
+        run.status !== "queued" &&
+        !neverReachedAgent(run)
           ? [throughOf(run.userMessageId)]
           : [],
       ),

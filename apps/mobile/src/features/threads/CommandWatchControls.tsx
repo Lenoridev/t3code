@@ -150,15 +150,14 @@ export function CommandWatchRow(props: CommandWatchControlsProps & { readonly se
   const { watch } = props;
   const actions = useCommandWatchActions(props);
   const needsUser = watch.status === "awaiting_approval" || watch.status === "paused";
+  const warn = needsUser || watch.lastFailure !== undefined;
   const [showDefinition, setShowDefinition] = useState(false);
   return (
     <View className="gap-2 border-b border-border py-3.5">
       <View className="min-w-0">
         <Text className="font-t3-medium text-sm text-foreground">{watch.label}</Text>
         <Text
-          className={
-            needsUser ? "text-xs text-warning-foreground" : "text-xs text-foreground-muted"
-          }
+          className={warn ? "text-xs text-warning-foreground" : "text-xs text-foreground-muted"}
         >
           {commandWatchStatusLabel(watch, props.settled)}
         </Text>

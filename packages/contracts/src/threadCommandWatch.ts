@@ -142,6 +142,8 @@ export const ThreadCommandWatch = Schema.Struct({
   /** Failed checks in a row, counted separately for running the command and reading its output. */
   collectionFailures: NonNegativeInt,
   comparisonFailures: NonNegativeInt,
+  /** Updates in a row whose run failed before reaching the agent. */
+  deliveryFailures: Schema.optional(NonNegativeInt),
   lastFailure: Schema.optional(Schema.String),
   /** Detected changes not yet in the thread, waiting behind `pendingMessageId`. */
   waitingChanges: NonNegativeInt,

@@ -15,10 +15,17 @@ const CHANGE_SUMMARY_MAX_CHARACTERS = 120;
 const CHANGE_KIND_MAX_CHARACTERS = 80;
 const COMPLETION_REASON_MAX_CHARACTERS = 500;
 
-/** Failed checks in a row, per stage, before a watch pauses. */
+/** Failed checks in a row, per stage, before the agent hears and before a watch pauses. */
+export const COMMAND_WATCH_FAILURE_NOTICE_AT = 3;
 export const COMMAND_WATCH_FAILURE_LIMIT = 8;
+/** Updates in a row that never reached the agent before a watch pauses. */
+export const COMMAND_WATCH_DELIVERY_FAILURE_LIMIT = 3;
 /** Output one check may produce. Longer output is a failed check, never a cut observation. */
-export const COMMAND_WATCH_OUTPUT_LIMIT_BYTES = 4 * 1024;
+const COMMAND_WATCH_OUTPUT_LIMIT_BYTES = 4 * 1024;
+/** A comparison reduces its input, and exact comparison stores and diffs all of it. */
+const COMMAND_WATCH_COMPARISON_OUTPUT_LIMIT_BYTES = 64 * 1024;
+export const commandWatchOutputLimitBytes = (hasComparison: boolean) =>
+  hasComparison ? COMMAND_WATCH_COMPARISON_OUTPUT_LIMIT_BYTES : COMMAND_WATCH_OUTPUT_LIMIT_BYTES;
 /** What one update to the agent carries. Changes beyond it wait for the next update. */
 export const COMMAND_WATCH_UPDATE_MAX_CHANGES = 10;
 export const COMMAND_WATCH_UPDATE_MAX_BYTES = 8 * 1024;
@@ -249,8 +256,11 @@ function changeContent(differences: ReadonlyArray<string>, heading: string, valu
 export function readCommandWatchRun(input: {
   readonly format: ThreadCommandWatchFormat;
   readonly run: CommandWatchRun;
+  readonly hasComparison?: boolean;
 }): CommandWatchObservation {
   const { run } = input;
+  const hasComparison = input.hasComparison === true;
+  const outputLimit = commandWatchOutputLimitBytes(hasComparison);
   if (run.kind === "failed") return { kind: "failed", stage: "collection", reason: run.reason };
   if (run.code !== 0) {
     const stderr = run.stderr.trim();
@@ -263,11 +273,13 @@ export function readCommandWatchRun(input: {
           : `exited with code ${run.code}: ${cut(stderr, STDERR_LIMIT_BYTES)}`,
     };
   }
-  if (run.stdoutTruncated || byteLength(run.stdout) > COMMAND_WATCH_OUTPUT_LIMIT_BYTES) {
+  if (run.stdoutTruncated || byteLength(run.stdout) > outputLimit) {
     return {
       kind: "failed",
       stage: "collection",
-      reason: `printed more than ${COMMAND_WATCH_OUTPUT_LIMIT_BYTES / 1024} KB`,
+      reason: hasComparison
+        ? `printed more than ${outputLimit / 1024} KB, so narrow the command`
+        : `printed more than ${outputLimit / 1024} KB, so narrow the command or add a comparison, which can read ${COMMAND_WATCH_COMPARISON_OUTPUT_LIMIT_BYTES / 1024} KB`,
     };
   }
   if (input.format !== "json") {
@@ -593,6 +605,15 @@ export function commandWatchUpdate(
     ),
     through: taken.at(-1)!.change.sequence,
     remaining,
+  };
+}
+
+/** The early warning, while the watch still retries. */
+export function commandWatchFailingNotice(failures: number, detail: string): DetectedChange {
+  return {
+    kind: "notice",
+    summary: "the command keeps failing",
+    content: `${failures} checks in a row failed. The last one ${detail}. T3 Code keeps retrying with growing delays and pauses this watch after ${COMMAND_WATCH_FAILURE_LIMIT} failures. If this will not clear by itself, fix the cause or pass replaces to watch_command.`,
   };
 }
 

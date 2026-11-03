@@ -112,7 +112,7 @@ function CommandWatchRow(props: {
               "truncate text-2xs",
               watch.status === "awaiting_approval" ||
                 watch.status === "paused" ||
-                (watch.status === "baselining" && watch.lastFailure !== undefined)
+                watch.lastFailure !== undefined
                 ? "text-warning-foreground"
                 : "text-muted-foreground",
             )}
