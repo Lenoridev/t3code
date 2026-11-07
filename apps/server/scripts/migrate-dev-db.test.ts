@@ -42,7 +42,13 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
         ["stopped-thread", "project-kept", "completed", "{}", "2026-08-01"],
         ["fork-thread", "project-kept", "completed", forkPayload, "2026-08-02"],
         ["running-thread", "project-kept", "running", "{}", "2026-08-05"],
-        ["settled-thread", "project-kept", "completed", '{"settledAt":"2026-08-01"}', "2026-08-05"],
+        [
+          "settled-thread",
+          "project-kept",
+          "completed",
+          '{"settledAt":"2026-08-01","commandWatches":[{"id":"command-watch:a","status":"watching"}]}',
+          "2026-08-05",
+        ],
         [
           "archived-thread",
           "project-kept",
@@ -93,6 +99,9 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
       yield* sql`INSERT INTO scheduled_task_webhook_pending
         (delivery_id, task_id, coalesce_key, due_at, task_json, request_json, delivery_ids_json)
         VALUES ('delivery-1', 'task-1', 'key-1', 1900000000000, '{}', '{}', '[]')`;
+      yield* sql`INSERT INTO command_watch_storage
+        (watch_id, thread_id, helpers_json, observation, next_sequence, delivered_through, updated_at)
+        VALUES ('command-watch:a', 'settled-thread', '[]', 'out', 1, 0, '2026-08-01')`;
       yield* sql`INSERT INTO auth_sessions (session_id, subject, scopes, method, issued_at, expires_at)
         VALUES ('session-1', 'user', '[]', 'pairing', '2026-08-01', '2027-08-01')`;
     }),
@@ -130,13 +139,17 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
             tasks: number;
             webhooks: number;
             transfers: number;
+            watches: number;
           }>`
             SELECT
               (SELECT COUNT(*) FROM auth_sessions) AS auth,
               (SELECT COUNT(*) FROM scheduled_tasks) AS tasks,
               (SELECT COUNT(*) FROM scheduled_task_webhook_replay_keys) +
                 (SELECT COUNT(*) FROM scheduled_task_webhook_pending) AS webhooks,
-              (SELECT COUNT(*) FROM orchestration_v2_projection_context_transfers) AS transfers`;
+              (SELECT COUNT(*) FROM orchestration_v2_projection_context_transfers) AS transfers,
+              (SELECT COUNT(*) FROM command_watch_storage) +
+                (SELECT COUNT(*) FROM orchestration_v2_projection_threads
+                  WHERE json_extract(payload_json, '$.commandWatches') IS NOT NULL) AS watches`;
           return { threads, events, sessions, leftovers };
         }),
       );
@@ -152,7 +165,13 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         kept.sessions.map((row) => row.provider_session_id),
         ["session-shared"],
       );
-      assert.deepStrictEqual(kept.leftovers, { auth: 0, tasks: 0, webhooks: 0, transfers: 0 });
+      assert.deepStrictEqual(kept.leftovers, {
+        auth: 0,
+        tasks: 0,
+        webhooks: 0,
+        transfers: 0,
+        watches: 0,
+      });
     }),
   );
 

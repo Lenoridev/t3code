@@ -17,7 +17,9 @@ export function commandWatchStatusLabel(watch: ThreadCommandWatch, settled = fal
         : `Not started: last check ${watch.lastFailure}`;
     case "ended":
       return watch.endReason === "completed"
-        ? `Completed${watch.endDetail === undefined ? "" : `: ${watch.endDetail}`}`
+        ? `Completed${watch.endDetail === undefined ? "" : `: ${watch.endDetail}`}${
+            commandWatchHasWork(watch) ? ", last update not delivered yet" : ""
+          }`
         : watch.endReason === "denied"
           ? "Denied"
           : "Stopped";
@@ -64,9 +66,13 @@ export function commandWatchesTitle(watches: ReadonlyArray<ThreadCommandWatch>):
   }
 }
 
-/** Ended watches stay listed for a while, but are no longer anything to act on. */
+/** A completed watch still delivers its last update; Stop discards it. */
+export const commandWatchHasWork = (watch: ThreadCommandWatch) =>
+  watch.status !== "ended" || watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
+
+/** Ended watches stay listed for a while, but only one still delivering is anything to act on. */
 export const commandWatchesLive = (watches: ReadonlyArray<ThreadCommandWatch>) =>
-  watches.filter((watch) => watch.status !== "ended");
+  watches.filter(commandWatchHasWork);
 
 export function commandWatchComparisonLabel(watch: ThreadCommandWatch): string {
   switch (watch.comparison.kind) {
@@ -85,8 +91,12 @@ export function commandWatchPurposeLabel(watch: ThreadCommandWatch): string {
     : `Ends by itself when: ${watch.completion.description}`;
 }
 
-export const COMMAND_WATCH_LIMITS_LABEL =
-  "Each check may run for 60 seconds and print 4 KB. It pauses after 8 failed checks in a row, or when 1 MB of changes are waiting.";
+export const commandWatchLimitsLabel = (watch: ThreadCommandWatch) =>
+  `Each check may run for 60 seconds and print ${watch.comparison.kind === "custom-js-v1" ? "64" : "4"} KB. It pauses after 8 failed checks in a row, or when 1 MB of changes are waiting.`;
+
+/** A comparison script or helper copies, which the thread projection leaves out. */
+export const commandWatchNeedsDetails = (watch: ThreadCommandWatch) =>
+  watch.comparison.kind === "custom-js-v1" || watch.helpers.length > 0;
 
 export const COMMAND_WATCH_APPROVAL_WARNING =
   "outside the agent's sandbox, with the T3 server's account permissions, until the watch is stopped.";

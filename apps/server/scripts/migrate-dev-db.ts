@@ -211,6 +211,8 @@ const CLEARED_TABLES: ReadonlyArray<string> = [
   "provider_session_runtime",
   "auth_sessions",
   "auth_pairing_links",
+  "command_watch_storage",
+  "command_watch_changes",
 ];
 
 const PROVIDER_SESSIONS_TABLE = "orchestration_v2_projection_provider_sessions";
@@ -396,6 +398,10 @@ const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigra
       for (const table of CLEARED_TABLES) {
         yield* sql`DELETE FROM ${sql(table)}`;
       }
+      // A watch runs the developer's commands, and a Full-access one would run here unasked.
+      yield* sql`UPDATE orchestration_v2_projection_threads
+        SET payload_json = json_remove(payload_json, '$.commandWatches')
+        WHERE json_extract(payload_json, '$.commandWatches') IS NOT NULL`;
     }),
   );
 

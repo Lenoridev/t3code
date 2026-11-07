@@ -498,9 +498,36 @@ const commandWatchEnded = (
   return { ...rest, status: "ended", endReason, endedAt, authority: null, waitingChanges: 0 };
 };
 
-/** Paused and ended watches do not count toward a thread's limit. */
+/**
+ * Forgets updates removed from the queue without reaching the agent, so their changes go out
+ * again instead of counting as delivered the way a user's own removal does.
+ */
+const withCommandWatchUpdatesRequeued = (
+  thread: OrchestrationV2AppThread,
+  removedMessageIds: ReadonlySet<string>,
+): Pick<OrchestrationV2AppThread, "commandWatches"> =>
+  thread.commandWatches === undefined || removedMessageIds.size === 0
+    ? {}
+    : {
+        commandWatches: thread.commandWatches.map((watch) => {
+          if (
+            watch.pendingMessageId === undefined ||
+            !removedMessageIds.has(watch.pendingMessageId)
+          ) {
+            return watch;
+          }
+          const { pendingMessageId: _pending, ...rest } = watch;
+          // At least one change waits again; the reactor counts them exactly when it next looks.
+          return { ...rest, waitingChanges: watch.waitingChanges + 1 };
+        }),
+      };
+
+/**
+ * Paused and ended watches do not count toward a thread's limit, except a storage-limit pause,
+ * which resumes by itself once its updates go out.
+ */
 const commandWatchIsActive = (watch: ThreadCommandWatch) =>
-  watch.status !== "paused" && watch.status !== "ended";
+  watch.status !== "ended" && (watch.status !== "paused" || watch.pauseReason === "storage-limit");
 
 const commandWatchHasWork = (watch: ThreadCommandWatch) =>
   watch.status !== "ended" || watch.pendingMessageId !== undefined || watch.waitingChanges > 0;
@@ -3158,7 +3185,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const watch = watches.find((candidate) => candidate.id === command.watchId);
         if (watch === undefined) return yield* refuse(`The watch ${command.watchId} ended.`);
         if (watch.status !== "paused") return;
-        if (watches.filter(commandWatchIsActive).length >= THREAD_COMMAND_WATCH_LIMIT) {
+        const others = watches.filter(
+          (candidate) => candidate.id !== watch.id && commandWatchIsActive(candidate),
+        );
+        if (others.length >= THREAD_COMMAND_WATCH_LIMIT) {
           return yield* refuse(
             `Thread ${command.threadId} already watches ${THREAD_COMMAND_WATCH_LIMIT} commands. Stop one before resuming this one.`,
           );
@@ -3178,7 +3208,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ...rest,
               authority,
               // A pause that outlasted Full access has no authority left to resume with.
-              status: authority === null ? "awaiting_approval" : "watching",
+              status:
+                authority === null
+                  ? "awaiting_approval"
+                  : rest.baselinedAt === undefined
+                    ? "baselining"
+                    : "watching",
               collectionFailures: 0,
               comparisonFailures: 0,
             };
@@ -3261,6 +3296,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : { deliveryFailures: patch.deliveryFailures }),
           ...(patch.waitingChanges === undefined ? {} : { waitingChanges: patch.waitingChanges }),
           ...(patch.lastChangeAt === undefined ? {} : { lastChangeAt: patch.lastChangeAt }),
+          ...(patch.baselinedAt === undefined ? {} : { baselinedAt: patch.baselinedAt }),
         }));
         break;
       }
@@ -3549,6 +3585,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    /** Watch updates settling removes from the queue; they never reached the agent. */
+    let settleCancelledMessageIds: ReadonlySet<string> = new Set();
     if (command.type === "thread.settle") {
       const projection = yield* loadProjectionForCommand(
         command,
@@ -3606,6 +3644,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           effects,
         );
       }
+      settleCancelledMessageIds = new Set(automaticQueuedRuns.map((run) => run.userMessageId));
       for (const run of automaticQueuedRuns) {
         yield* dispatchQueuedRunCancel(
           {
@@ -3794,6 +3833,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             settledOverride: "settled",
             settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
             pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
+            ...withCommandWatchUpdatesRequeued(thread, settleCancelledMessageIds),
             unsettledAt: null,
             pinnedAt: null,
             pinOrderKey: null,

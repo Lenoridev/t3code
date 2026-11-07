@@ -7,8 +7,10 @@ import {
 } from "@t3tools/contracts";
 import {
   COMMAND_WATCH_APPROVAL_WARNING,
-  COMMAND_WATCH_LIMITS_LABEL,
   commandWatchComparisonLabel,
+  commandWatchHasWork,
+  commandWatchLimitsLabel,
+  commandWatchNeedsDetails,
   commandWatchesLive,
   commandWatchIntervalLabel,
   commandWatchPurposeLabel,
@@ -87,6 +89,7 @@ function CommandWatchRow(props: {
   const pause = useAtomCommand(threadEnvironment.pauseCommandWatch, { reportFailure: true });
   const canOperateThread = useEnvironmentScope(props.environmentId, AuthOrchestrationOperateScope);
   const target = { threadId: props.threadId, watchId: watch.id };
+  const stopLabel = watch.status === "ended" ? "Discard the last update of" : "Stop watching";
   const decide = (allow: boolean) =>
     void approve({
       environmentId: props.environmentId,
@@ -160,7 +163,7 @@ function CommandWatchRow(props: {
             <TooltipPopup>Pause watching</TooltipPopup>
           </Tooltip>
         ) : null}
-        {watch.status === "ended" ? null : (
+        {!commandWatchHasWork(watch) ? null : (
           <Tooltip>
             <TooltipTrigger
               render={
@@ -169,7 +172,7 @@ function CommandWatchRow(props: {
                   variant="ghost"
                   part="icon"
                   tone="destructive"
-                  aria-label={`Stop watching ${watch.label}`}
+                  aria-label={`${stopLabel} ${watch.label}`}
                   disabled={!canOperateThread}
                   onClick={() => void stop({ environmentId: props.environmentId, input: target })}
                 >
@@ -177,7 +180,9 @@ function CommandWatchRow(props: {
                 </ThreadDetailsControl>
               }
             />
-            <TooltipPopup>Stop watching</TooltipPopup>
+            <TooltipPopup>
+              {watch.status === "ended" ? "Discard last update" : "Stop watching"}
+            </TooltipPopup>
           </Tooltip>
         )}
       </div>
@@ -232,6 +237,28 @@ function CommandWatchRow(props: {
   );
 }
 
+/** The definition text a projection leaves out, loaded only for watches that have any. */
+function useCommandWatchDetails(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly watch: ThreadCommandWatch;
+}) {
+  const supportsDetails =
+    useServerConfigs().get(props.environmentId)?.environment.capabilities.commandWatchDetails ===
+    true;
+  const needsDetails = commandWatchNeedsDetails(props.watch);
+  const details = useEnvironmentQuery(
+    supportsDetails && needsDetails
+      ? orchestrationEnvironment.commandWatchDetails({
+          environmentId: props.environmentId,
+          input: { threadId: props.threadId, watchId: props.watch.id },
+        })
+      : null,
+  );
+  // Approval covers code the user must be able to read first.
+  return { details, reviewable: !needsDetails || details.data != null };
+}
+
 /** Everything the watch runs, which is what an approval covers. */
 function CommandWatchDefinition(props: {
   readonly environmentId: EnvironmentId;
@@ -239,18 +266,7 @@ function CommandWatchDefinition(props: {
   readonly watch: ThreadCommandWatch;
 }) {
   const { watch } = props;
-  const supportsDetails =
-    useServerConfigs().get(props.environmentId)?.environment.capabilities.commandWatchDetails ===
-    true;
-  const needsDetails = watch.comparison.kind === "custom-js-v1" || watch.helpers.length > 0;
-  const details = useEnvironmentQuery(
-    supportsDetails && needsDetails
-      ? orchestrationEnvironment.commandWatchDetails({
-          environmentId: props.environmentId,
-          input: { threadId: props.threadId, watchId: watch.id },
-        })
-      : null,
-  );
+  const { details } = useCommandWatchDetails(props);
   const code =
     "max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-1.5 font-mono text-foreground/80";
   return (
@@ -280,7 +296,7 @@ function CommandWatchDefinition(props: {
         );
       })}
       {details.error === null ? null : <p>Could not load the full definition.</p>}
-      <p>{COMMAND_WATCH_LIMITS_LABEL}</p>
+      <p>{commandWatchLimitsLabel(watch)}</p>
     </div>
   );
 }
@@ -293,6 +309,7 @@ export function CommandWatchApproval(props: {
   readonly onDecide: (allow: boolean) => void;
 }) {
   const { watch } = props;
+  const { reviewable } = useCommandWatchDetails(props);
   return (
     <div className="mt-1.5 flex flex-col gap-1.5 text-2xs text-muted-foreground">
       <p>
@@ -308,7 +325,11 @@ export function CommandWatchApproval(props: {
         <p>Replaces a running watch, which keeps running until you decide.</p>
       )}
       <div className="flex gap-1.5">
-        <Button size="xs" disabled={props.disabled} onClick={() => props.onDecide(true)}>
+        <Button
+          size="xs"
+          disabled={props.disabled || !reviewable}
+          onClick={() => props.onDecide(true)}
+        >
           Allow this watch
         </Button>
         <Button

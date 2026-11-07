@@ -36,6 +36,9 @@ import { CommandWatchesToolkit } from "./tools.ts";
 const THREAD_ID = ThreadId.make("thread:command-watch-mcp");
 const WORKSPACE = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-watch-mcp-"));
 NodeFS.writeFileSync(NodePath.join(WORKSPACE, "check.sh"), "echo checked\n");
+const OUTSIDE = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-watch-mcp-outside-"));
+NodeFS.writeFileSync(NodePath.join(OUTSIDE, "secret.txt"), "not the agent's\n");
+NodeFS.symlinkSync(NodePath.join(OUTSIDE, "secret.txt"), NodePath.join(WORKSPACE, "linked.sh"));
 
 const testCrypto = Crypto.make({
   randomBytes: (size) => new Uint8Array(size).fill(7),
@@ -256,6 +259,18 @@ describe("command watch toolkit handlers", () => {
           .pipe(Effect.flip),
       ).toMatchObject({ _tag: "CommandWatchFailedError" });
       expect(yield* Ref.get(escaping.commands)).toEqual([]);
+      const linked = yield* makeHarness({ runtimeMode: "approval-required" });
+      expect(
+        yield* linked
+          .call("watch_command", {
+            requestId: "r1",
+            command: "gh api",
+            label: "Reply",
+            helpers: ["linked.sh"],
+          })
+          .pipe(Effect.flip),
+      ).toMatchObject({ _tag: "CommandWatchFailedError" });
+      expect(yield* Ref.get(linked.stored)).toEqual([]);
 
       const subagent = yield* makeHarness({ subagent: true });
       expect(

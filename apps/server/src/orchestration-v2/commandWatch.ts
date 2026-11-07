@@ -20,6 +20,18 @@ export const COMMAND_WATCH_FAILURE_NOTICE_AT = 3;
 export const COMMAND_WATCH_FAILURE_LIMIT = 8;
 /** Updates in a row that never reached the agent before a watch pauses. */
 export const COMMAND_WATCH_DELIVERY_FAILURE_LIMIT = 3;
+/** Retry delays grow with failures in a row, up to this many intervals and never past an hour. */
+const MAX_BACKOFF_INTERVALS = 8;
+const MAX_RETRY_DELAY_MS = 60 * 60_000;
+
+/** When to try again after a check or an update fails, or the interval after a success. */
+export const commandWatchRetryDelayMs = (everyMinutes: number, failures: number) => {
+  const interval = everyMinutes * 60_000;
+  if (failures === 0) return interval;
+  const backoff = interval * Math.min(2 ** (failures - 1), MAX_BACKOFF_INTERVALS);
+  return Math.min(backoff, MAX_RETRY_DELAY_MS);
+};
+
 /** Output one check may produce. Longer output is a failed check, never a cut observation. */
 const COMMAND_WATCH_OUTPUT_LIMIT_BYTES = 4 * 1024;
 /** A comparison reduces its input, and exact comparison stores and diffs all of it. */
@@ -36,6 +48,8 @@ export const COMMAND_WATCH_BACKLOG_LIMIT_BYTES = 1024 * 1024;
 const STDERR_LIMIT_BYTES = 1024;
 const DIFF_VALUE_LIMIT = 200;
 const DIFF_LINE_LIMIT = 200;
+/** Line pairs a diff aligns before it shows the differing block as replaced. */
+const LINE_ALIGNMENT_LIMIT = 250_000;
 
 /** What one run of a watched command did. */
 export type CommandWatchRun =
@@ -186,36 +200,66 @@ export function jsonDifferences(previous: unknown, current: unknown, path = "$")
 
 /** A line diff with one line of context, for text small enough to compare whole. */
 export function lineDifferences(previous: string, current: string): Array<string> {
-  const before = previous.split("\n");
-  const after = current.split("\n");
-  // Longest common subsequence; outputs are at most a few KB, so the table stays small.
-  const table = Array.from({ length: before.length + 1 }, () =>
-    new Array<number>(after.length + 1).fill(0),
-  );
-  for (let i = before.length - 1; i >= 0; i -= 1) {
-    for (let j = after.length - 1; j >= 0; j -= 1) {
-      table[i]![j] =
-        before[i] === after[j]
-          ? table[i + 1]![j + 1]! + 1
-          : Math.max(table[i + 1]![j]!, table[i]![j + 1]!);
+  const allBefore = previous.split("\n");
+  const allAfter = current.split("\n");
+  // Unchanged lines at either end need no alignment, which covers appended output.
+  let start = 0;
+  while (
+    start < allBefore.length &&
+    start < allAfter.length &&
+    allBefore[start] === allAfter[start]
+  ) {
+    start += 1;
+  }
+  let end = 0;
+  while (
+    end < allBefore.length - start &&
+    end < allAfter.length - start &&
+    allBefore[allBefore.length - 1 - end] === allAfter[allAfter.length - 1 - end]
+  ) {
+    end += 1;
+  }
+  const before = allBefore.slice(start, allBefore.length - end);
+  const after = allAfter.slice(start, allAfter.length - end);
+  const ops: Array<{ readonly mark: " " | "-" | "+"; readonly line: string }> = allBefore
+    .slice(0, start)
+    .map((line) => ({ mark: " ", line }));
+  const width = after.length + 1;
+  // Aligning costs one cell per pair of lines, which blocks the server on large unrelated output.
+  if (before.length * after.length > LINE_ALIGNMENT_LIMIT) {
+    for (const line of before) ops.push({ mark: "-", line });
+    for (const line of after) ops.push({ mark: "+", line });
+  } else {
+    // Longest common subsequence of the lines that differ.
+    const table = new Int32Array((before.length + 1) * width);
+    for (let i = before.length - 1; i >= 0; i -= 1) {
+      for (let j = after.length - 1; j >= 0; j -= 1) {
+        table[i * width + j] =
+          before[i] === after[j]
+            ? table[(i + 1) * width + j + 1]! + 1
+            : Math.max(table[(i + 1) * width + j]!, table[i * width + j + 1]!);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < before.length || j < after.length) {
+      if (i < before.length && j < after.length && before[i] === after[j]) {
+        ops.push({ mark: " ", line: before[i]! });
+        i += 1;
+        j += 1;
+      } else if (
+        i < before.length &&
+        (j >= after.length || table[(i + 1) * width + j]! >= table[i * width + j + 1]!)
+      ) {
+        ops.push({ mark: "-", line: before[i]! });
+        i += 1;
+      } else {
+        ops.push({ mark: "+", line: after[j]! });
+        j += 1;
+      }
     }
   }
-  const ops: Array<{ readonly mark: " " | "-" | "+"; readonly line: string }> = [];
-  let i = 0;
-  let j = 0;
-  while (i < before.length || j < after.length) {
-    if (i < before.length && j < after.length && before[i] === after[j]) {
-      ops.push({ mark: " ", line: before[i]! });
-      i += 1;
-      j += 1;
-    } else if (i < before.length && (j >= after.length || table[i + 1]![j]! >= table[i]![j + 1]!)) {
-      ops.push({ mark: "-", line: before[i]! });
-      i += 1;
-    } else {
-      ops.push({ mark: "+", line: after[j]! });
-      j += 1;
-    }
-  }
+  for (const line of allAfter.slice(allAfter.length - end)) ops.push({ mark: " ", line });
   const near = (index: number) =>
     ops[index]!.mark !== " " ||
     ops[index - 1]?.mark === "-" ||
@@ -461,7 +505,7 @@ export function readComparisonResult(input: {
     });
   }
   let completionReason: string | undefined;
-  if (complete !== undefined) {
+  if (complete !== undefined && complete !== null) {
     if (input.completion.kind !== "condition") {
       return failed("asked to complete a watch that declares no completion condition");
     }

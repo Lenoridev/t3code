@@ -4,6 +4,7 @@ import {
   COMMAND_WATCH_UPDATE_MAX_BYTES,
   COMMAND_WATCH_UPDATE_MAX_CHANGES,
   type CommandWatchRun,
+  commandWatchRetryDelayMs,
   commandWatchUpdate,
   evaluateCommandWatchCheck,
   readComparisonResult,
@@ -26,6 +27,25 @@ const check = (
   format: "text" | "json" = "text",
   reportInitialState = false,
 ) => evaluateCommandWatchCheck({ format, previous, reportInitialState, run });
+
+describe("commandWatchRetryDelayMs", () => {
+  it.each([
+    // [every minutes, failures in a row, minutes until the next try]
+    [10, 0, 10],
+    [10, 1, 10],
+    [10, 2, 20],
+    [10, 3, 40],
+    [10, 4, 60],
+    [1, 4, 8],
+    [1, 9, 8],
+    // A slow watch still retries a failure within the hour.
+    [1440, 0, 1440],
+    [1440, 1, 60],
+    [1440, 8, 60],
+  ])("every %i min after %i failures waits %i min", (everyMinutes, failures, minutes) => {
+    assert.strictEqual(commandWatchRetryDelayMs(everyMinutes, failures), minutes * 60_000);
+  });
+});
 
 describe("evaluateCommandWatchCheck", () => {
   it("records the first output quietly unless asked to report it", () => {
@@ -148,6 +168,12 @@ describe("readComparisonResult", () => {
     assert.strictEqual(outcome.kind === "accepted" && outcome.state, '{"seen":1}');
   });
 
+  it("reads complete: null as not completing, as JSON writers often leave it", () => {
+    const outcome = read({ state: null, changes: [], complete: null });
+    assert.strictEqual(outcome.kind, "accepted");
+    assert.isUndefined(outcome.kind === "accepted" ? outcome.completionReason : "failed");
+  });
+
   it("suppresses baseline changes, but not a completion found on the baseline", () => {
     const quiet = read({ state: null, changes: [change] }, { phase: "baseline" });
     assert.deepEqual(quiet.kind === "accepted" && quiet.changes, []);
@@ -172,6 +198,18 @@ describe("differences", () => {
 
   it("shows changed lines with one line of context", () => {
     assert.deepEqual(lineDifferences("a\nb\nc\nd\ne", "a\nb\nc\nd\nX"), ["  d", "- e", "+ X"]);
+  });
+
+  it("replaces a large unrelated output wholesale instead of aligning every line", () => {
+    const lines = (prefix: string) => Array.from({ length: 2000 }, (_, i) => `${prefix}${i}`);
+    const differences = lineDifferences(
+      ["same", ...lines("a"), "end"].join("\n"),
+      ["same", ...lines("b"), "end"].join("\n"),
+    );
+    assert.deepEqual(differences.slice(0, 2), ["  same", "- a0"]);
+    assert.strictEqual(differences.at(-2), "+ b1999");
+    assert.strictEqual(differences.at(-1), "  end");
+    assert.lengthOf(differences, 4002);
   });
 });
 

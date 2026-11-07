@@ -129,18 +129,35 @@ const make = Effect.gen(function* () {
             reason: `Helper ${declared} must be a path inside this thread's workspace.`,
           });
         }
-        const content = yield* fileSystem
-          .readFileString(absolute)
-          .pipe(
-            Effect.mapError(
-              () => new CommandWatchFailedError({ reason: `Could not read helper ${declared}.` }),
-            ),
-          );
-        if (Buffer.byteLength(content, "utf8") > HELPER_LIMIT_BYTES) {
+        const unreadable = new CommandWatchFailedError({
+          reason: `Could not read helper ${declared}.`,
+        });
+        // A link may point anywhere the server can read, and its copy goes to the agent unreviewed.
+        const [realRoot, realFile] = yield* Effect.all([
+          fileSystem.realPath(cwd),
+          fileSystem.realPath(absolute),
+        ]).pipe(Effect.mapError(() => unreadable));
+        const realInside = path.relative(realRoot, realFile);
+        if (realInside.startsWith("..") || path.isAbsolute(realInside)) {
+          return yield* new CommandWatchFailedError({
+            reason: `Helper ${declared} links outside this thread's workspace.`,
+          });
+        }
+        // Checked before reading, so a device or a pipe is never read.
+        const info = yield* fileSystem.stat(realFile).pipe(Effect.mapError(() => unreadable));
+        if (info.type !== "File") {
+          return yield* new CommandWatchFailedError({
+            reason: `Helper ${declared} is not a regular file.`,
+          });
+        }
+        if (Number(info.size) > HELPER_LIMIT_BYTES) {
           return yield* new CommandWatchFailedError({
             reason: `Helper ${declared} is larger than ${HELPER_LIMIT_BYTES / 1024} KB.`,
           });
         }
+        const content = yield* fileSystem
+          .readFileString(realFile)
+          .pipe(Effect.mapError(() => unreadable));
         return { path: inside, content, sha256: yield* sha256(content) };
       }),
     );

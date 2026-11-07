@@ -3455,6 +3455,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
       waitingChanges: Schema.optional(NonNegativeInt),
       pendingMessageId: Schema.optional(Schema.NullOr(MessageId)),
       lastChangeAt: Schema.optional(IsoDateTime),
+      baselinedAt: Schema.optional(IsoDateTime),
       /** Clears `replacesWatchId` once the replaced watch's waiting changes moved over. */
       replacesWatchId: Schema.optional(Schema.Null),
     }),

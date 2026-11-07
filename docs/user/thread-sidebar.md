@@ -225,8 +225,8 @@ your own comments or to report "new comment" instead of "2 lines changed". The s
 restricted interpreter with no access to files, the network, or other programs. It can also end the
 watch once a condition the agent declared is met, such as CI finishing.
 
-The command runs on the server machine with the server's account permissions, outside the agent's
-sandbox. In Full access a watch starts at once. In other modes it waits for you: the thread shows
+The command runs in `/bin/sh` (Windows PowerShell on Windows) on the server machine, with the
+server's account permissions, outside the agent's sandbox. In Full access a watch starts at once. In other modes it waits for you: the thread shows
 **Pending Approval**. Choose **Review** at the end of the conversation, or open the
 Background work sheet on mobile, to see the full command and choose **Allow this watch** or
 **Deny**. Your approval covers that exact command, the helper scripts and comparison script it

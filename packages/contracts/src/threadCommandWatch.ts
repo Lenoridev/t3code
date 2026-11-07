@@ -150,6 +150,8 @@ export const ThreadCommandWatch = Schema.Struct({
   /** The update this watch has queued in the thread that the agent has not started on. */
   pendingMessageId: Schema.optional(MessageId),
   lastChangeAt: Schema.optional(IsoDateTime),
+  /** When a check first succeeded. Until then a resumed watch is still starting, not watching. */
+  baselinedAt: Schema.optional(IsoDateTime),
 });
 export type ThreadCommandWatch = typeof ThreadCommandWatch.Type;
 

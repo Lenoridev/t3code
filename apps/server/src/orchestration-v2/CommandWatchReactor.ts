@@ -10,7 +10,6 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { listLoginShellCandidates } from "@t3tools/shared/shell";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -39,6 +38,7 @@ import {
   commandWatchFailingNotice,
   commandWatchOutputLimitBytes,
   commandWatchPauseNotice,
+  commandWatchRetryDelayMs,
   commandWatchRevisionText,
   commandWatchUpdate,
   compareCommandWatchOutput,
@@ -60,8 +60,8 @@ const ACTIVE_SCAN_MS = 30_000;
 const IDLE_SCAN_MS = 5 * 60_000;
 /** Storage the agent tool wrote just before starting its watch is not an orphan yet. */
 const ORPHAN_GRACE_MS = 10 * 60_000;
-/** Retry delays grow with failures in a row, up to this many intervals. */
-const MAX_BACKOFF_INTERVALS = 8;
+/** How often an ended watch retries its last update once its failures in a row reach the limit. */
+const ENDED_DELIVERY_RETRY_MS = 24 * 60 * 60_000;
 
 type SyncPatch = Extract<
   OrchestrationV2ServerCommand,
@@ -97,22 +97,23 @@ const updateMessageId = (watch: ThreadCommandWatch, attempt: string, through: nu
 const throughOf = (messageId: string) => Number(messageId.slice(messageId.lastIndexOf(":") + 1));
 
 /**
- * The server's own shell, run non-interactively: the server already loaded the login PATH.
- * Resolved once, since finding the user's shell can read the account database.
+ * The shell every watch's command runs in. Fixed rather than the user's login shell, so the
+ * POSIX syntax the tool describes works whatever shell the user prefers.
  */
 export const resolveCommandWatchShell = Effect.gen(function* () {
-  const platform = yield* HostProcess.Platform;
-  if (platform === "win32") {
+  if ((yield* HostProcess.Platform) === "win32") {
     return {
       program: "powershell.exe",
-      invocation: (command: string) => ["-NoProfile", "-NonInteractive", "-Command", command],
+      // PowerShell reads environment variables as `$env:NAME`; this keeps the documented name.
+      invocation: (command: string) => [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$T3_WATCH_HELPERS = $env:T3_WATCH_HELPERS; ${command}`,
+      ],
     };
   }
-  const environment = yield* HostProcess.Environment;
-  return {
-    program: listLoginShellCandidates(platform, environment.SHELL)[0] ?? "/bin/sh",
-    invocation: (command: string) => ["-c", command],
-  };
+  return { program: "/bin/sh", invocation: (command: string) => ["-c", command] };
 });
 
 /**
@@ -203,8 +204,15 @@ export const make = Effect.gen(function* () {
         deliveryFailures += 1;
         patch.deliveryFailures = deliveryFailures;
         patch.lastFailure = "could not start the agent on an update";
-        deliveryRetryAt.set(watch.id, now + watch.everyMinutes * 60_000);
-        if (deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT && running(watch)) {
+        const atLimit = deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT;
+        deliveryRetryAt.set(
+          watch.id,
+          now +
+            (atLimit && watch.status === "ended"
+              ? ENDED_DELIVERY_RETRY_MS
+              : commandWatchRetryDelayMs(watch.everyMinutes, 1)),
+        );
+        if (atLimit && running(watch)) {
           patch.status = "paused";
           patch.pauseReason = "failures";
         }
@@ -217,16 +225,20 @@ export const make = Effect.gen(function* () {
     const waiting = yield* store.waiting(watch.id);
     if (
       waiting.length === 0 ||
-      deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT ||
+      // A paused watch waits for its resume; nothing can resume an ended one.
+      (deliveryFailures >= COMMAND_WATCH_DELIVERY_FAILURE_LIMIT && watch.status !== "ended") ||
       (deliveryRetryAt.get(watch.id) ?? 0) > now
     ) {
       if (watch.waitingChanges !== waiting.length) patch.waitingChanges = waiting.length;
       return { patch, wake: undefined };
     }
     const prefix = `message:command-watch:${watch.id}:`;
+    // Only updates that woke the agent: retries of one that never reached it are not frequent news.
     const recentUpdates = (yield* readRuns).filter(
       (run) =>
         run.userMessageId.startsWith(prefix) &&
+        run.status !== "cancelled" &&
+        !neverReachedAgent(run) &&
         DateTime.toEpochMillis(run.requestedAt) > now - 24 * 60 * 60_000,
     ).length;
     const update = commandWatchUpdate(watch, waiting, recentUpdates + 1);
@@ -371,11 +383,17 @@ export const make = Effect.gen(function* () {
           }),
         ),
         Effect.catch((error) =>
-          Effect.succeed({
-            kind: "failed" as const,
-            stage: "comparison" as const,
-            reason: `comparison ${error.reason}`,
-          }),
+          Effect.succeed(
+            // A missing runtime is this server's problem, not the comparison's, so it never
+            // counts toward pausing the watch.
+            error.unavailable
+              ? { kind: "unavailable" as const, reason: `comparison ${error.reason}` }
+              : {
+                  kind: "failed" as const,
+                  stage: "comparison" as const,
+                  reason: `comparison ${error.reason}`,
+                },
+          ),
         ),
       );
   });
@@ -394,23 +412,21 @@ export const make = Effect.gen(function* () {
       if (storage === undefined) return;
     }
     if (watch.authority === null) return;
-    if (watch.authority.kind === "full-access") {
-      // Leaving Full access already sent this watch back for approval; this check lost a race.
-      if (thread.runtimeMode !== "full-access") return;
-    } else {
-      const revision = yield* currentRevision(thread, watch, storage);
-      const allowed = watch.authority.revisionHash;
-      if (revision.revisionHash !== allowed || allowed !== watch.revisionHash) {
-        // A changed definition, shell or helper never runs under an approval given for another.
-        // The user reviews what would run now; the watch keeps its accepted state.
-        yield* record(thread.id, watch, {
-          status: "awaiting_approval",
-          revisionHash: revision.revisionHash,
-          shell: shell.program,
-          helpers: revision.helpers,
-        });
-        return;
-      }
+    // Leaving Full access already sent this watch back for approval; this check lost a race.
+    if (watch.authority.kind === "full-access" && thread.runtimeMode !== "full-access") return;
+    const revision = yield* currentRevision(thread, watch, storage);
+    const allowed =
+      watch.authority.kind === "approved" ? watch.authority.revisionHash : watch.revisionHash;
+    if (revision.revisionHash !== allowed || allowed !== watch.revisionHash) {
+      // A changed definition, shell, helper or environment never runs under authority given for
+      // another. The user reviews what would run now; the watch keeps its accepted state.
+      yield* record(thread.id, watch, {
+        status: "awaiting_approval",
+        revisionHash: revision.revisionHash,
+        shell: shell.program,
+        helpers: revision.helpers,
+      });
+      return;
     }
     // A result that completed the watch is already stored, so a crash before this recorded it
     // must not be lost to the next check finding the output identical.
@@ -436,7 +452,9 @@ export const make = Effect.gen(function* () {
     );
     const patch: { -readonly [K in keyof SyncPatch]: SyncPatch[K] } = {};
     let failures = 0;
-    if (outcome.kind === "failed") {
+    if (outcome.kind === "unavailable") {
+      if (watch.lastFailure !== outcome.reason) patch.lastFailure = outcome.reason;
+    } else if (outcome.kind === "failed") {
       const collectionFailures = outcome.stage === "collection" ? watch.collectionFailures + 1 : 0;
       const comparisonFailures =
         outcome.stage === "comparison" ? watch.comparisonFailures + 1 : watch.comparisonFailures;
@@ -493,6 +511,7 @@ export const make = Effect.gen(function* () {
         }
       }
       if (patch.status === undefined && watch.status !== "watching") patch.status = "watching";
+      if (watch.baselinedAt === undefined) patch.baselinedAt = now;
       if (watch.collectionFailures !== 0) patch.collectionFailures = 0;
       if (watch.comparisonFailures !== 0) patch.comparisonFailures = 0;
       if (watch.lastFailure !== undefined) patch.lastFailure = null;
@@ -674,11 +693,8 @@ export const make = Effect.gen(function* () {
                   Effect.gen(function* () {
                     const finished = yield* Clock.currentTimeMillis;
                     // The interval starts when a check ends, so checks of one watch never overlap.
-                    const intervals =
-                      failures === undefined || failures === 0
-                        ? 1
-                        : Math.min(2 ** (failures - 1), MAX_BACKOFF_INTERVALS);
-                    const next = finished + watch.everyMinutes * 60_000 * intervals;
+                    const next =
+                      finished + commandWatchRetryDelayMs(watch.everyMinutes, failures ?? 0);
                     dueAt.set(key, next);
                     nextScanAt = Math.min(nextScanAt, next);
                     yield* store.setNextCheckAt(watch.id, next);
@@ -699,7 +715,7 @@ export const make = Effect.gen(function* () {
               }).pipe(
                 Effect.andThen(
                   Effect.sync(() => {
-                    if (due) dueAt.set(key, now + watch.everyMinutes * 60_000);
+                    if (due) dueAt.set(key, now + commandWatchRetryDelayMs(watch.everyMinutes, 1));
                   }),
                 ),
               ),
