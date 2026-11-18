@@ -131,6 +131,9 @@ describe("CommandWatchComparison", () => {
         return [...seen.keys(), [...new Set([1, 1, 2])].length, "x".padStart(2, "y"), /b+/.test("abc")];
       `);
       assert.deepEqual((JSON.parse(report) as { value: unknown }).value, ["a", 2, "yx", true]);
+      // As in JSON.stringify, a property set to undefined is left out.
+      const optional = yield* evaluate("return { a: 1, complete: undefined };");
+      assert.deepEqual((JSON.parse(optional) as { value: unknown }).value, { a: 1 });
     }).pipe(Effect.provide(layerTest)),
   );
 
@@ -173,7 +176,7 @@ describe("CommandWatchComparison", () => {
       for (const [expression, reason] of [
         ["return { a: NaN };", "finite"],
         ["return { a: Infinity };", "finite"],
-        ["return { a: undefined };", "JSON"],
+        ["return [undefined];", "JSON"],
         ["return { a: 1n };", "JSON"],
         ["return { a() {} };", "JSON"],
         ["return new Map();", "plain"],

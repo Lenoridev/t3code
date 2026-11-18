@@ -66,7 +66,8 @@ const PRELUDE = `(() => {
       }
       for (const key of ownKeys(value)) {
         if (typeof key !== "string") throw new TypeError(path + " has a symbol key");
-        check(value[key], path + "." + key, seen);
+        // Left out, as JSON.stringify does.
+        if (value[key] !== undefined) check(value[key], path + "." + key, seen);
       }
     }
     seen.delete(value);
