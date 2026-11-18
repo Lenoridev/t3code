@@ -153,6 +153,10 @@ describe("CommandWatchComparison", () => {
   it.live("ends runaway allocation, deep recursion, a thrown error and a Promise as failures", () =>
     Effect.gen(function* () {
       assert.isNotEmpty(yield* failureOf("function compare() { let s = 'x'; for (;;) s += s; }"));
+      assert.include(
+        yield* failureOf("function compare() { const a = []; for (;;) a.push('x'.repeat(1e5)); }"),
+        "out of memory",
+      );
       assert.isNotEmpty(
         yield* failureOf("function f() { return f() + 1; } function compare() { return f(); }"),
       );

@@ -4,7 +4,9 @@ import * as variantModule from "@jitl/quickjs-singlefile-cjs-release-sync";
 
 /** Measured from after the interpreter loads, so a slow machine's startup does not count. */
 const COMPARISON_TIME_LIMIT_MS = 250;
-const COMPARISON_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
+// The interpreter's own memory limit cannot count in this WebAssembly build, which reports every
+// allocation as 0 bytes, so the heap itself is capped: 16 MiB at start plus the comparison's 32.
+const COMPARISON_HEAP_LIMIT_BYTES = 48 * 1024 * 1024;
 // Above this, deep recursion overflows the WebAssembly stack before QuickJS's own check fires.
 const COMPARISON_STACK_LIMIT_BYTES = 256 * 1024;
 const ERROR_LIMIT = 500;
@@ -100,8 +102,16 @@ async function runComparison(request: ComparisonWorkerRequest): Promise<Comparis
     // CommonJS interop types this as the module; the core unwraps its `default` at runtime.
     variantModule.default as unknown as Parameters<typeof newQuickJSWASMModuleFromVariant>[0],
   );
+  const heap = quickjs.getWasmMemory();
+  const growHeap = heap.grow.bind(heap);
+  // A refused growth makes the interpreter's allocation fail with "out of memory".
+  heap.grow = (pages: number) => {
+    if (heap.buffer.byteLength + pages * 65_536 > COMPARISON_HEAP_LIMIT_BYTES) {
+      throw new RangeError("The comparison heap is full.");
+    }
+    return growHeap(pages);
+  };
   const runtime = quickjs.newRuntime();
-  runtime.setMemoryLimit(COMPARISON_MEMORY_LIMIT_BYTES);
   runtime.setMaxStackSize(COMPARISON_STACK_LIMIT_BYTES);
   const deadline = performance.now() + COMPARISON_TIME_LIMIT_MS;
   runtime.setInterruptHandler(() => performance.now() > deadline);
