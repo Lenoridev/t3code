@@ -96,6 +96,8 @@ const updateMessageId = (watch: ThreadCommandWatch, attempt: string, through: nu
   MessageId.make(`message:command-watch:${watch.id}:${attempt}:${through}`);
 const throughOf = (messageId: string) => Number(messageId.slice(messageId.lastIndexOf(":") + 1));
 
+const BYTE_ORDER_MARK = String.fromCodePoint(0xfeff);
+
 /**
  * The shell every watch's command runs in. Fixed rather than the user's login shell, so the
  * POSIX syntax the tool describes works whatever shell the user prefers.
@@ -104,16 +106,30 @@ export const resolveCommandWatchShell = Effect.gen(function* () {
   if ((yield* HostProcess.Platform) === "win32") {
     return {
       program: "powershell.exe",
-      // PowerShell reads environment variables as `$env:NAME`; this keeps the documented name.
+      // Windows PowerShell 5.1 writes in the console code page and blocks .ps1 files on Windows 11
+      // by default. The child gets its own hidden console, so the encoding change stays inside it.
+      // `$env:NAME` is PowerShell's spelling; the variable keeps the documented name.
       invocation: (command: string) => [
         "-NoProfile",
         "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
         "-Command",
-        `$T3_WATCH_HELPERS = $env:T3_WATCH_HELPERS; ${command}`,
+        "[Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false); " +
+          `$T3_WATCH_HELPERS = $env:T3_WATCH_HELPERS; ${command}`,
       ],
+      // PowerShell 5.1 reads a .ps1 file without a byte order mark as ANSI.
+      helperContent: (helperPath: string, content: string) =>
+        helperPath.toLowerCase().endsWith(".ps1") && !content.startsWith(BYTE_ORDER_MARK)
+          ? `${BYTE_ORDER_MARK}${content}`
+          : content,
     };
   }
-  return { program: "/bin/sh", invocation: (command: string) => ["-c", command] };
+  return {
+    program: "/bin/sh",
+    invocation: (command: string) => ["-c", command],
+    helperContent: (_helperPath: string, content: string) => content,
+  };
 });
 
 /**
@@ -302,7 +318,10 @@ export const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const target = path.join(helperDirectory, helper.path);
           yield* fileSystem.makeDirectory(path.dirname(target), { recursive: true });
-          yield* fileSystem.writeFileString(target, helper.content);
+          yield* fileSystem.writeFileString(
+            target,
+            shell.helperContent(helper.path, helper.content),
+          );
           yield* fileSystem.chmod(target, 0o700);
         }),
       { discard: true },
