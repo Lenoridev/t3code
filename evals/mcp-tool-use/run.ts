@@ -40,6 +40,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { buildCodexAdditionalContext } from "../../apps/server/src/provider/CodexDeveloperInstructions.ts";
 import { AttachmentToolkit } from "../../apps/server/src/mcp/toolkits/attachment/tools.ts";
+import { CommandWatchesToolkit } from "../../apps/server/src/mcp/toolkits/commandWatches/tools.ts";
 import { DeviceToolkit } from "../../apps/server/src/mcp/toolkits/device/tools.ts";
 import { EnvironmentToolkit } from "../../apps/server/src/mcp/toolkits/environment/tools.ts";
 import { HtmlToolkit } from "../../apps/server/src/mcp/toolkits/html/tools.ts";
@@ -74,6 +75,7 @@ const MODELS = {
   "claude-opus-5-5": "Opus 5.5",
   "gpt-6.1-sol": "GPT-6.1 Sol",
   "gpt-6-astra": "GPT-6 Astra",
+  "gpt-6-luna": "GPT-6 Luna",
 } as const;
 type Model = keyof typeof MODELS;
 /** GPT models replay a Codex capture through CLIProxyAPI, the rest a Claude Code capture. */
@@ -87,6 +89,10 @@ const PRICES = {
   "claude-opus-5-5": { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
 };
 type PricedModel = keyof typeof PRICES;
+/** Shell simulators only the proxy serves, so a Codex run needs no Anthropic key. Not priced. */
+const PROXY_SHELL_MODELS = ["gpt-6-luna"] as const;
+type ShellModel = PricedModel | (typeof PROXY_SHELL_MODELS)[number];
+const isPriced = (model: ShellModel): model is PricedModel => model in PRICES;
 const T3_PREFIX = "mcp__t3-code__";
 const RUNTIME_MARKER = "<runtime_info>";
 const TOOL_LOADED = "Tool loaded.";
@@ -135,7 +141,7 @@ const PriorToolCall = Schema.Struct({
 });
 
 /**
- * One expected call. `args` match partially: `~text` is a case-insensitive substring,
+ * One expected call. `args` match partially: `~text` is a case-insensitive substring, `/re/` a regex,
  * `"<=N"` / `">=N"` bound a number, and keys may be dotted paths.
  */
 const McpToolUseCall = Schema.Struct({
@@ -361,6 +367,7 @@ const t3SourceTools: ReadonlyArray<Tool.Any> = [
   PreviewControlsToolkit,
   WorktreeToolkit,
   PullRequestsToolkit,
+  CommandWatchesToolkit,
   PreviewToolkit,
   DeviceToolkit,
   HtmlToolkit,
@@ -1204,7 +1211,7 @@ type Config = {
   readonly proxy?: { readonly url: string; readonly headers: Readonly<Record<string, string>> };
   readonly effort: string;
   readonly maxSteps: number;
-  readonly shellModel: PricedModel;
+  readonly shellModel: ShellModel;
 };
 
 /**
@@ -1229,7 +1236,7 @@ const simulate = Effect.fn("evaluateMcpToolUse.simulate")(function* (
     const response = yield* callModel(
       config.apiKey,
       body,
-      config.apiKey ? undefined : config.proxy,
+      config.apiKey && isPriced(config.shellModel) ? undefined : config.proxy,
     );
     addUsage(sample.shellUsage, response.usage);
     output = shellOutput(response.content);
@@ -1312,7 +1319,10 @@ const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(function* 
 });
 
 const BOUND = /^([<>]=)(-?\d+(?:\.\d+)?)$/;
-/** Partial match: `~text` is a case-insensitive substring, `<=N` / `>=N` bound a number. */
+/**
+ * Partial match: `~text` is a case-insensitive substring, `/re/` a regex, and `<=N` / `>=N` bound
+ * a number.
+ */
 const matches = (expected: unknown, actual: unknown): boolean => {
   const bound = typeof expected === "string" ? BOUND.exec(expected) : null;
   if (bound !== null) {
@@ -1321,6 +1331,14 @@ const matches = (expected: unknown, actual: unknown): boolean => {
   }
   if (typeof expected === "string" && expected.startsWith("~")) {
     return valueText(actual).toLowerCase().includes(expected.slice(1).toLowerCase());
+  }
+  if (
+    typeof expected === "string" &&
+    expected.length > 1 &&
+    expected.startsWith("/") &&
+    expected.endsWith("/")
+  ) {
+    return new RegExp(expected.slice(1, -1)).test(valueText(actual));
   }
   if (Array.isArray(expected)) {
     return (
@@ -1772,7 +1790,7 @@ const spend = (usages: ReadonlyArray<Usage>, model: PricedModel | undefined) => 
 /** Markdown report. With a baseline, each case shows its earlier pass rate and the change. */
 export const summarize = (
   rows: Array<ResultRow>,
-  options: { readonly header: string; readonly shellModel: PricedModel; readonly model: Model },
+  options: { readonly header: string; readonly shellModel: ShellModel; readonly model: Model },
   before?: Map<string, number>,
 ) => {
   const codex = isCodex(options.model);
@@ -1782,7 +1800,7 @@ export const summarize = (
   );
   const shell = spend(
     rows.map((row) => row.shellUsage),
-    options.shellModel,
+    isPriced(options.shellModel) ? options.shellModel : undefined,
   );
   const cost = agent.cost + shell.cost;
   const table = (title: string, key: (row: ResultRow) => string, compare = false) => [
@@ -1850,7 +1868,10 @@ const Flags = Schema.Struct({
   concurrency: PositiveInt,
   "max-steps": Schema.optional(PositiveInt),
   effort: Schema.optional(Schema.Literals(EFFORTS)),
-  "shell-model": Schema.Literals(Object.keys(PRICES) as Array<PricedModel>),
+  "shell-model": Schema.Literals([
+    ...(Object.keys(PRICES) as Array<PricedModel>),
+    ...PROXY_SHELL_MODELS,
+  ]),
   "user-instructions": Schema.Literals(["keep", "drop"]),
   "dry-run": Schema.Boolean,
   "stop-on-regression": Schema.Boolean,
@@ -2016,7 +2037,7 @@ const main = Effect.gen(function* () {
   const config: Config = {
     apiKey,
     model: flags.model,
-    ...(codex ? { proxy: proxyConfig() } : {}),
+    ...(codex || !isPriced(flags["shell-model"]) ? { proxy: proxyConfig() } : {}),
     effort,
     maxSteps: flags["max-steps"] ?? (codex ? 10 : 6),
     shellModel: flags["shell-model"],

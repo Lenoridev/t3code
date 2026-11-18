@@ -106,7 +106,10 @@ const failed = (expect: Parameters<typeof gradeSample>[0], run: SampleRun) =>
 it("passes a good run and names every rule a bad run breaks", () => {
   const expect = {
     calls: [{ tool: "delegate_task", args: { task: "~FINDING", "target.options": "~max" } }],
-    callsMustNot: [{ tool: "delegate_task", args: { runtimeMode: "approval-required" } }],
+    callsMustNot: [
+      { tool: "delegate_task", args: { runtimeMode: "approval-required" } },
+      { tool: "delegate_task", args: { task: "/^Review/" } },
+    ],
     notCalls: ["t3_thread_send"],
     order: ["orchestrator_capabilities", "delegate_task"],
     minCalls: { orchestrator_capabilities: 1 },
@@ -149,6 +152,7 @@ it("passes a good run and names every rule a bad run breaks", () => {
   assert.deepEqual(failed(expect, bad), [
     'calls delegate_task {"task":"~FINDING","target.options":"~max"}',
     'callsMustNot delegate_task {"runtimeMode":"approval-required"}',
+    'callsMustNot delegate_task {"task":"/^Review/"}',
     "notCalls t3_thread_send",
     "order orchestrator_capabilities > delegate_task",
     "minCalls orchestrator_capabilities >= 1",
