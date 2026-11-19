@@ -744,6 +744,27 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
     }
     return null;
   })();
+  const openBackgroundWork = () => {
+    Keyboard.dismiss();
+    navigation.navigate("ThreadBackgroundWork", {
+      environmentId: props.environmentId,
+      threadId: props.selectedThread.id,
+    });
+  };
+  const liveCommandWatches = commandWatchesLive(commandWatches);
+  // The status shows one thing at a time; while it shows other work, watches keep a way in.
+  const watchesSegment =
+    liveCommandWatches.length > 0 &&
+    !settled &&
+    floatingStatus !== null &&
+    floatingStatus.kind !== "watch" &&
+    floatingStatus.kind !== "background"
+      ? {
+          count: liveCommandWatches.length,
+          accessibilityLabel: `${commandWatchesTitle(liveCommandWatches)}. Open background work.`,
+          onPress: openBackgroundWork,
+        }
+      : null;
   const showWorkingControl = floatingStatus !== null;
   const showFloatingStatus =
     showWorkingControl ||
@@ -1431,6 +1452,7 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
                     showScrollToEnd={showScrollToEndButton}
                     onScrollToEnd={handleScrollToEnd}
                     agents={agentsSegment}
+                    watches={watchesSegment}
                     onOpenAgents={() => {
                       Keyboard.dismiss();
                       navigation.navigate("ThreadAgents", {

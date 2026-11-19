@@ -51,7 +51,16 @@ export const isCommandWatchRunning = (watch: ThreadCommandWatch) =>
 /** One line naming a thread's watches. */
 export function commandWatchesTitle(watches: ReadonlyArray<ThreadCommandWatch>): string {
   const [only] = watches;
-  if (watches.length !== 1 || only === undefined) return `Watching ${watches.length} commands`;
+  if (watches.length !== 1 || only === undefined) {
+    const approval = watches.filter((watch) => watch.status === "awaiting_approval").length;
+    const paused = watches.filter((watch) => watch.status === "paused").length;
+    if (approval === 0 && paused === 0) return `Watching ${watches.length} commands`;
+    const needs = [
+      approval > 0 ? `${approval} ${approval === 1 ? "needs" : "need"} approval` : null,
+      paused > 0 ? `${paused} paused` : null,
+    ].filter((part) => part !== null);
+    return `${watches.length} watches: ${needs.join(", ")}`;
+  }
   switch (only.status) {
     case "awaiting_approval":
       return `Needs approval: ${only.label}`;
@@ -88,7 +97,7 @@ export function commandWatchComparisonLabel(watch: ThreadCommandWatch): string {
 export function commandWatchPurposeLabel(watch: ThreadCommandWatch): string {
   return watch.completion.kind === "ongoing"
     ? "Runs until stopped."
-    : `Ends by itself when: ${watch.completion.description}`;
+    : `Ends by itself when: ${watch.completion.description.replace(/[^.!?]$/, "$&.")}`;
 }
 
 export const commandWatchLimitsLabel = (watch: ThreadCommandWatch) =>
@@ -99,7 +108,7 @@ export const commandWatchNeedsDetails = (watch: ThreadCommandWatch) =>
   watch.comparison.kind === "custom-js-v1" || watch.helpers.length > 0;
 
 export const COMMAND_WATCH_APPROVAL_WARNING =
-  "outside the agent's sandbox, with the T3 server's account permissions, until the watch is stopped.";
+  "outside the agent's sandbox, with the T3 server's account permissions, until the watch ends or is stopped.";
 
 /** The watch that needs the user first: approval before a paused watch. */
 export function commandWatchNeedingUser(

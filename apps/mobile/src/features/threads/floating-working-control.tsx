@@ -74,6 +74,12 @@ export function FloatingWorkingControl(props: {
   readonly onScrollToEnd: () => void;
   readonly agents: SubagentPillSegment | null;
   readonly onOpenAgents: () => void;
+  /** Running watches while the status shows other work, so their controls stay one tap away. */
+  readonly watches: {
+    readonly count: number;
+    readonly accessibilityLabel: string;
+    readonly onPress: () => void;
+  } | null;
   readonly queuedCount: number;
   readonly onOpenQueue: () => void;
   readonly lift?: SharedValue<number>;
@@ -87,6 +93,9 @@ export function FloatingWorkingControl(props: {
       ? props.status.action
       : null;
   const [agentsWidth, setAgentsWidth] = useState(0);
+  const [watchesWidth, setWatchesWidth] = useState(0);
+  const watches = props.watches;
+  const hasWatches = watches !== null;
   const hasQueue = props.queuedCount > 0;
   const hasPreview = props.devicePreview !== null || props.browserPreview !== null;
   const [previewWidth, setPreviewWidth] = useState(0);
@@ -100,6 +109,7 @@ export function FloatingWorkingControl(props: {
       (action !== null ? actionWidth : 0) -
       (hasQueue ? queueWidth : 0) -
       (hasAgents ? agentsWidth : 0) -
+      (hasWatches ? watchesWidth : 0) -
       (hasPreview ? previewWidth : 0),
   );
   const separationProgress = useSharedValue(props.showScrollToEnd ? 1 : 0);
@@ -133,7 +143,7 @@ export function FloatingWorkingControl(props: {
     capsuleWidth.set(first ? width : withTiming(width, CONTROL_TIMING));
   };
   const hasStatus = props.status !== null;
-  const hasCapsule = hasStatus || hasQueue || hasAgents || hasPreview;
+  const hasCapsule = hasStatus || hasQueue || hasAgents || hasWatches || hasPreview;
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- clears the Reanimated capsule width value and measured width when the status goes away
   useEffect(() => {
     if (!hasStatus) {
@@ -163,7 +173,7 @@ export function FloatingWorkingControl(props: {
     props.status?.kind === "background" ||
     props.status?.kind === "watch";
   const capsuleInteractive =
-    statusInteractive || action !== null || hasQueue || hasAgents || hasPreview;
+    statusInteractive || action !== null || hasQueue || hasAgents || hasWatches || hasPreview;
   const statusContent =
     props.status !== null ? (
       <View
@@ -242,6 +252,23 @@ export function FloatingWorkingControl(props: {
           </Text>
         </Pressable>
       ) : null}
+      {watches !== null ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={watches.accessibilityLabel}
+          onPress={watches.onPress}
+          onLayout={(event) => setWatchesWidth(settleWidth(event.nativeEvent.layout.width))}
+          className="h-11 flex-row items-center gap-1.5 px-3 active:opacity-70"
+        >
+          {hasStatus || hasPreview || hasAgents ? (
+            <View className="absolute left-0 h-4 w-px bg-border" />
+          ) : null}
+          <SymbolView name="eye" size={13} tintColorClassName="accent-foreground-muted" />
+          <Text className="font-t3-medium text-xs tabular-nums" numberOfLines={1}>
+            {watches.count}
+          </Text>
+        </Pressable>
+      ) : null}
       {hasQueue ? (
         <Pressable
           accessibilityRole="button"
@@ -252,7 +279,7 @@ export function FloatingWorkingControl(props: {
           style={{ maxWidth: Math.min(overlayWidth, windowWidth) * 0.45 }}
           className="h-11 flex-row items-center gap-2 px-3 active:opacity-70"
         >
-          {hasStatus || hasPreview || hasAgents ? (
+          {hasStatus || hasPreview || hasAgents || hasWatches ? (
             <View className="absolute left-0 h-4 w-px bg-border" />
           ) : null}
           <SymbolView name="list.number" size={13} tintColorClassName="accent-foreground-muted" />
